@@ -18,7 +18,7 @@ The attestation model is optimistic: we assume attestations from the next block 
 
 ## Lighthouse Modifications
 
-Uses a [fork of Lighthouse](https://github.com/samcm/lighthouse/tree/fcr-simulator) based on [dapplion's FCR branch](https://github.com/sigp/lighthouse/pull/8951). [Full diff of changes](https://github.com/samcm/lighthouse/compare/fcr...fcr-simulator) -- adds the simulator crate and bypasses blob availability checks for historical blocks.
+Uses a [fork of Lighthouse](https://github.com/samcm/lighthouse/tree/fcr-simulator) based on [dapplion's FCR branch](https://github.com/sigp/lighthouse/pull/8951). [Full diff of changes](https://github.com/dapplion/lighthouse/compare/fcr...samcm:lighthouse:fcr-simulator) -- adds the simulator crate and bypasses blob availability checks for historical blocks.
 
 ## Build
 
