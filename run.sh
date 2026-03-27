@@ -37,6 +37,32 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
+MERGED="$OUTPUT_DIR/merged.csv"
+
+merge_chunks() {
+    HEADER_WRITTEN=false
+    for f in "$OUTPUT_DIR"/chunk-*.csv; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" == *worker* ]] && continue
+
+        if [[ "$HEADER_WRITTEN" == false ]]; then
+            head -1 "$f" > "$MERGED.tmp"
+            HEADER_WRITTEN=true
+        fi
+        tail -n +2 "$f" >> "$MERGED.tmp"
+    done
+
+    if [[ -f "$MERGED.tmp" ]]; then
+        mv "$MERGED.tmp" "$MERGED"
+        TOTAL_SLOTS=$(($(wc -l < "$MERGED") - 1))
+        CONFIRMED=$(awk -F, 'NR>1 && $5=="true"' "$MERGED" | wc -l)
+        if [[ $TOTAL_SLOTS -gt 0 ]]; then
+            RATE=$(echo "scale=2; $CONFIRMED * 100 / $TOTAL_SLOTS" | bc)
+            echo "  Merged: $TOTAL_SLOTS slots, $CONFIRMED confirmed ($RATE%)"
+        fi
+    fi
+}
+
 TOTAL_EPOCHS=$((END_EPOCH - START_EPOCH))
 TOTAL_CHUNKS=$(( (TOTAL_EPOCHS + CHUNK_SIZE - 1) / CHUNK_SIZE ))
 
@@ -91,6 +117,9 @@ while [[ $CURSOR -lt $END_EPOCH ]]; do
         echo "  Worker CSVs may be at: $OUTPUT_DIR/chunk-${CURSOR}-${CHUNK_END}.worker-*.csv"
     fi
 
+    # Merge after every chunk so we always have usable data
+    merge_chunks
+
     CURSOR=$CHUNK_END
 done
 
@@ -99,30 +128,5 @@ echo "=== Summary ==="
 echo "Completed: $COMPLETED / $TOTAL_CHUNKS chunks"
 echo "Failed: $FAILED"
 
-# Merge all completed chunks
-MERGED="$OUTPUT_DIR/merged.csv"
-echo ""
-echo "Merging completed chunks into $MERGED"
-
-HEADER_WRITTEN=false
-for f in "$OUTPUT_DIR"/chunk-*.csv; do
-    [[ -f "$f" ]] || continue
-    # Skip worker files
-    [[ "$f" == *worker* ]] && continue
-
-    if [[ "$HEADER_WRITTEN" == false ]]; then
-        head -1 "$f" > "$MERGED"
-        HEADER_WRITTEN=true
-    fi
-    tail -n +2 "$f" >> "$MERGED"
-done
-
-if [[ -f "$MERGED" ]]; then
-    TOTAL_SLOTS=$(($(wc -l < "$MERGED") - 1))
-    CONFIRMED=$(awk -F, 'NR>1 && $5=="true"' "$MERGED" | wc -l)
-    if [[ $TOTAL_SLOTS -gt 0 ]]; then
-        RATE=$(echo "scale=2; $CONFIRMED * 100 / $TOTAL_SLOTS" | bc)
-        echo "Total slots: $TOTAL_SLOTS"
-        echo "Confirmed (delay<=1): $CONFIRMED ($RATE%)"
-    fi
-fi
+# Final merge
+merge_chunks
