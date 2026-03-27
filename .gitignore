@@ -1,0 +1,8 @@
+# Build artifacts
+target/
+
+# Cache
+*.cache
+
+# Worker output files
+*.worker-*.csv

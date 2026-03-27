@@ -1,0 +1,4 @@
+[submodule "lighthouse"]
+	path = lighthouse
+	url = git@github.com:samcm/lighthouse.git
+	branch = fcr-simulator
