@@ -1,9 +1,17 @@
 FROM rust:1.88-bookworm AS builder
 
+RUN apt-get update && apt-get install -y \
+    cmake \
+    clang \
+    libclang-dev \
+    protobuf-compiler \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /build
 COPY . .
 
-RUN git submodule update --init --recursive
+RUN cd lighthouse && git submodule update --init --recursive
 
 WORKDIR /build/lighthouse
 
