@@ -14,7 +14,7 @@ For each slot N in the configured range:
 
 Blocks come from [ERA files](https://github.com/eth-clients/e2store-format-specs). The starting beacon state is fetched from a beacon node API and cached locally. BLS verification is disabled (`fake_crypto`) for speed since all blocks are from the canonical chain.
 
-The attestation model is optimistic: we assume attestations from the next block all arrived at the attestation deadline. This gives an upper bound on confirmation rates.
+The attestation model is optimistic: we assume attestations from the next block all arrived at the attestation deadline. [This investigation](https://investigations.ethpandaops.io/2026-03/fcr-attestation-proxy/) validates that on-chain attestations are a reasonable proxy for what a node would see at the attestation deadline.
 
 ## Lighthouse Modifications
 
