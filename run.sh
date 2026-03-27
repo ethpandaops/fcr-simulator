@@ -114,7 +114,19 @@ while [[ $CURSOR -lt $END_EPOCH ]]; do
     else
         FAILED=$((FAILED + 1))
         echo "[$CHUNK_NUM/$TOTAL_CHUNKS] Chunk FAILED (exit code $?)"
-        echo "  Worker CSVs may be at: $OUTPUT_DIR/chunk-${CURSOR}-${CHUNK_END}.worker-*.csv"
+        # Salvage partial data from worker files if chunk CSV wasn't produced
+        if [[ ! -f "$CHUNK_FILE" ]]; then
+            WORKER_FILES=("$OUTPUT_DIR"/chunk-${CURSOR}-${CHUNK_END}.worker-*.csv)
+            if [[ -f "${WORKER_FILES[0]}" ]]; then
+                echo "  Salvaging data from worker files..."
+                head -1 "${WORKER_FILES[0]}" > "$CHUNK_FILE"
+                for wf in "${WORKER_FILES[@]}"; do
+                    tail -n +2 "$wf" >> "$CHUNK_FILE"
+                done
+                SALVAGED=$(($(wc -l < "$CHUNK_FILE") - 1))
+                echo "  Salvaged $SALVAGED slots from worker files"
+            fi
+        fi
     fi
 
     # Merge after every chunk so we always have usable data
