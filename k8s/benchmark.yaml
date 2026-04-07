@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fcr-benchmark-cache
+  namespace: fcr-simulator
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: do-block-storage
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fcr-benchmark
+  namespace: fcr-simulator
+  labels:
+    app: fcr-simulator
+    type: benchmark
+spec:
+  activeDeadlineSeconds: 7200
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: fcr-simulator
+        type: benchmark
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        doks.digitalocean.com/node-pool: platform-primary-ams3-production-cpu-large
+      tolerations:
+        - key: cpu_optimized
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: benchmark
+          image: ghcr.io/ethpandaops/fcr-simulator:latest
+          env:
+            - name: BEACON_NODE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: fcr-simulator-config
+                  key: beacon-node-url
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              BN_URL="$BEACON_NODE_URL"
+              CACHE="/data/cache"
+              OUT="/data/results"
+              mkdir -p "$OUT"
+
+              echo "=== Benchmarking --parallel 1 (tmpfs for DB) ==="
+              START=$(date +%s)
+              fcr-simulator \
+                --beacon-node-url "$BN_URL" \
+                --start-epoch 435000 \
+                --end-epoch 435010 \
+                --parallel 1 \
+                --output "$OUT/benchmark-p1.csv" \
+                --cache-dir "$CACHE"
+              END=$(date +%s)
+              DURATION=$((END - START))
+              SLOTS=$(tail -n +2 "$OUT/benchmark-p1.csv" 2>/dev/null | wc -l)
+              echo "=== parallel=1: ${SLOTS} slots in ${DURATION}s ==="
+
+              echo "=== BENCHMARK COMPLETE ==="
+          resources:
+            requests:
+              cpu: "6"
+              memory: 10Gi
+            limits:
+              cpu: "7"
+              memory: 14Gi
+          volumeMounts:
+            - name: cache
+              mountPath: /data/cache
+            - name: db-tmpfs
+              mountPath: /data/cache/db
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: fcr-benchmark-cache
+        - name: db-tmpfs
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi

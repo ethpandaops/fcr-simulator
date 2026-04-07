@@ -6,3 +6,8 @@ target/
 
 # Worker output files
 *.worker-*.csv
+.env
+
+# Data artifacts
+results/
+attestation-timing/
