@@ -90,7 +90,7 @@ def _process_hour_inner(db: duckdb.DuckDBPyConnection, committee_file: Path, att
     db.execute(f"""
         CREATE OR REPLACE TABLE hour_committee AS
         SELECT slot,
-            row_number() OVER (PARTITION BY slot ORDER BY committee_index, pos) - 1 AS position,
+            row_number() OVER (PARTITION BY slot ORDER BY CAST(CAST(committee_index AS VARCHAR) AS INTEGER), pos) - 1 AS position,
             vi AS validator_index
         FROM (
             SELECT slot, committee_index, unnest(validators) AS vi, generate_subscripts(validators, 1) AS pos
@@ -138,22 +138,28 @@ def _process_hour_inner(db: duckdb.DuckDBPyConnection, committee_file: Path, att
         LEFT JOIN hour_timing t ON c.slot = t.slot AND c.validator_index = t.validator_index
     """)
 
-    # Build vote IDs
+    # Build vote IDs (only over non-NULL rows to avoid off-by-one with the filtered votes list)
     db.execute("""
         CREATE OR REPLACE TABLE hour_with_votes AS
-        SELECT
-            slot, position, slot_offset,
-            CASE WHEN head_root IS NOT NULL
-                THEN CAST(dense_rank() OVER (
+        SELECT slot, position, slot_offset, vote_id, head_root, source_epoch, source_root, target_epoch, target_root
+        FROM (
+            SELECT
+                slot, position, slot_offset,
+                CAST(dense_rank() OVER (
                     PARTITION BY slot
-                    ORDER BY COALESCE(head_root, ''), COALESCE(source_epoch, 0),
-                             COALESCE(source_root, ''), COALESCE(target_epoch, 0),
-                             COALESCE(target_root, '')
-                ) - 1 AS UTINYINT)
-                ELSE CAST(255 AS UTINYINT)
-            END AS vote_id,
-            head_root, source_epoch, source_root, target_epoch, target_root
-        FROM hour_joined
+                    ORDER BY head_root, source_epoch, source_root, target_epoch, target_root
+                ) - 1 AS UTINYINT) AS vote_id,
+                head_root, source_epoch, source_root, target_epoch, target_root
+            FROM hour_joined
+            WHERE head_root IS NOT NULL
+            UNION ALL
+            SELECT
+                slot, position, slot_offset,
+                CAST(255 AS UTINYINT) AS vote_id,
+                head_root, source_epoch, source_root, target_epoch, target_root
+            FROM hour_joined
+            WHERE head_root IS NULL
+        )
     """)
 
     # Pack into per-slot rows and append to results
