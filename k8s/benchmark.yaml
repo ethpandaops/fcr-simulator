@@ -53,18 +53,24 @@ spec:
               OUT="/data/results"
               mkdir -p "$OUT"
 
-              echo "=== Benchmarking --parallel 1 (tmpfs for DB) ==="
+              echo "=== Benchmarking --engine lighthouse --parallel 1 ==="
               START=$(date +%s)
-              fcr-simulator \
+              fcr-orchestrator \
+                --engine lighthouse \
+                --network mainnet \
                 --beacon-node-url "$BN_URL" \
                 --start-epoch 435000 \
                 --end-epoch 435010 \
+                --warmup-epochs 10 \
                 --parallel 1 \
                 --output "$OUT/benchmark-p1.csv" \
+                --output-format both \
+                --attestation-source-mode next-non-missed \
+                --lookahead-cap 4 \
                 --cache-dir "$CACHE"
               END=$(date +%s)
               DURATION=$((END - START))
-              SLOTS=$(tail -n +2 "$OUT/benchmark-p1.csv" 2>/dev/null | wc -l)
+              SLOTS=$(tail -n +3 "$OUT/benchmark-p1.csv" 2>/dev/null | wc -l)
               echo "=== parallel=1: ${SLOTS} slots in ${DURATION}s ==="
 
               echo "=== BENCHMARK COMPLETE ==="

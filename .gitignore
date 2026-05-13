@@ -1,13 +1,22 @@
 # Build artifacts
 target/
+/fcr-orchestrator
+/fcr-lighthouse
+/results/fcr-orchestrator
+/results/fcr-lighthouse
 
 # Cache
 *.cache
 
+# Local secrets
+.env
+
 # Worker output files
 *.worker-*.csv
-.env
 
 # Data artifacts
 results/
 attestation-timing/
+
+# Go test outputs
+*.test
