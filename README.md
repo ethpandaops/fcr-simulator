@@ -56,7 +56,13 @@ docker run ghcr.io/ethpandaops/fcr-simulator \
 
 ## Output
 
-CSV with one row per slot. Key columns: `slot`, `confirmed` (delay <= 1 slot), `confirmation_delay_slots`, `has_block`, `is_missed_slot`, `num_attestations_injected`.
+CSV output starts with a schema marker line:
+
+```text
+# fcr-simulator-csv-schema-version:2
+```
+
+It then has one row per slot. Key columns: `slot`, `eval_slot`, `has_block`, `block_root`, `confirmed_root`, `confirmed_slot`, `confirmation_delay_slots`, `fast_confirmed` (`confirmed_root` is non-zero and `confirmed_slot == slot`), `strict_one_slot_confirmed`, `is_missed_slot`, `num_attestations_injected`.
 
 ## References
 

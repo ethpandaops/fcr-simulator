@@ -16,6 +16,7 @@ OUTPUT_DIR="./results"
 CHUNK_SIZE=1000
 PARALLEL=2
 BINARY="./lighthouse/target/release/fcr-simulator"
+CSV_SCHEMA_HEADER="# fcr-simulator-csv-schema-version:2"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -39,23 +40,101 @@ mkdir -p "$OUTPUT_DIR"
 
 MERGED="$OUTPUT_DIR/merged.csv"
 
+chunk_manifest_complete() {
+    local chunk_file="$1"
+    local start_epoch="$2"
+    local end_epoch="$3"
+    local manifest="${chunk_file}.manifest.json"
+    local start_slot=$((start_epoch * 32))
+    local end_slot=$((end_epoch * 32))
+
+    [[ -f "$chunk_file" && -f "$manifest" ]] || return 1
+
+    python3 - "$manifest" "$start_slot" "$end_slot" <<'PY'
+import json
+import sys
+
+manifest_path, expected_start, expected_end = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(manifest_path) as f:
+    manifest = json.load(f)
+
+if manifest.get("schema_version") != 1:
+    sys.exit(1)
+if manifest.get("partial"):
+    sys.exit(1)
+
+ranges = sorted(
+    (int(r["start_slot"]), int(r["end_slot"]))
+    for r in manifest.get("completed_ranges", [])
+)
+cursor = expected_start
+for start, end in ranges:
+    if start != cursor or end < start:
+        sys.exit(1)
+    cursor = end
+
+if cursor != expected_end:
+    sys.exit(1)
+PY
+}
+
+csv_schema_valid() {
+    local csv_file="$1"
+    local first_line
+
+    [[ -f "$csv_file" ]] || return 1
+    IFS= read -r first_line < "$csv_file" || return 1
+    [[ "$first_line" == "$CSV_SCHEMA_HEADER" ]]
+}
+
+chunk_epochs_from_path() {
+    local path="$1"
+    local base
+    base=$(basename "$path")
+    [[ "$base" =~ ^chunk-([0-9]+)-([0-9]+)\.csv$ ]] || return 1
+    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+}
+
 merge_chunks() {
     HEADER_WRITTEN=false
     for f in "$OUTPUT_DIR"/chunk-*.csv; do
         [[ -f "$f" ]] || continue
         [[ "$f" == *worker* ]] && continue
 
+        if ! read -r chunk_start chunk_end < <(chunk_epochs_from_path "$f"); then
+            echo "  Skipping $f: cannot parse chunk range"
+            continue
+        fi
+        if ! chunk_manifest_complete "$f" "$chunk_start" "$chunk_end"; then
+            echo "  Skipping $f: manifest is missing or incomplete"
+            continue
+        fi
+        if ! csv_schema_valid "$f"; then
+            echo "  Skipping $f: CSV schema header is missing or unsupported"
+            continue
+        fi
+
         if [[ "$HEADER_WRITTEN" == false ]]; then
-            head -1 "$f" > "$MERGED.tmp"
+            sed -n '1,2p' "$f" > "$MERGED.tmp"
             HEADER_WRITTEN=true
         fi
-        tail -n +2 "$f" >> "$MERGED.tmp"
+        tail -n +3 "$f" >> "$MERGED.tmp"
     done
 
     if [[ -f "$MERGED.tmp" ]]; then
         mv "$MERGED.tmp" "$MERGED"
-        TOTAL_SLOTS=$(($(wc -l < "$MERGED") - 1))
-        CONFIRMED=$(awk -F, 'NR>1 && $5=="true"' "$MERGED" | wc -l)
+        TOTAL_SLOTS=$(($(wc -l < "$MERGED") - 2))
+        CONFIRMED=$(awk -F, '
+            NR == 2 {
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "fast_confirmed") {
+                        fast_confirmed_col = i
+                    }
+                }
+                next
+            }
+            NR > 2 && fast_confirmed_col && $fast_confirmed_col == "true"
+        ' "$MERGED" | wc -l)
         if [[ $TOTAL_SLOTS -gt 0 ]]; then
             RATE=$(echo "scale=2; $CONFIRMED * 100 / $TOTAL_SLOTS" | bc)
             echo "  Merged: $TOTAL_SLOTS slots, $CONFIRMED confirmed ($RATE%)"
@@ -88,16 +167,12 @@ while [[ $CURSOR -lt $END_EPOCH ]]; do
     CHUNK_FILE="$OUTPUT_DIR/chunk-${CURSOR}-${CHUNK_END}.csv"
 
     # Skip if this chunk already completed
-    if [[ -f "$CHUNK_FILE" ]]; then
+    if chunk_manifest_complete "$CHUNK_FILE" "$CURSOR" "$CHUNK_END"; then
         LINES=$(wc -l < "$CHUNK_FILE")
-        EXPECTED_SLOTS=$(( (CHUNK_END - CURSOR) * 32 ))
-        # Header + at least 90% of expected slots = good enough
-        if [[ $LINES -gt $((EXPECTED_SLOTS * 9 / 10)) ]]; then
-            echo "[$CHUNK_NUM/$TOTAL_CHUNKS] Chunk $CURSOR-$CHUNK_END already complete ($LINES lines), skipping"
-            COMPLETED=$((COMPLETED + 1))
-            CURSOR=$CHUNK_END
-            continue
-        fi
+        echo "[$CHUNK_NUM/$TOTAL_CHUNKS] Chunk $CURSOR-$CHUNK_END already complete ($LINES lines), skipping"
+        COMPLETED=$((COMPLETED + 1))
+        CURSOR=$CHUNK_END
+        continue
     fi
 
     echo "[$CHUNK_NUM/$TOTAL_CHUNKS] Running chunk: epoch $CURSOR - $CHUNK_END"
@@ -119,11 +194,11 @@ while [[ $CURSOR -lt $END_EPOCH ]]; do
             WORKER_FILES=("$OUTPUT_DIR"/chunk-${CURSOR}-${CHUNK_END}.worker-*.csv)
             if [[ -f "${WORKER_FILES[0]}" ]]; then
                 echo "  Salvaging data from worker files..."
-                head -1 "${WORKER_FILES[0]}" > "$CHUNK_FILE"
+                sed -n '1,2p' "${WORKER_FILES[0]}" > "$CHUNK_FILE"
                 for wf in "${WORKER_FILES[@]}"; do
-                    tail -n +2 "$wf" >> "$CHUNK_FILE"
+                    tail -n +3 "$wf" >> "$CHUNK_FILE"
                 done
-                SALVAGED=$(($(wc -l < "$CHUNK_FILE") - 1))
+                SALVAGED=$(($(wc -l < "$CHUNK_FILE") - 2))
                 echo "  Salvaged $SALVAGED slots from worker files"
             fi
         fi

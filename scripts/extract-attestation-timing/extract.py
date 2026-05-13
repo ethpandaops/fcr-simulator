@@ -8,6 +8,8 @@ of slot_offsets and vote_ids indexed by committee position.
 Processes one hour at a time to keep memory usage bounded (~4-6 GB).
 
 Output schema per slot:
+  - schema_magic (string): constant "fcr_attestation_timing"
+  - schema_version (u8): current schema is 2
   - slot (u64)
   - slot_offsets (list[u8]): one per committee position. 255 = not seen by xatu.
     Value N means attestation was first seen N slots after duty slot.
@@ -37,6 +39,8 @@ import httpx
 R2_BASE = "https://data.ethpandaops.io/xatu/mainnet/databases/default"
 BEACON_API_TABLE = "beacon_api_eth_v1_events_attestation"
 COMMITTEE_TABLE = "canonical_beacon_committee"
+SCHEMA_MAGIC = "fcr_attestation_timing"
+SCHEMA_VERSION = 2
 
 
 def check_parquet_exists(table: str, year: int, month: int, day: int, part: int | str) -> tuple[bool, int]:
@@ -90,7 +94,7 @@ def _process_hour_inner(db: duckdb.DuckDBPyConnection, committee_file: Path, att
     db.execute(f"""
         CREATE OR REPLACE TABLE hour_committee AS
         SELECT slot,
-            row_number() OVER (PARTITION BY slot ORDER BY CAST(CAST(committee_index AS VARCHAR) AS INTEGER), pos) - 1 AS position,
+            row_number() OVER (PARTITION BY slot ORDER BY CAST(committee_index AS VARCHAR), pos) - 1 AS position,
             vi AS validator_index
         FROM (
             SELECT slot, committee_index, unnest(validators) AS vi, generate_subscripts(validators, 1) AS pos
@@ -163,9 +167,11 @@ def _process_hour_inner(db: duckdb.DuckDBPyConnection, committee_file: Path, att
     """)
 
     # Pack into per-slot rows and append to results
-    db.execute("""
+    db.execute(f"""
         INSERT INTO day_results
         SELECT
+            '{SCHEMA_MAGIC}' AS schema_magic,
+            CAST({SCHEMA_VERSION} AS UTINYINT) AS schema_version,
             CAST(slot AS UBIGINT) AS slot,
             list(slot_offset ORDER BY position) AS slot_offsets,
             list(vote_id ORDER BY position) AS vote_ids,
@@ -261,6 +267,8 @@ def process_day(date: datetime, output_dir: Path, hours: list[int] | None = None
     # Create results table
     db.execute("""
         CREATE TABLE day_results (
+            schema_magic VARCHAR,
+            schema_version UTINYINT,
             slot UBIGINT,
             slot_offsets UTINYINT[],
             vote_ids UTINYINT[],
@@ -312,6 +320,10 @@ def process_day(date: datetime, output_dir: Path, hours: list[int] | None = None
         "beacon_hours": beacon_count,
         "elapsed_seconds": round(elapsed, 1),
         "sha256": sha256.hexdigest(),
+        "schema_magic": SCHEMA_MAGIC,
+        "schema_version": SCHEMA_VERSION,
+        "committee_order": "lexicographic",
+        "vote_id_base": 0,
     }
     print(f"  OK {date_str}: {row_count} slots, {total_seen:,} seen, {meta['output_kb']} KB, {elapsed:.0f}s")
     return meta
