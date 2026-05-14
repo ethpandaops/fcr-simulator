@@ -1,4 +1,4 @@
-From 055018713cbe65d3d32ded0558721025fca410b7 Mon Sep 17 00:00:00 2001
+From 6aa3e94ce24404c387ce04df056d2f3f64391279 Mon Sep 17 00:00:00 2001
 From: Codex <codex@example.invalid>
 Date: Thu, 14 May 2026 19:13:12 +1000
 Subject: [PATCH 1/2] fcr-simulator-engine: add Teku engine wrapper
@@ -7,15 +7,15 @@ Subject: [PATCH 1/2] fcr-simulator-engine: add Teku engine wrapper
  fcr-simulator-engine/build.gradle             |  69 ++++
  .../forkchoice/FcrForkChoiceAccess.java       |  25 ++
  .../forkchoice/fcr/Config.java                |  89 ++++
- .../forkchoice/fcr/Engine.java                | 381 ++++++++++++++++++
+ .../forkchoice/fcr/Engine.java                | 385 ++++++++++++++++++
  .../forkchoice/fcr/HttpClient.java            | 100 +++++
- .../statetransition/forkchoice/fcr/Main.java  | 103 +++++
- .../forkchoice/fcr/OutputWriter.java          |  59 +++
+ .../statetransition/forkchoice/fcr/Main.java  | 111 +++++
+ .../forkchoice/fcr/OutputWriter.java          |  65 +++
  .../forkchoice/fcr/PlanFetcher.java           |  55 +++
  .../forkchoice/fcr/SlotResult.java            |  55 +++
  .../src/main/resources/log4j2-fcr.xml         |  13 +
  settings.gradle                               |   1 +
- 11 files changed, 950 insertions(+)
+ 11 files changed, 968 insertions(+)
  create mode 100644 fcr-simulator-engine/build.gradle
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
@@ -230,10 +230,10 @@ index 0000000..3c5421e
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
 new file mode 100644
-index 0000000..1613e0c
+index 0000000..abfc7f4
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,385 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -300,7 +300,7 @@ index 0000000..1613e0c
 +
 +import org.apache.tuweni.bytes.Bytes32;
 +
-+public class Engine {
++public class Engine implements AutoCloseable {
 +  private final Config cfg;
 +  private final Spec spec;
 +  private final HttpClient httpClient;
@@ -422,8 +422,12 @@ index 0000000..1613e0c
 +              + slotsProcessed
 +              + " records_written="
 +              + outputWriter.getRecordsWritten());
-+      outputWriter.flush();
 +    }
++  }
++
++  @Override
++  public void close() throws IOException {
++    outputWriter.close();
 +  }
 +
 +  private void runSlot(final long simSlot) throws IOException, InterruptedException {
@@ -723,10 +727,10 @@ index 0000000..1580a53
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java
 new file mode 100644
-index 0000000..c216348
+index 0000000..83551b4
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,111 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -787,6 +791,14 @@ index 0000000..c216348
 +      System.err.println("simulation failure: " + e.getMessage());
 +      e.printStackTrace(System.err);
 +      return 3;
++    } finally {
++      try {
++        engine.close();
++      } catch (final Exception e) {
++        System.err.println("close failure: " + e.getMessage());
++        e.printStackTrace(System.err);
++        return 3;
++      }
 +    }
 +    return 0;
 +  }
@@ -832,10 +844,10 @@ index 0000000..c216348
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java
 new file mode 100644
-index 0000000..0b7fd5c
+index 0000000..289f132
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,65 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -859,7 +871,7 @@ index 0000000..0b7fd5c
 +
 +import com.fasterxml.jackson.databind.ObjectMapper;
 +
-+public class OutputWriter {
++public class OutputWriter implements AutoCloseable {
 +  private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 +
 +  private final BufferedWriter writer;
@@ -893,6 +905,12 @@ index 0000000..0b7fd5c
 +
 +  public void flush() throws IOException {
 +    writer.flush();
++  }
++
++  @Override
++  public void close() throws IOException {
++    writer.flush();
++    writer.close();
 +  }
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/PlanFetcher.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/PlanFetcher.java

@@ -119,7 +119,7 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 
 	fs := flag.NewFlagSet("fcr-orchestrator", flag.ContinueOnError)
 	fs.SetOutput(output)
-	fs.StringVar(&cfg.Engine, "engine", "", "engine name (V1 supports lighthouse)")
+	fs.StringVar(&cfg.Engine, "engine", "", "engine name (V1 supports lighthouse, teku)")
 	fs.StringVar(&cfg.EngineBinary, "engine-binary", os.Getenv("FCR_ENGINE_BINARY"), "path to engine binary (env: FCR_ENGINE_BINARY)")
 	fs.StringVar(&cfg.Network, "network", "", "network name (V1 supports mainnet)")
 	fs.Var(&startEpoch, "start-epoch", "first epoch, inclusive")
@@ -181,8 +181,8 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 	if cfg.Engine == "" {
 		return fmt.Errorf("--engine is required")
 	}
-	if cfg.Engine != "lighthouse" {
-		return fmt.Errorf("--engine=%q is not supported in V1; supported value is %q", cfg.Engine, "lighthouse")
+	if cfg.Engine != "lighthouse" && cfg.Engine != "teku" {
+		return fmt.Errorf("--engine=%q is not supported; supported values are %q, %q", cfg.Engine, "lighthouse", "teku")
 	}
 	if cfg.EngineBinary == "" {
 		return fmt.Errorf("--engine-binary is required")

@@ -42,6 +42,7 @@ done
 shopt -u nullglob
 
 GRADLE_ARGS=(${GRADLE_ARGS:-})
+export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$ENGINE_DIR/.gradle-home}"
 (cd "$BUILD_SRC" && ./gradlew "${GRADLE_ARGS[@]}" :fcr-simulator-engine:shadowJar)
 
 cp "$BUILD_SRC/fcr-simulator-engine/build/libs/fcr-teku-all.jar" "$DIST_DIR/fcr-teku-all.jar"
