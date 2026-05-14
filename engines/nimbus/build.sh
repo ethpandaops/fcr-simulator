@@ -6,7 +6,7 @@
 # and dependency graph rather than relying on the system Nim, so the build is
 # reproducible across machines that have only a working C toolchain + make.
 
-set -euo pipefail
+set -eo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${HERE}/../.." && pwd)"
@@ -19,8 +19,11 @@ if [ ! -d "${NIMBUS_DIR}" ]; then
   exit 1
 fi
 
-echo "[build] bootstrapping nimbus-eth2 build system (one-time, ~20-40 min cold)" >&2
-(cd "${NIMBUS_DIR}" && make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)" update)
+NIM_PINNED="${NIMBUS_DIR}/vendor/nimbus-build-system/vendor/Nim/bin/nim"
+if [ ! -x "${NIM_PINNED}" ]; then
+  echo "[build] bootstrapping nimbus-eth2 build system (one-time, ~5-10 min)" >&2
+  (cd "${NIMBUS_DIR}" && make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)" update)
+fi
 
 mkdir -p "${OUT_DIR}"
 
@@ -31,6 +34,7 @@ if [ ! -f "${NIMBUS_ENV}" ]; then
 fi
 
 # Activate Nimbus's pinned Nim toolchain + Nimble paths.
+export USE_SYSTEM_NIM=${USE_SYSTEM_NIM:-0}
 # shellcheck disable=SC1090
 source "${NIMBUS_ENV}"
 
@@ -39,17 +43,20 @@ source "${NIMBUS_ENV}"
 # tree; we reference it via absolute path.
 cd "${NIMBUS_DIR}"
 
+export NIMBUS_BUILD_SYSTEM=yes
+
 NIM_PARAMS=(
   c
   -d:release
   -d:fakeCrypto
   -d:disableMarchNative
+  -d:disableLTO
   -d:chronicles_log_level=NOTICE
   -d:const_preset=mainnet
+  -d:kzgExternalBlst
   --threads:on
   --mm:refc
-  --passC:-fno-lto
-  --passL:-fno-lto
+  --path:"${NIMBUS_DIR}"
   -o:"${OUT_BIN}"
 )
 

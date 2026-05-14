@@ -5,30 +5,38 @@
 # warmup/recording slot range, emitting JSONL records that the Go orchestrator merges
 # into the final per-run CSV.
 
-{.push raises: [].}
-
 import
-  std/[json, options, os, parseopt, strformat, strutils, tables, times],
+  std/[json, monotimes, options, os, parseopt, strformat, strutils, tables, times],
   chronos,
   chronos/apps/http/httpclient,
   results,
   stew/[byteutils, io2],
-  taskpools,
-  ../nimbus-eth2/beacon_chain/[beacon_chain_db, beacon_clock, conf,
-    validator_pool],
-  ../nimbus-eth2/beacon_chain/consensus_object_pools/[
-    attestation_pool, blockchain_dag, block_clearance, block_quarantine,
-    spec_cache],
-  ../nimbus-eth2/beacon_chain/fork_choice/[fork_choice, fork_choice_types],
-  ../nimbus-eth2/beacon_chain/gossip_processing/batch_validation,
-  ../nimbus-eth2/beacon_chain/spec/[
-    beaconstate, forks, helpers, presets, signatures, state_transition],
-  ../nimbus-eth2/beacon_chain/spec/datatypes/[base, phase0, altair, bellatrix,
-    capella, deneb, electra],
-  ../nimbus-eth2/beacon_chain/validators/validator_monitor
+  taskpools
 
-from ../nimbus-eth2/beacon_chain/spec/eth2_apis/eth2_rest_serialization import
-  RestApiResponse
+import beacon_chain/beacon_chain_db
+import beacon_chain/consensus_object_pools/attestation_pool
+import beacon_chain/consensus_object_pools/blockchain_dag
+import beacon_chain/consensus_object_pools/block_clearance
+import beacon_chain/consensus_object_pools/block_quarantine
+import beacon_chain/consensus_object_pools/spec_cache
+import beacon_chain/fork_choice/fork_choice
+import beacon_chain/fork_choice/fork_choice_types
+import beacon_chain/gossip_processing/batch_validation
+import beacon_chain/spec/beaconstate
+import beacon_chain/spec/forks
+import beacon_chain/spec/helpers
+import beacon_chain/spec/presets
+import beacon_chain/spec/state_transition
+import beacon_chain/spec/state_transition_epoch
+import beacon_chain/spec/datatypes/base
+import beacon_chain/spec/datatypes/phase0
+import beacon_chain/spec/datatypes/altair
+import beacon_chain/spec/datatypes/bellatrix
+import beacon_chain/spec/datatypes/capella
+import beacon_chain/spec/datatypes/deneb
+import beacon_chain/spec/datatypes/electra
+import beacon_chain/validators/validator_monitor
+import beacon_chain/networking/network_metadata
 
 const
   EngineName = "nimbus"
@@ -78,48 +86,70 @@ proc parseEngineConfig(): tuple[cfg: EngineConfig, exit: Option[ExitKind]] =
     byzantineThreshold: 25,
     attestationSourceMode: "",
     lookaheadCap: 0)
-  var parser = initOptParser(quoteShellCommand(commandLineParams()))
-  for kind, key, val in parser.getopt():
-    case kind
-    of cmdLongOption:
-      case key
-      of "beacon-node-url": cfg.beaconNodeUrl = val
-      of "start-slot":
-        try: cfg.startSlot = Slot(parseBiggestUInt(val))
-        except ValueError:
-          stderr.writeLine "invalid --start-slot: " & val
-          return (cfg, some(ekConfig))
-      of "end-slot":
-        try: cfg.endSlot = Slot(parseBiggestUInt(val))
-        except ValueError:
-          stderr.writeLine "invalid --end-slot: " & val
-          return (cfg, some(ekConfig))
-      of "warmup-start-slot":
-        try: cfg.warmupStartSlot = Slot(parseBiggestUInt(val))
-        except ValueError:
-          stderr.writeLine "invalid --warmup-start-slot: " & val
-          return (cfg, some(ekConfig))
-      of "network": cfg.network = val
-      of "byzantine-threshold":
-        try: cfg.byzantineThreshold = parseBiggestUInt(val).uint64
-        except ValueError:
-          stderr.writeLine "invalid --byzantine-threshold: " & val
-          return (cfg, some(ekConfig))
-      of "attestation-source-mode": cfg.attestationSourceMode = val
-      of "lookahead-cap":
-        try: cfg.lookaheadCap = parseBiggestUInt(val).uint64
-        except ValueError:
-          stderr.writeLine "invalid --lookahead-cap: " & val
-          return (cfg, some(ekConfig))
-      of "output": cfg.output = val
-      of "manifest-json": cfg.manifestJson = true
-      else:
-        stderr.writeLine "unknown flag --" & key
-        return (cfg, some(ekConfig))
-    of cmdArgument:
-      stderr.writeLine "unexpected positional argument: " & key
+  let argv = commandLineParams()
+  var i = 0
+  template needArg(flag: string): string =
+    if i + 1 >= argv.len:
+      stderr.writeLine "missing argument for " & flag
       return (cfg, some(ekConfig))
-    else: discard
+    inc i
+    argv[i]
+  while i < argv.len:
+    let arg = argv[i]
+    let (key, valOpt) =
+      if arg.startsWith("--"):
+        let stripped = arg[2 .. ^1]
+        let eq = stripped.find('=')
+        if eq >= 0:
+          (stripped[0 ..< eq], some(stripped[eq + 1 .. ^1]))
+        else:
+          (stripped, none(string))
+      else:
+        stderr.writeLine "unexpected positional argument: " & arg
+        return (cfg, some(ekConfig))
+    template getVal(flag: string): string =
+      if valOpt.isSome: valOpt.get else: needArg(flag)
+    case key
+    of "beacon-node-url": cfg.beaconNodeUrl = getVal("--beacon-node-url")
+    of "start-slot":
+      let v = getVal("--start-slot")
+      try: cfg.startSlot = Slot(parseBiggestUInt(v))
+      except ValueError:
+        stderr.writeLine "invalid --start-slot: " & v
+        return (cfg, some(ekConfig))
+    of "end-slot":
+      let v = getVal("--end-slot")
+      try: cfg.endSlot = Slot(parseBiggestUInt(v))
+      except ValueError:
+        stderr.writeLine "invalid --end-slot: " & v
+        return (cfg, some(ekConfig))
+    of "warmup-start-slot":
+      let v = getVal("--warmup-start-slot")
+      try: cfg.warmupStartSlot = Slot(parseBiggestUInt(v))
+      except ValueError:
+        stderr.writeLine "invalid --warmup-start-slot: " & v
+        return (cfg, some(ekConfig))
+    of "network": cfg.network = getVal("--network")
+    of "byzantine-threshold":
+      let v = getVal("--byzantine-threshold")
+      try: cfg.byzantineThreshold = parseBiggestUInt(v).uint64
+      except ValueError:
+        stderr.writeLine "invalid --byzantine-threshold: " & v
+        return (cfg, some(ekConfig))
+    of "attestation-source-mode":
+      cfg.attestationSourceMode = getVal("--attestation-source-mode")
+    of "lookahead-cap":
+      let v = getVal("--lookahead-cap")
+      try: cfg.lookaheadCap = parseBiggestUInt(v).uint64
+      except ValueError:
+        stderr.writeLine "invalid --lookahead-cap: " & v
+        return (cfg, some(ekConfig))
+    of "output": cfg.output = getVal("--output")
+    of "manifest-json": cfg.manifestJson = true
+    else:
+      stderr.writeLine "unknown flag --" & key
+      return (cfg, some(ekConfig))
+    inc i
 
   if cfg.manifestJson:
     return (cfg, none(ExitKind))
@@ -164,29 +194,30 @@ proc trimBaseUrl(url: string): string =
   if url.endsWith("/"): url[0 ..< ^1] else: url
 
 proc httpGet(session: HttpSessionRef, url: string, acceptSsz: bool):
-    Future[tuple[status: int, headers: HttpResponseHeaderRef, body: seq[byte]]]
+    Future[tuple[status: int, body: seq[byte]]]
     {.async: (raises: [CatchableError]).} =
-  let uri = parseUri(url).valueOr:
-    raise newException(EngineError, "bad URL: " & url)
-  let req = HttpClientRequestRef.new(
-    session, uri, HttpMethod.MethodGet,
-    headers = if acceptSsz: @[
-        HttpHeaderTuple(key: "Accept", value: "application/octet-stream"),
-      ] else: @[
-        HttpHeaderTuple(key: "Accept", value: "application/json"),
-      ]).valueOr:
+  let acceptVal = if acceptSsz: "application/octet-stream" else: "application/json"
+  let headers = @[("Accept", acceptVal)]
+  let reqRes = HttpClientRequestRef.new(
+    session, url, MethodGet, headers = headers)
+  if reqRes.isErr:
     raise newException(EngineError, "bad request for " & url)
-  let resp = await req.send()
-  let body = await resp.getBodyBytes()
-  result = (status: resp.status.int, headers: resp.headers, body: body)
-  await resp.closeWait()
+  var req = reqRes.get
+  var resp: HttpClientResponseRef = nil
+  try:
+    resp = await req.send()
+    let body = await resp.getBodyBytes()
+    result = (status: resp.status.int, body: body)
+  finally:
+    if resp != nil: await resp.closeWait()
+    await req.closeWait()
 
 proc fetchSszBlockAtSlot(session: HttpSessionRef, base: string, slot: Slot,
     cfg: RuntimeConfig):
     Future[Option[ForkedSignedBeaconBlock]]
     {.async: (raises: [CatchableError]).} =
   let url = base & "/eth/v2/beacon/blocks/" & $slot.uint64
-  let (status, _, body) = await httpGet(session, url, acceptSsz = true)
+  let (status, body) = await httpGet(session, url, acceptSsz = true)
   if status == 404:
     return none(ForkedSignedBeaconBlock)
   if status != 200:
@@ -197,8 +228,8 @@ proc fetchSszBlockAtSlot(session: HttpSessionRef, base: string, slot: Slot,
 proc fetchSszBlockByRoot(session: HttpSessionRef, base: string,
     root: Eth2Digest, cfg: RuntimeConfig):
     Future[ForkedSignedBeaconBlock] {.async: (raises: [CatchableError]).} =
-  let url = base & "/eth/v2/beacon/blocks/" & root.data.toHex(true)
-  let (status, _, body) = await httpGet(session, url, acceptSsz = true)
+  let url = base & "/eth/v2/beacon/blocks/0x" & root.data.toHex()
+  let (status, body) = await httpGet(session, url, acceptSsz = true)
   if status != 200:
     raise newException(EngineError, &"HTTP {status} from {url}")
   readSszForkedSignedBeaconBlock(cfg, body)
@@ -207,7 +238,7 @@ proc fetchCheckpointState(session: HttpSessionRef, base: string, slot: Slot,
     cfg: RuntimeConfig):
     Future[ForkedHashedBeaconState] {.async: (raises: [CatchableError]).} =
   let url = base & "/eth/v2/debug/beacon/states/" & $slot.uint64
-  let (status, _, body) = await httpGet(session, url, acceptSsz = true)
+  let (status, body) = await httpGet(session, url, acceptSsz = true)
   if status != 200:
     raise newException(EngineError, &"HTTP {status} from {url}")
   readSszForkedHashedBeaconState(cfg, body)
@@ -216,7 +247,7 @@ proc fetchGenesisState(session: HttpSessionRef, base: string,
     cfg: RuntimeConfig):
     Future[ForkedHashedBeaconState] {.async: (raises: [CatchableError]).} =
   let url = base & "/eth/v2/debug/beacon/states/genesis"
-  let (status, _, body) = await httpGet(session, url, acceptSsz = true)
+  let (status, body) = await httpGet(session, url, acceptSsz = true)
   if status != 200:
     raise newException(EngineError, &"HTTP {status} from {url}")
   readSszForkedHashedBeaconState(cfg, body)
@@ -226,7 +257,7 @@ proc fetchAttestationPlan(session: HttpSessionRef, base: string,
     Future[AttestationPlan] {.async: (raises: [CatchableError]).} =
   let url =
     base & "/fcr-sim/v1/plan?from=" & $fromSlot.uint64 & "&to=" & $toSlot.uint64
-  let (status, _, body) = await httpGet(session, url, acceptSsz = false)
+  let (status, body) = await httpGet(session, url, acceptSsz = false)
   if status != 200:
     raise newException(EngineError, &"HTTP {status} from {url}")
   let bodyStr = string.fromBytes(body)
@@ -244,7 +275,7 @@ proc fetchAttestationPlan(session: HttpSessionRef, base: string,
 # Engine core
 
 type
-  Engine = object
+  Engine = ref object
     cfg: EngineConfig
     spec: RuntimeConfig
     session: HttpSessionRef
@@ -259,16 +290,16 @@ type
     validatorMonitor: ref ValidatorMonitor
     plan: AttestationPlan
     blockCache: Table[uint64, Option[ForkedSignedBeaconBlock]]
-    out: File
+    outFile: File
     recordsWritten: uint64
 
 proc mainnetSpec(byzantineThreshold: uint64): RuntimeConfig =
-  result = defaultRuntimeConfig
+  result = getMetadataForNetwork("mainnet").cfg
   result.CONFIRMATION_BYZANTINE_THRESHOLD = byzantineThreshold
 
 proc init(T: type Engine, cfg: EngineConfig): Future[T]
     {.async: (raises: [CatchableError]).} =
-  var eng: Engine
+  var eng = Engine()
   eng.cfg = cfg
   eng.spec = mainnetSpec(cfg.byzantineThreshold)
   eng.session = HttpSessionRef.new()
@@ -281,7 +312,7 @@ proc init(T: type Engine, cfg: EngineConfig): Future[T]
   let genesisState =
     await fetchGenesisState(eng.session, eng.base, eng.spec)
 
-  let memDb = BeaconChainDB.new("", inMemory = true)
+  let memDb = BeaconChainDB.new("", eng.spec, inMemory = true)
   ChainDAGRef.preInit(memDb, checkpointState)
 
   let validatorMonitor = newClone(ValidatorMonitor.init(eng.spec))
@@ -313,11 +344,11 @@ proc init(T: type Engine, cfg: EngineConfig): Future[T]
     eng.session, eng.base, cfg.warmupStartSlot + 1, cfg.endSlot)
 
   # Open output file (overwrite mode).
-  eng.out = open(cfg.output, fmWrite)
+  eng.outFile = open(cfg.output, fmWrite)
 
   return eng
 
-proc getBlockAtSlot(self: var Engine, slot: Slot):
+proc getBlockAtSlot(self: Engine, slot: Slot):
     Future[Option[ForkedSignedBeaconBlock]]
     {.async: (raises: [CatchableError]).} =
   let key = slot.uint64
@@ -328,38 +359,49 @@ proc getBlockAtSlot(self: var Engine, slot: Slot):
   self.blockCache[key] = blck
   blck
 
-proc processBlock(self: var Engine, forked: ForkedSignedBeaconBlock):
+proc makeOnBlockAdded(self: Engine, wallTime: BeaconTime, consensusFork: static ConsensusFork):
+    OnBlockAdded[consensusFork] =
+  proc(blckRef: BlockRef, blck: consensusFork.TrustedSignedBeaconBlock,
+       state: consensusFork.BeaconState, epochRef: EpochRef,
+       unrealized: FinalityCheckpoints) {.gcsafe, raises: [].} =
+    self.attPool[].addForkChoice(
+      epochRef, blckRef, unrealized, blck.message, wallTime)
+
+proc processBlock(self: Engine, forked: ForkedSignedBeaconBlock):
     Result[BlockRef, string] =
   ## Imports a canonical-chain block via dag.addHeadBlockWithParent + addForkChoice.
-  let checked = withBlck(forked):
-    let parent = checkHeadBlock(self.dag, forkyBlck).valueOr:
-      if error == VerifierError.Duplicate:
-        # Same block already in dag (e.g. cached); proceed without re-import.
-        return ok(self.dag.getBlockRef(forkyBlck.root).valueOr:
-          return err("Duplicate but missing BlockRef"))
-      return err("checkHeadBlock failed: " & $error)
-    let addRes = addHeadBlockWithParent(
-      self.dag, self.batchVerifier[], forkyBlck, parent,
-      OptimisticStatus.valid,
-      onBlockAdded = OnBlockAdded(nil))
-    if addRes.isErr:
-      return err("addHeadBlock failed: " & $addRes.error)
-    let blckRef = addRes.value
-    let epochRef = self.dag.getEpochRef(blckRef, blckRef.slot.epoch, false).valueOr:
-      return err("getEpochRef failed: " & $error)
-    let unrealized = withState(self.dag.headState):
-      when consensusFork >= ConsensusFork.Altair:
-        let (cps, _) = forkyState.data.compute_unrealized_finality()
-        cps
+  var resultRef: BlockRef = nil
+  var errMsg = ""
+  withBlck(forked):
+    let parentRes = checkHeadBlock(self.dag, forkyBlck)
+    if parentRes.isErr:
+      let parentErr = results.error(parentRes)
+      if parentErr == VerifierError.Duplicate:
+        let existing = self.dag.getBlockRef(forkyBlck.root)
+        if existing.isSome:
+          resultRef = existing.get
+        else:
+          errMsg = "Duplicate but missing BlockRef"
       else:
-        default(FinalityCheckpoints)
-    self.attPool[].addForkChoice(
-      epochRef, blckRef, unrealized, forkyBlck.message,
-      blckRef.slot.start_beacon_time(self.dag.timeParams))
-    blckRef
-  ok(checked)
+        errMsg = "checkHeadBlock failed: " & $parentErr
+    else:
+      let parent = parentRes.value
+      let wallTime = forkyBlck.message.slot.start_beacon_time(self.dag.cfg.timeParams)
+      let cb = makeOnBlockAdded(self, wallTime, consensusFork)
+      let addRes = addHeadBlockWithParent(
+        self.dag, self.batchVerifier[], forkyBlck, parent,
+        OptimisticStatus.valid, cb)
+      if addRes.isErr:
+        errMsg = "addHeadBlock failed: " & $results.error(addRes)
+      else:
+        resultRef = addRes.value
+  if errMsg.len > 0:
+    return err(errMsg)
+  if resultRef.isNil:
+    return err("processBlock: no BlockRef")
+  ok(resultRef)
 
-proc injectAttestationsFromBlock(self: var Engine, simSlot: Slot,
+proc injectAttestationsFromBlock(self: Engine, simSlot: Slot,
     sourceBlockSlot: Slot): Future[uint64]
     {.async: (raises: [CatchableError]).} =
   let blckOpt = await self.getBlockAtSlot(sourceBlockSlot)
@@ -387,19 +429,23 @@ proc injectAttestationsFromBlock(self: var Engine, simSlot: Slot,
         inc injected
   injected
 
-proc recomputeHead(self: var Engine, simSlot: Slot): Result[Eth2Digest, string] =
-  let wallTime = (simSlot + 1).start_beacon_time(self.dag.timeParams)
-  let head = self.attPool[].forkChoice.get_head(self.dag, wallTime).valueOr:
-    return err("get_head failed: " & $error)
-  let headRef = self.dag.getBlockRef(head).valueOr:
-    return err("getBlockRef(head) failed: " & $error)
+proc recomputeHead(self: Engine, simSlot: Slot): Result[Eth2Digest, string] =
+  let wallTime = (simSlot + 1).start_beacon_time(self.dag.cfg.timeParams)
+  let headRes = self.attPool[].forkChoice.get_head(self.dag, wallTime)
+  if headRes.isErr:
+    return err("get_head failed")
+  let head = headRes.value
+  let headRefOpt = self.dag.getBlockRef(head)
+  if headRefOpt.isNone:
+    return err("getBlockRef(head) failed")
+  let headRef = headRefOpt.get
   self.dag.updateHead(headRef, self.quarantine[], [])
-  # will_select_head triggers FCR advance + confirmed root update.
-  self.attPool[].forkChoice.will_select_head(self.dag, headRef, wallTime).isOkOr:
-    return err("will_select_head failed: " & $error)
+  let wsRes = self.attPool[].forkChoice.will_select_head(self.dag, headRef, wallTime)
+  if wsRes.isErr:
+    return err("will_select_head failed")
   ok(head)
 
-proc emitRecord(self: var Engine, simSlot: Slot, hasBlock: bool,
+proc emitRecord(self: Engine, simSlot: Slot, hasBlock: bool,
     blockRoot: Option[Eth2Digest], headRoot: Eth2Digest,
     sourceSlot: Option[Slot], numInjected: uint64,
     fcrEvalUs: uint64) =
@@ -446,13 +492,13 @@ proc emitRecord(self: var Engine, simSlot: Slot, hasBlock: bool,
   rec["is_missed_slot"] = %(not hasBlock)
   rec["fcr_eval_duration_us"] = %fcrEvalUs
 
-  self.out.write($rec)
-  self.out.write("\n")
+  self.outFile.write($rec)
+  self.outFile.write("\n")
   inc self.recordsWritten
   if self.recordsWritten mod FlushInterval == 0:
-    self.out.flushFile()
+    self.outFile.flushFile()
 
-proc run(self: var Engine): Future[Result[void, string]]
+proc run(self: Engine): Future[Result[void, string]]
     {.async: (raises: [CatchableError]).} =
   var slot = self.cfg.warmupStartSlot + 1
   while slot < self.cfg.endSlot:
@@ -479,7 +525,7 @@ proc run(self: var Engine): Future[Result[void, string]]
     let t0 = getMonoTime()
     let headRes = self.recomputeHead(slot)
     if headRes.isErr:
-      return err("recomputeHead@" & $slot.uint64 & ": " & headRes.error)
+      return err("recomputeHead@" & $slot.uint64 & ": " & results.error(headRes))
     let dur = (getMonoTime() - t0).inMicroseconds.uint64
 
     if isRecording:
@@ -487,8 +533,8 @@ proc run(self: var Engine): Future[Result[void, string]]
         sourceSlot, numInjected, dur)
 
     slot = slot + 1
-  self.out.flushFile()
-  self.out.close()
+  self.outFile.flushFile()
+  self.outFile.close()
   ok()
 
 # --------------------------------------------------------------------------------
@@ -517,5 +563,3 @@ proc main() {.async: (raises: [CatchableError]).} =
 
 when isMainModule:
   waitFor main()
-
-{.pop.}
