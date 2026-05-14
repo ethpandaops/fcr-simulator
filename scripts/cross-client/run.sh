@@ -33,8 +33,9 @@ fi
 if [[ -f .env ]]; then
     set -a; source .env; set +a
 fi
-if [[ -z "${BN_URL:-}" ]]; then
-    echo "BN_URL must be set (via .env or env)" >&2
+BN="${BEACON_NODE_URL:-${BN_URL:-}}"
+if [[ -z "$BN" ]]; then
+    echo "BEACON_NODE_URL (or BN_URL) must be set in .env or environment" >&2
     exit 2
 fi
 
@@ -56,7 +57,7 @@ for ep in $EPOCHS; do
             --end-epoch "$((ep + 1))" \
             --warmup-epochs "$WARMUP_EPOCHS" \
             --parallel "$PARALLEL" \
-            --beacon-node-url "$BN_URL" \
+            --beacon-node-url "$BN" \
             --output "$out_base.csv" \
             --output-format both \
             --attestation-source-mode "$ATT_MODE" \

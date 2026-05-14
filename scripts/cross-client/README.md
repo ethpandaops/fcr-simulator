@@ -22,4 +22,4 @@ scripts/cross-client/run.sh grandine   ./results/fcr-grandine
 scripts/cross-client/diff.py
 ```
 
-`run.sh` reads `BN_URL` from `.env` (`set -a; source .env; set +a`); the beacon node must be in archive mode for older ranges.
+`run.sh` reads `BEACON_NODE_URL` (or legacy `BN_URL`) from `.env` (`set -a; source .env; set +a`); the beacon node must be in archive mode for older ranges.

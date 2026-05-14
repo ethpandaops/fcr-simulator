@@ -20,6 +20,7 @@ from collections import defaultdict
 from pathlib import Path
 
 CONSENSUS_COLS = [
+    "source_block_slot",
     "has_block",
     "block_root",
     "head_root",
@@ -30,9 +31,13 @@ CONSENSUS_COLS = [
     "strict_one_slot_confirmed",
     "finalized_epoch",
     "justified_epoch",
-    "num_attestations_injected",
     "is_epoch_boundary",
     "is_missed_slot",
+]
+
+DIAGNOSTIC_COLS = [
+    "num_attestations_injected",
+    "fcr_eval_duration_us",
 ]
 
 
@@ -86,12 +91,13 @@ def main() -> int:
 
     rows_written = 0
     divergent_rows = 0
+    missing_rows = 0
     per_col_disagree: dict[str, int] = {c: 0 for c in CONSENSUS_COLS}
 
     with per_slot_path.open("w", newline="") as f_all, div_path.open("w", newline="") as f_div:
         writer = csv.writer(f_all)
         div_writer = csv.writer(f_div)
-        writer.writerow(["slot", "engine", *CONSENSUS_COLS])
+        writer.writerow(["slot", "engine", *CONSENSUS_COLS, *DIAGNOSTIC_COLS])
         div_writer.writerow(["slot", "column", *engines])
 
         for slot in sorted(per_slot):
@@ -100,30 +106,43 @@ def main() -> int:
                 if engine not in engines_present:
                     continue
                 row = engines_present[engine]
-                writer.writerow([slot, engine, *(row.get(c, "") for c in CONSENSUS_COLS)])
+                writer.writerow([
+                    slot,
+                    engine,
+                    *(row.get(c, "") for c in CONSENSUS_COLS),
+                    *(row.get(c, "") for c in DIAGNOSTIC_COLS),
+                ])
                 rows_written += 1
 
-            seen_engines = [e for e in engines if e in engines_present]
-            if len(seen_engines) < 2:
-                continue
             row_had_divergence = False
-            for col in CONSENSUS_COLS:
-                values = [engines_present[e].get(col, "") for e in seen_engines]
-                if len(set(values)) > 1:
-                    per_col_disagree[col] += 1
-                    row_had_divergence = True
-                    div_writer.writerow([slot, col, *values])
+            missing_engines = [e for e in engines if e not in engines_present]
+            if missing_engines:
+                missing_rows += 1
+                row_had_divergence = True
+                div_writer.writerow([slot, "_row_missing", *(("" if e in missing_engines else "present") for e in engines)])
+
+            seen_engines = [e for e in engines if e in engines_present]
+            if len(seen_engines) >= 2:
+                for col in CONSENSUS_COLS:
+                    values = [engines_present[e].get(col, "") for e in seen_engines]
+                    if len(set(values)) > 1:
+                        per_col_disagree[col] += 1
+                        row_had_divergence = True
+                        # Map back to all engines: blank string for missing engines.
+                        div_writer.writerow([slot, col, *(engines_present[e].get(col, "") if e in engines_present else "" for e in engines)])
             if row_had_divergence:
                 divergent_rows += 1
 
     total_slots = len(per_slot)
     print(f"wrote {per_slot_path} ({rows_written} engine-slot rows over {total_slots} unique slots)")
-    print(f"wrote {div_path} ({divergent_rows} divergent slots of {total_slots})")
+    print(f"wrote {div_path} ({divergent_rows} divergent slots of {total_slots}; {missing_rows} had a missing engine row)")
     print("")
     print("per-column disagreement counts (slot-level):")
     for col in CONSENSUS_COLS:
         marker = "*" if per_col_disagree[col] else " "
         print(f"  {marker} {col:30s} {per_col_disagree[col]}")
+    print("")
+    print("diagnostic columns (NOT included in divergence): " + ", ".join(DIAGNOSTIC_COLS))
     return 0
 
 
