@@ -276,17 +276,8 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	if engineManifest.EngineName == "" {
-		return 1, fmt.Errorf("engine manifest from %s did not report engine_name", cfg.EngineBinary)
-	}
-	if engineManifest.EngineName != cfg.Engine {
-		return 1, fmt.Errorf("engine manifest name %q does not match --engine=%q", engineManifest.EngineName, cfg.Engine)
-	}
-
-	for _, flag := range supportedEngines[cfg.Engine].RequiredBuildFlags {
-		if !engineHasBuildFlag(engineManifest, flag) {
-			return 1, fmt.Errorf("engine %s is missing required build flag %q (got build_flags=%v)", cfg.EngineBinary, flag, engineManifest.BuildFlags)
-		}
+	if err := validateEngineManifest(cfg.Engine, cfg.EngineBinary, engineManifest); err != nil {
+		return 1, err
 	}
 
 	chunks := chunk.Split(cfg.StartEpoch, cfg.EndEpoch, cfg.WarmupEpochs, cfg.Parallel)
@@ -399,6 +390,21 @@ func engineHasBuildFlag(m manifest.EngineManifest, flag string) bool {
 		}
 	}
 	return false
+}
+
+func validateEngineManifest(engine, binary string, m manifest.EngineManifest) error {
+	if m.EngineName == "" {
+		return fmt.Errorf("engine manifest from %s did not report engine_name", binary)
+	}
+	if m.EngineName != engine {
+		return fmt.Errorf("engine manifest name %q does not match --engine=%q", m.EngineName, engine)
+	}
+	for _, flag := range supportedEngines[engine].RequiredBuildFlags {
+		if !engineHasBuildFlag(m, flag) {
+			return fmt.Errorf("engine %s is missing required build flag %q (got build_flags=%v)", binary, flag, m.BuildFlags)
+		}
+	}
+	return nil
 }
 
 func captureEngineManifest(ctx context.Context, engineBinary string) (manifest.EngineManifest, error) {

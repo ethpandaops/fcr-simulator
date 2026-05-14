@@ -66,6 +66,37 @@ func TestEngineHasBuildFlag(t *testing.T) {
 	}
 }
 
+func TestValidateEngineManifest_RejectsEmptyEngineName(t *testing.T) {
+	m := manifest.EngineManifest{BuildFlags: []string{"fake_crypto"}}
+	err := validateEngineManifest("lighthouse", "/tmp/fcr-x", m)
+	if err == nil || !strings.Contains(err.Error(), "did not report engine_name") {
+		t.Errorf("expected engine_name-required error, got %v", err)
+	}
+}
+
+func TestValidateEngineManifest_RejectsMismatchedName(t *testing.T) {
+	m := manifest.EngineManifest{EngineName: "teku", BuildFlags: []string{"fake_crypto"}}
+	err := validateEngineManifest("lighthouse", "/tmp/fcr-x", m)
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Errorf("expected name-mismatch error, got %v", err)
+	}
+}
+
+func TestValidateEngineManifest_RejectsMissingRequiredFlag(t *testing.T) {
+	m := manifest.EngineManifest{EngineName: "lighthouse", BuildFlags: []string{"unrelated"}}
+	err := validateEngineManifest("lighthouse", "/tmp/fcr-x", m)
+	if err == nil || !strings.Contains(err.Error(), `missing required build flag "fake_crypto"`) {
+		t.Errorf("expected missing-build-flag error, got %v", err)
+	}
+}
+
+func TestValidateEngineManifest_AcceptsMatching(t *testing.T) {
+	m := manifest.EngineManifest{EngineName: "grandine", BuildFlags: []string{"fake_crypto", "extra"}}
+	if err := validateEngineManifest("grandine", "/tmp/fcr-x", m); err != nil {
+		t.Errorf("expected success, got %v", err)
+	}
+}
+
 func TestSupportedEngines_AllRequireFakeCrypto(t *testing.T) {
 	for engine, spec := range supportedEngines {
 		found := false
