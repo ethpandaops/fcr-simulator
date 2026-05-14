@@ -119,7 +119,7 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 
 	fs := flag.NewFlagSet("fcr-orchestrator", flag.ContinueOnError)
 	fs.SetOutput(output)
-	fs.StringVar(&cfg.Engine, "engine", "", "engine name (V1 supports lighthouse)")
+	fs.StringVar(&cfg.Engine, "engine", "", "engine name (V1 supports lighthouse, nimbus)")
 	fs.StringVar(&cfg.EngineBinary, "engine-binary", os.Getenv("FCR_ENGINE_BINARY"), "path to engine binary (env: FCR_ENGINE_BINARY)")
 	fs.StringVar(&cfg.Network, "network", "", "network name (V1 supports mainnet)")
 	fs.Var(&startEpoch, "start-epoch", "first epoch, inclusive")
@@ -181,8 +181,8 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 	if cfg.Engine == "" {
 		return fmt.Errorf("--engine is required")
 	}
-	if cfg.Engine != "lighthouse" {
-		return fmt.Errorf("--engine=%q is not supported in V1; supported value is %q", cfg.Engine, "lighthouse")
+	if cfg.Engine != "lighthouse" && cfg.Engine != "nimbus" {
+		return fmt.Errorf("--engine=%q is not supported in V1; supported values are %q, %q", cfg.Engine, "lighthouse", "nimbus")
 	}
 	if cfg.EngineBinary == "" {
 		return fmt.Errorf("--engine-binary is required")
@@ -261,7 +261,7 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 	}
 
 	if !engineHasBuildFlag(engineManifest, "fake_crypto") {
-		return 1, fmt.Errorf("engine %s was not built with fake_crypto; refusing to run (build with `cargo build --features fake_crypto`)", cfg.EngineBinary)
+		return 1, fmt.Errorf("engine %s was not built with fake_crypto; refusing to run (rebuild the engine with its fake-crypto / -d:fakeCrypto build flag)", cfg.EngineBinary)
 	}
 
 	chunks := chunk.Split(cfg.StartEpoch, cfg.EndEpoch, cfg.WarmupEpochs, cfg.Parallel)
