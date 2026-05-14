@@ -1,0 +1,29 @@
+From 5e4b68909945031d0006538b0456ec3900377bfc Mon Sep 17 00:00:00 2001
+From: Codex <codex@example.invalid>
+Date: Thu, 14 May 2026 19:23:04 +1000
+Subject: [PATCH 2/2] fcr-simulator-engine: enable zip64 shadowJar and merge
+ service files
+
+---
+ fcr-simulator-engine/build.gradle | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/fcr-simulator-engine/build.gradle b/fcr-simulator-engine/build.gradle
+index a7c3af3..61f108f 100644
+--- a/fcr-simulator-engine/build.gradle
++++ b/fcr-simulator-engine/build.gradle
+@@ -66,4 +66,11 @@ shadowJar {
+   archiveBaseName = 'fcr-teku'
+   archiveClassifier = 'all'
+   archiveVersion = ''
++  zip64 = true
++  mergeServiceFiles()
++  manifest {
++    attributes(
++        'Main-Class': 'tech.pegasys.teku.statetransition.forkchoice.fcr.Main',
++        'Multi-Release': 'true')
++  }
+ }
+-- 
+2.50.1 (Apple Git-155)
+

@@ -2,3 +2,7 @@
 	path = lighthouse
 	url = git@github.com:samcm/lighthouse.git
 	branch = fcr-simulator
+[submodule "engines/teku/teku"]
+	path = engines/teku/teku
+	url = https://github.com/Nashatyrev/teku.git
+	branch = confirmation-2

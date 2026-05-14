@@ -1,0 +1,1050 @@
+From 055018713cbe65d3d32ded0558721025fca410b7 Mon Sep 17 00:00:00 2001
+From: Codex <codex@example.invalid>
+Date: Thu, 14 May 2026 19:13:12 +1000
+Subject: [PATCH 1/2] fcr-simulator-engine: add Teku engine wrapper
+
+---
+ fcr-simulator-engine/build.gradle             |  69 ++++
+ .../forkchoice/FcrForkChoiceAccess.java       |  25 ++
+ .../forkchoice/fcr/Config.java                |  89 ++++
+ .../forkchoice/fcr/Engine.java                | 381 ++++++++++++++++++
+ .../forkchoice/fcr/HttpClient.java            | 100 +++++
+ .../statetransition/forkchoice/fcr/Main.java  | 103 +++++
+ .../forkchoice/fcr/OutputWriter.java          |  59 +++
+ .../forkchoice/fcr/PlanFetcher.java           |  55 +++
+ .../forkchoice/fcr/SlotResult.java            |  55 +++
+ .../src/main/resources/log4j2-fcr.xml         |  13 +
+ settings.gradle                               |   1 +
+ 11 files changed, 950 insertions(+)
+ create mode 100644 fcr-simulator-engine/build.gradle
+ create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
+ create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
+ create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
+ create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java
+ create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java
+ create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java
+ create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/PlanFetcher.java
+ create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotResult.java
+ create mode 100644 fcr-simulator-engine/src/main/resources/log4j2-fcr.xml
+
+diff --git a/fcr-simulator-engine/build.gradle b/fcr-simulator-engine/build.gradle
+new file mode 100644
+index 0000000..a7c3af3
+--- /dev/null
++++ b/fcr-simulator-engine/build.gradle
+@@ -0,0 +1,69 @@
++plugins {
++  id 'application'
++  id 'com.gradleup.shadow' version '8.3.5'
++}
++
++def fcrBuildDir = layout.buildDirectory.dir('generated-resources/fcr')
++def gitCommit =
++    providers
++        .exec {
++          commandLine 'git', '-C', rootDir.absolutePath, 'rev-parse', 'HEAD'
++        }
++        .standardOutput
++        .asText
++        .map { it.trim() }
++        .get()
++
++dependencies {
++  implementation project(':ethereum:networks')
++  implementation project(':ethereum:spec')
++  implementation project(':ethereum:statetransition')
++  implementation project(':infrastructure:async')
++  implementation project(':infrastructure:bls')
++  implementation project(':infrastructure:kzg')
++  implementation project(':infrastructure:metrics')
++  implementation project(':infrastructure:ssz')
++  implementation project(':infrastructure:time')
++  implementation project(':infrastructure:unsigned')
++  implementation project(':storage')
++  implementation project(':storage:api')
++
++  implementation testFixtures(project(':ethereum:spec'))
++  implementation testFixtures(project(':ethereum:statetransition'))
++  implementation testFixtures(project(':infrastructure:async'))
++  implementation testFixtures(project(':infrastructure:bls'))
++  implementation testFixtures(project(':infrastructure:metrics'))
++  implementation testFixtures(project(':infrastructure:time'))
++  implementation testFixtures(project(':storage'))
++
++  implementation 'com.fasterxml.jackson.core:jackson-databind'
++  implementation 'io.consensys.tuweni:tuweni-bytes'
++}
++
++application {
++  mainClass = 'tech.pegasys.teku.statetransition.forkchoice.fcr.Main'
++}
++
++tasks.register('generateFcrBuildProperties') {
++  def outputFile = fcrBuildDir.map { it.file('META-INF/fcr-build.properties') }
++  outputs.file(outputFile)
++  doLast {
++    def file = outputFile.get().asFile
++    file.parentFile.mkdirs()
++    file.text = "engine.version=${project.version}\nengine.commit=${gitCommit}\n"
++  }
++}
++
++sourceSets {
++  main {
++    resources.srcDir(fcrBuildDir)
++  }
++}
++
++processResources.dependsOn tasks.named('generateFcrBuildProperties')
++
++shadowJar {
++  archiveBaseName = 'fcr-teku'
++  archiveClassifier = 'all'
++  archiveVersion = ''
++}
+diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
+new file mode 100644
+index 0000000..22fd787
+--- /dev/null
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
+@@ -0,0 +1,25 @@
++/*
++ * Copyright Consensys Software Inc., 2025
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
++ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations under the License.
++ */
++
++package tech.pegasys.teku.statetransition.forkchoice;
++
++import tech.pegasys.teku.infrastructure.async.SafeFuture;
++import tech.pegasys.teku.infrastructure.unsigned.UInt64;
++
++public final class FcrForkChoiceAccess {
++  private FcrForkChoiceAccess() {}
++
++  public static SafeFuture<Boolean> processHead(final ForkChoice forkChoice, final UInt64 nodeSlot) {
++    return forkChoice.processHead(nodeSlot);
++  }
++}
+diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
+new file mode 100644
+index 0000000..3c5421e
+--- /dev/null
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
+@@ -0,0 +1,89 @@
++/*
++ * Copyright Consensys Software Inc., 2025
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
++ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations under the License.
++ */
++
++package tech.pegasys.teku.statetransition.forkchoice.fcr;
++
++import java.nio.file.Path;
++import java.util.HashMap;
++import java.util.Map;
++
++public record Config(
++    String beaconNodeUrl,
++    long startSlot,
++    long endSlot,
++    long warmupStartSlot,
++    String network,
++    long byzantineThreshold,
++    String attestationSourceMode,
++    long lookaheadCap,
++    Path output) {
++
++  static Config parse(final String[] args) {
++    final Map<String, String> values = new HashMap<>();
++    for (int i = 0; i < args.length; i++) {
++      final String arg = args[i];
++      if (!arg.startsWith("--")) {
++        throw new IllegalArgumentException("unexpected positional argument: " + arg);
++      }
++      if (arg.equals("--manifest-json")) {
++        continue;
++      }
++      if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
++        throw new IllegalArgumentException("missing value for " + arg);
++      }
++      values.put(arg.substring(2), args[++i]);
++    }
++
++    final Config cfg =
++        new Config(
++            required(values, "beacon-node-url"),
++            parseLong(required(values, "start-slot"), "start-slot"),
++            parseLong(required(values, "end-slot"), "end-slot"),
++            parseLong(required(values, "warmup-start-slot"), "warmup-start-slot"),
++            required(values, "network"),
++            parseLong(values.getOrDefault("byzantine-threshold", "25"), "byzantine-threshold"),
++            values.getOrDefault("attestation-source-mode", ""),
++            parseLong(values.getOrDefault("lookahead-cap", "0"), "lookahead-cap"),
++            Path.of(required(values, "output")));
++    cfg.validate();
++    return cfg;
++  }
++
++  private void validate() {
++    if (!network.equals("mainnet")) {
++      throw new IllegalArgumentException("--network=" + network + " is not supported");
++    }
++    if (startSlot > endSlot) {
++      throw new IllegalArgumentException("--start-slot must be <= --end-slot");
++    }
++    if (warmupStartSlot >= endSlot) {
++      throw new IllegalArgumentException("--warmup-start-slot must be < --end-slot");
++    }
++  }
++
++  private static String required(final Map<String, String> values, final String key) {
++    final String value = values.get(key);
++    if (value == null || value.isBlank()) {
++      throw new IllegalArgumentException("--" + key + " is required");
++    }
++    return value;
++  }
++
++  private static long parseLong(final String value, final String key) {
++    try {
++      return Long.parseUnsignedLong(value);
++    } catch (final NumberFormatException e) {
++      throw new IllegalArgumentException("--" + key + " must be an unsigned integer", e);
++    }
++  }
++}
+diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
+new file mode 100644
+index 0000000..1613e0c
+--- /dev/null
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
+@@ -0,0 +1,381 @@
++/*
++ * Copyright Consensys Software Inc., 2025
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
++ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations under the License.
++ */
++
++package tech.pegasys.teku.statetransition.forkchoice.fcr;
++
++import static tech.pegasys.teku.networks.Eth2NetworkConfiguration.DEFAULT_FORK_CHOICE_LATE_BLOCK_REORG_ENABLED;
++
++import tech.pegasys.teku.bls.BLSConstants;
++import tech.pegasys.teku.bls.BLSSignatureVerifier;
++import tech.pegasys.teku.infrastructure.async.SafeFuture;
++import tech.pegasys.teku.infrastructure.async.eventthread.InlineEventThread;
++import tech.pegasys.teku.infrastructure.metrics.StubMetricsSystem;
++import tech.pegasys.teku.infrastructure.unsigned.UInt64;
++import tech.pegasys.teku.kzg.KZG;
++import tech.pegasys.teku.spec.Spec;
++import tech.pegasys.teku.spec.SpecFactory;
++import tech.pegasys.teku.spec.datastructures.attestation.ValidatableAttestation;
++import tech.pegasys.teku.spec.datastructures.blocks.SignedBeaconBlock;
++import tech.pegasys.teku.spec.datastructures.blocks.SignedBlockAndState;
++import tech.pegasys.teku.spec.datastructures.execution.ExecutionPayloadContext;
++import tech.pegasys.teku.spec.datastructures.operations.Attestation;
++import tech.pegasys.teku.spec.datastructures.operations.IndexedAttestation;
++import tech.pegasys.teku.spec.datastructures.state.AnchorPoint;
++import tech.pegasys.teku.spec.datastructures.state.beaconstate.BeaconState;
++import tech.pegasys.teku.spec.executionlayer.ExecutionLayerChannelStub;
++import tech.pegasys.teku.spec.executionlayer.ForkChoiceState;
++import tech.pegasys.teku.spec.executionlayer.ForkChoiceUpdatedResult;
++import tech.pegasys.teku.spec.executionlayer.PayloadStatus;
++import tech.pegasys.teku.spec.logic.common.statetransition.availability.AvailabilityCheckerFactory;
++import tech.pegasys.teku.spec.logic.common.statetransition.results.BlockImportResult;
++import tech.pegasys.teku.spec.logic.common.util.AsyncBLSSignatureVerifier;
++import tech.pegasys.teku.statetransition.forkchoice.FcrForkChoiceAccess;
++import tech.pegasys.teku.statetransition.forkchoice.ForkChoice;
++import tech.pegasys.teku.statetransition.forkchoice.ForkChoiceNotifier;
++import tech.pegasys.teku.statetransition.forkchoice.ForkChoiceStateProvider;
++import tech.pegasys.teku.statetransition.forkchoice.ForkChoiceUpdatedResultSubscriber;
++import tech.pegasys.teku.statetransition.forkchoice.MergeTransitionBlockValidator;
++import tech.pegasys.teku.statetransition.forkchoice.PayloadValidationResult;
++import tech.pegasys.teku.statetransition.forkchoice.TickProcessor;
++import tech.pegasys.teku.statetransition.util.DebugDataDumper;
++import tech.pegasys.teku.statetransition.validation.BlockBroadcastValidator;
++import tech.pegasys.teku.storage.client.RecentChainData;
++import tech.pegasys.teku.storage.server.StateStorageMode;
++import tech.pegasys.teku.storage.storageSystem.FileBackedStorageSystemBuilder;
++import tech.pegasys.teku.storage.storageSystem.StorageSystem;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.Optional;
++import java.util.concurrent.CopyOnWriteArrayList;
++
++import org.apache.tuweni.bytes.Bytes32;
++
++public class Engine {
++  private final Config cfg;
++  private final Spec spec;
++  private final HttpClient httpClient;
++  private final StorageSystem storageSystem;
++  private final RecentChainData recentChainData;
++  private final ForkChoice forkChoice;
++  private final ExecutionLayerChannelStub executionLayer;
++  private final Map<UInt64, Optional<UInt64>> plan;
++  private final OutputWriter outputWriter;
++
++  private Engine(
++      final Config cfg,
++      final Spec spec,
++      final HttpClient httpClient,
++      final StorageSystem storageSystem,
++      final ForkChoice forkChoice,
++      final ExecutionLayerChannelStub executionLayer,
++      final Map<UInt64, Optional<UInt64>> plan,
++      final OutputWriter outputWriter) {
++    this.cfg = cfg;
++    this.spec = spec;
++    this.httpClient = httpClient;
++    this.storageSystem = storageSystem;
++    this.recentChainData = storageSystem.recentChainData();
++    this.forkChoice = forkChoice;
++    this.executionLayer = executionLayer;
++    this.plan = plan;
++    this.outputWriter = outputWriter;
++  }
++
++  public static Engine bootstrap(final Config cfg) throws IOException, InterruptedException {
++    BLSConstants.disableBLSVerification();
++    final Spec spec =
++        SpecFactory.create(
++            cfg.network(),
++            false,
++            builder ->
++                builder
++                    .confirmationByzantineThreshold((int) cfg.byzantineThreshold())
++                    .committeeWeightEstimationAdjustmentFactor(5)
++                    .confirmationSlashingThreshold(25));
++    spec.reinitializeForTesting(
++        AvailabilityCheckerFactory.NOOP_BLOB_SIDECAR,
++        AvailabilityCheckerFactory.NOOP_DATACOLUMN_SIDECAR,
++        KZG.DISABLED);
++
++    final HttpClient httpClient = new HttpClient(cfg.beaconNodeUrl());
++    final UInt64 warmupStartSlot = UInt64.valueOf(cfg.warmupStartSlot());
++    final BeaconState anchorState =
++        spec.deserializeBeaconState(httpClient.getState(warmupStartSlot));
++    final SignedBeaconBlock anchorBlock =
++        spec.deserializeSignedBeaconBlock(httpClient.getBlockRequired(warmupStartSlot));
++
++    final StorageSystem storageSystem =
++        FileBackedStorageSystemBuilder.create()
++            .storageMode(StateStorageMode.PRUNE)
++            .specProvider(spec)
++            .dataDir(Files.createTempDirectory("fcr-teku"))
++            .build();
++    final RecentChainData recentChainData = storageSystem.recentChainData();
++    final ExecutionLayerChannelStub executionLayer = new ExecutionLayerChannelStub(spec, false);
++    final InlineEventThread eventThread = new InlineEventThread();
++    final ForkChoiceNotifier forkChoiceNotifier = new ValidForkChoiceNotifier();
++    final ForkChoice forkChoice =
++        new ForkChoice(
++            spec,
++            eventThread,
++            recentChainData,
++            forkChoiceNotifier,
++            new ForkChoiceStateProvider(eventThread, recentChainData),
++            new TickProcessor(spec, recentChainData),
++            new AlwaysValidTransitionBlockValidator(spec, recentChainData),
++            DEFAULT_FORK_CHOICE_LATE_BLOCK_REORG_ENABLED,
++            DebugDataDumper.NOOP,
++            new StubMetricsSystem(),
++            AsyncBLSSignatureVerifier.wrap(BLSSignatureVerifier.NO_OP));
++
++    final AnchorPoint anchorPoint =
++        AnchorPoint.fromInitialBlockAndState(
++            spec, new SignedBlockAndState(anchorBlock, anchorState));
++    recentChainData.initializeFromAnchorPoint(
++        anchorPoint, spec.computeTimeAtSlot(anchorState, anchorState.getSlot()));
++
++    final PlanFetcher planFetcher = new PlanFetcher(httpClient);
++    final Map<UInt64, Optional<UInt64>> plan =
++        planFetcher.fetch(UInt64.valueOf(cfg.warmupStartSlot() + 1), UInt64.valueOf(cfg.endSlot()));
++    validatePlan(plan, cfg);
++    System.err.println(
++        "engine bootstrap done: warmup_start_slot="
++            + cfg.warmupStartSlot()
++            + " start_slot="
++            + cfg.startSlot()
++            + " end_slot="
++            + cfg.endSlot()
++            + " plan_entries="
++            + plan.size());
++
++    return new Engine(
++        cfg,
++        spec,
++        httpClient,
++        storageSystem,
++        forkChoice,
++        executionLayer,
++        plan,
++        new OutputWriter(cfg.output()));
++  }
++
++  public void run() throws IOException, InterruptedException {
++    long slotsProcessed = 0;
++    try {
++      for (long slot = cfg.warmupStartSlot() + 1; slot < cfg.endSlot(); slot++) {
++        runSlot(slot);
++        slotsProcessed++;
++      }
++    } finally {
++      System.err.println(
++          "slots_processed="
++              + slotsProcessed
++              + " records_written="
++              + outputWriter.getRecordsWritten());
++      outputWriter.flush();
++    }
++  }
++
++  private void runSlot(final long simSlot) throws IOException, InterruptedException {
++    final UInt64 slot = UInt64.valueOf(simSlot);
++    final boolean isRecording = simSlot >= cfg.startSlot();
++    storageSystem.chainUpdater().advanceCurrentSlotToAtLeast(slot);
++    final Optional<SignedBeaconBlock> maybeBlock =
++        httpClient.getBlock(slot).map(spec::deserializeSignedBeaconBlock);
++    final boolean hasBlock = maybeBlock.isPresent();
++    final Bytes32 blockRoot = maybeBlock.map(SignedBeaconBlock::getRoot).orElse(null);
++
++    if (maybeBlock.isPresent()) {
++      final BlockImportResult result =
++          forkChoice
++              .onBlock(
++                  maybeBlock.get(), Optional.empty(), BlockBroadcastValidator.NOOP, executionLayer)
++              .join();
++      if (!result.isSuccessful()) {
++        throw new IllegalStateException(
++            "block import failed at slot " + simSlot + ": " + result.getFailureReason());
++      }
++    }
++
++    final Optional<UInt64> sourceSlot = plan.get(slot);
++    final int numInjected = injectSourceAttestations(sourceSlot);
++
++    final UInt64 evalSlot = UInt64.valueOf(simSlot + 1);
++    storageSystem.chainUpdater().advanceCurrentSlotToAtLeast(evalSlot);
++    final long t0 = System.nanoTime();
++    FcrForkChoiceAccess.processHead(forkChoice, evalSlot).join();
++    final long durationUs = (System.nanoTime() - t0) / 1_000;
++
++    if (simSlot % 32 == 0) {
++      printSlotDiagnostic(slot, isRecording, hasBlock);
++    }
++
++    if (isRecording) {
++      outputWriter.write(
++          buildSlotResult(slot, hasBlock, blockRoot, sourceSlot, numInjected, durationUs));
++    }
++  }
++
++  private void printSlotDiagnostic(
++      final UInt64 slot, final boolean isRecording, final boolean hasBlock) {
++    final Bytes32 headRoot = recentChainData.getChainHead().orElseThrow().getRoot();
++    final Bytes32 confirmedRoot = recentChainData.getStore().getConfirmedRoot();
++    final long confirmedSlot =
++        recentChainData.getSlotForBlockRoot(confirmedRoot).orElse(UInt64.ZERO).longValue();
++    System.err.println(
++        "slot="
++            + slot
++            + " is_recording="
++            + isRecording
++            + " has_block="
++            + hasBlock
++            + " head="
++            + headRoot.toHexString()
++            + " confirmed="
++            + confirmedRoot.toHexString()
++            + " confirmed_slot="
++            + confirmedSlot);
++  }
++
++  private int injectSourceAttestations(final Optional<UInt64> sourceSlot)
++      throws IOException, InterruptedException {
++    if (sourceSlot.isEmpty()) {
++      return 0;
++    }
++    final SignedBeaconBlock sourceBlock =
++        spec.deserializeSignedBeaconBlock(httpClient.getBlockRequired(sourceSlot.get()));
++    final Bytes32 headRoot = recentChainData.getChainHead().orElseThrow().getRoot();
++    final BeaconState headState = recentChainData.retrieveBlockState(headRoot).join().orElseThrow();
++    final List<ValidatableAttestation> validatableAttestations = new ArrayList<>();
++    for (Attestation attestation : sourceBlock.getMessage().getBody().getAttestations()) {
++      final IndexedAttestation indexedAttestation =
++          spec.atSlot(sourceBlock.getSlot())
++              .getAttestationUtil()
++              .getIndexedAttestation(headState, attestation);
++      final ValidatableAttestation validatableAttestation =
++          ValidatableAttestation.from(spec, attestation);
++      validatableAttestation.setIndexedAttestation(indexedAttestation);
++      validatableAttestations.add(validatableAttestation);
++    }
++    forkChoice.applyIndexedAttestations(validatableAttestations);
++    return validatableAttestations.size();
++  }
++
++  private SlotResult buildSlotResult(
++      final UInt64 slot,
++      final boolean hasBlock,
++      final Bytes32 blockRoot,
++      final Optional<UInt64> sourceSlot,
++      final int numInjected,
++      final long durationUs) {
++    final Bytes32 headRoot = recentChainData.getChainHead().orElseThrow().getRoot();
++    final Bytes32 confirmedRoot = recentChainData.getStore().getConfirmedRoot();
++    final long confirmedSlot =
++        recentChainData.getSlotForBlockRoot(confirmedRoot).orElse(UInt64.ZERO).longValue();
++    final long evalSlot = slot.longValue() + 1;
++    final long delay = Math.max(0, evalSlot - confirmedSlot);
++    final boolean fastConfirmed = !confirmedRoot.isZero() && confirmedSlot == slot.longValue();
++    final boolean strictOneSlotConfirmed =
++        hasBlock
++            && !confirmedRoot.isZero()
++            && blockRoot != null
++            && blockRoot.equals(confirmedRoot)
++            && confirmedSlot == slot.longValue()
++            && delay == 1;
++
++    return new SlotResult(
++        slot.longValue(),
++        slot.longValue() / 32,
++        hasBlock,
++        blockRoot == null ? null : blockRoot.toHexString(),
++        headRoot.toHexString(),
++        confirmedRoot.toHexString(),
++        confirmedSlot,
++        delay,
++        fastConfirmed,
++        strictOneSlotConfirmed,
++        recentChainData.getStore().getFinalizedCheckpoint().getEpoch().longValue(),
++        recentChainData.getStore().getJustifiedCheckpoint().getEpoch().longValue(),
++        sourceSlot.map(UInt64::longValue).orElse(null),
++        numInjected,
++        slot.longValue() % 32 == 0,
++        !hasBlock,
++        durationUs);
++  }
++
++  private static void validatePlan(final Map<UInt64, Optional<UInt64>> plan, final Config cfg) {
++    for (long slot = cfg.warmupStartSlot() + 1; slot < cfg.endSlot(); slot++) {
++      final UInt64 key = UInt64.valueOf(slot);
++      if (!plan.containsKey(key)) {
++        throw new IllegalStateException("attestation plan missing slot " + slot);
++      }
++    }
++  }
++
++  private static class AlwaysValidTransitionBlockValidator extends MergeTransitionBlockValidator {
++    AlwaysValidTransitionBlockValidator(final Spec spec, final RecentChainData recentChainData) {
++      super(spec, recentChainData);
++    }
++
++    @Override
++    public SafeFuture<PayloadValidationResult> verifyAncestorTransitionBlock(
++        final Bytes32 chainHeadRoot) {
++      return SafeFuture.completedFuture(PayloadValidationResult.VALID);
++    }
++  }
++
++  private static class ValidForkChoiceNotifier implements ForkChoiceNotifier {
++    private final List<ForkChoiceUpdatedResultSubscriber> subscribers = new CopyOnWriteArrayList<>();
++
++    @Override
++    public void onForkChoiceUpdated(
++        final ForkChoiceState forkChoiceState, final Optional<UInt64> proposingSlot) {
++      final SafeFuture<ForkChoiceUpdatedResult> result =
++          SafeFuture.completedFuture(
++              new ForkChoiceUpdatedResult(PayloadStatus.VALID, Optional.empty()));
++      subscribers.forEach(
++          subscriber ->
++              subscriber.onForkChoiceUpdatedResult(
++                  new ForkChoiceUpdatedResultSubscriber.ForkChoiceUpdatedResultNotification(
++                      forkChoiceState, Optional.empty(), false, result)));
++    }
++
++    @Override
++    public void onAttestationsDue(final UInt64 slot) {}
++
++    @Override
++    public void onPayloadAttestationsDue(final UInt64 slot) {}
++
++    @Override
++    public void onSyncingStatusChanged(final boolean inSync) {}
++
++    @Override
++    public SafeFuture<Optional<ExecutionPayloadContext>> getPayloadId(
++        final Bytes32 parentBeaconBlockRoot, final UInt64 blockSlot) {
++      return SafeFuture.completedFuture(Optional.empty());
++    }
++
++    @Override
++    public void onTerminalBlockReached(final Bytes32 executionBlockHash) {}
++
++    @Override
++    public void subscribeToForkChoiceUpdatedResult(
++        final ForkChoiceUpdatedResultSubscriber subscriber) {
++      subscribers.add(subscriber);
++    }
++  }
++}
+diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java
+new file mode 100644
+index 0000000..1580a53
+--- /dev/null
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java
+@@ -0,0 +1,100 @@
++/*
++ * Copyright Consensys Software Inc., 2025
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
++ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations under the License.
++ */
++
++package tech.pegasys.teku.statetransition.forkchoice.fcr;
++
++import tech.pegasys.teku.infrastructure.unsigned.UInt64;
++
++import java.io.IOException;
++import java.net.URI;
++import java.net.URLEncoder;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.Optional;
++
++import org.apache.tuweni.bytes.Bytes;
++
++public class HttpClient {
++  private final URI baseUri;
++  private final java.net.http.HttpClient client;
++
++  public HttpClient(final String beaconNodeUrl) {
++    this.baseUri = URI.create(stripTrailingSlash(beaconNodeUrl));
++    this.client =
++        java.net.http.HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
++  }
++
++  public Bytes getState(final UInt64 slot) throws IOException, InterruptedException {
++    return getBytes("/eth/v2/debug/beacon/states/" + slot, false).orElseThrow();
++  }
++
++  public Optional<Bytes> getBlock(final UInt64 slot) throws IOException, InterruptedException {
++    return getBytes("/eth/v2/beacon/blocks/" + slot, true);
++  }
++
++  public Bytes getBlockRequired(final UInt64 slot) throws IOException, InterruptedException {
++    return getBlock(slot)
++        .orElseThrow(() -> new IOException("missing required block at slot " + slot));
++  }
++
++  public byte[] getJson(final String path) throws IOException, InterruptedException {
++    final HttpRequest request =
++        HttpRequest.newBuilder(resolve(path))
++            .timeout(Duration.ofMinutes(2))
++            .header("Accept", "application/json")
++            .GET()
++            .build();
++    final HttpResponse<byte[]> response =
++        client.send(request, HttpResponse.BodyHandlers.ofByteArray());
++    if (response.statusCode() != 200) {
++      throw new IOException("GET " + path + " failed with HTTP " + response.statusCode());
++    }
++    return response.body();
++  }
++
++  static String queryParam(final UInt64 value) {
++    return URLEncoder.encode(value.toString(), StandardCharsets.UTF_8);
++  }
++
++  private Optional<Bytes> getBytes(final String path, final boolean notFoundIsEmpty)
++      throws IOException, InterruptedException {
++    final HttpRequest request =
++        HttpRequest.newBuilder(resolve(path))
++            .timeout(Duration.ofMinutes(2))
++            .header("Accept", "application/octet-stream")
++            .GET()
++            .build();
++    final HttpResponse<byte[]> response =
++        client.send(request, HttpResponse.BodyHandlers.ofByteArray());
++    if (response.statusCode() == 404 && notFoundIsEmpty) {
++      return Optional.empty();
++    }
++    if (response.statusCode() != 200) {
++      throw new IOException("GET " + path + " failed with HTTP " + response.statusCode());
++    }
++    return Optional.of(Bytes.wrap(response.body()));
++  }
++
++  private URI resolve(final String path) {
++    return baseUri.resolve(path.startsWith("/") ? path : "/" + path);
++  }
++
++  private static String stripTrailingSlash(final String value) {
++    if (value.endsWith("/")) {
++      return value.substring(0, value.length() - 1);
++    }
++    return value;
++  }
++}
+diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java
+new file mode 100644
+index 0000000..c216348
+--- /dev/null
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java
+@@ -0,0 +1,103 @@
++/*
++ * Copyright Consensys Software Inc., 2025
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
++ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations under the License.
++ */
++
++package tech.pegasys.teku.statetransition.forkchoice.fcr;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Properties;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++
++public class Main {
++  private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
++
++  public static void main(final String[] args) {
++    System.setProperty("log4j2.configurationFile", "log4j2-fcr.xml");
++    System.exit(new Main().run(args));
++  }
++
++  int run(final String[] args) {
++    if (hasManifestFlag(args)) {
++      return printManifest();
++    }
++
++    final Config cfg;
++    try {
++      cfg = Config.parse(args);
++    } catch (final IllegalArgumentException e) {
++      System.err.println("configuration error: " + e.getMessage());
++      return 1;
++    }
++
++    final Engine engine;
++    try {
++      engine = Engine.bootstrap(cfg);
++    } catch (final Exception e) {
++      System.err.println("bootstrap failure: " + e.getMessage());
++      e.printStackTrace(System.err);
++      return 2;
++    }
++
++    try {
++      engine.run();
++    } catch (final Exception e) {
++      System.err.println("simulation failure: " + e.getMessage());
++      e.printStackTrace(System.err);
++      return 3;
++    }
++    return 0;
++  }
++
++  private int printManifest() {
++    final Properties properties = loadBuildProperties();
++    final Map<String, Object> manifest = new LinkedHashMap<>();
++    manifest.put("engine_name", "teku");
++    manifest.put("engine_version", properties.getProperty("engine.version", ""));
++    manifest.put("engine_commit", properties.getProperty("engine.commit", ""));
++    manifest.put("build_flags", List.of("fake_crypto", "no_el", "no_da_check"));
++    manifest.put("fcr_spec_commit", "");
++    try {
++      System.out.println(OBJECT_MAPPER.writeValueAsString(manifest));
++      return 0;
++    } catch (final IOException e) {
++      System.err.println("manifest error: " + e.getMessage());
++      return 1;
++    }
++  }
++
++  private static boolean hasManifestFlag(final String[] args) {
++    for (String arg : args) {
++      if (arg.equals("--manifest-json")) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  private static Properties loadBuildProperties() {
++    final Properties properties = new Properties();
++    try (InputStream in =
++        Main.class.getResourceAsStream("/META-INF/fcr-build.properties")) {
++      if (in != null) {
++        properties.load(in);
++      }
++    } catch (final IOException e) {
++      throw new IllegalStateException("failed to load build properties", e);
++    }
++    return properties;
++  }
++}
+diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java
+new file mode 100644
+index 0000000..0b7fd5c
+--- /dev/null
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java
+@@ -0,0 +1,59 @@
++/*
++ * Copyright Consensys Software Inc., 2025
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
++ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations under the License.
++ */
++
++package tech.pegasys.teku.statetransition.forkchoice.fcr;
++
++import java.io.BufferedWriter;
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardOpenOption;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++
++public class OutputWriter {
++  private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
++
++  private final BufferedWriter writer;
++  private long recordsWritten = 0;
++
++  public OutputWriter(final Path path) throws IOException {
++    final Path parent = path.getParent();
++    if (parent != null) {
++      Files.createDirectories(parent);
++    }
++    this.writer =
++        Files.newBufferedWriter(
++            path,
++            StandardOpenOption.CREATE,
++            StandardOpenOption.TRUNCATE_EXISTING,
++            StandardOpenOption.WRITE);
++  }
++
++  public void write(final SlotResult result) throws IOException {
++    writer.write(OBJECT_MAPPER.writeValueAsString(result));
++    writer.newLine();
++    recordsWritten++;
++    if (recordsWritten % 100 == 0) {
++      flush();
++    }
++  }
++
++  public long getRecordsWritten() {
++    return recordsWritten;
++  }
++
++  public void flush() throws IOException {
++    writer.flush();
++  }
++}
+diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/PlanFetcher.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/PlanFetcher.java
+new file mode 100644
+index 0000000..0f797cd
+--- /dev/null
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/PlanFetcher.java
+@@ -0,0 +1,55 @@
++/*
++ * Copyright Consensys Software Inc., 2025
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
++ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations under the License.
++ */
++
++package tech.pegasys.teku.statetransition.forkchoice.fcr;
++
++import tech.pegasys.teku.infrastructure.unsigned.UInt64;
++
++import java.io.IOException;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Optional;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++
++public class PlanFetcher {
++  private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
++
++  private final HttpClient httpClient;
++
++  public PlanFetcher(final HttpClient httpClient) {
++    this.httpClient = httpClient;
++  }
++
++  public Map<UInt64, Optional<UInt64>> fetch(final UInt64 from, final UInt64 to)
++      throws IOException, InterruptedException {
++    final String path =
++        "/fcr-sim/v1/plan?from="
++            + HttpClient.queryParam(from)
++            + "&to="
++            + HttpClient.queryParam(to);
++    final JsonNode root = OBJECT_MAPPER.readTree(httpClient.getJson(path));
++    final Map<UInt64, Optional<UInt64>> plan = new HashMap<>();
++    for (JsonNode entry : root.required("entries")) {
++      final UInt64 simSlot = UInt64.valueOf(entry.required("sim_slot").asLong());
++      final JsonNode source = entry.get("source_block_slot");
++      plan.put(
++          simSlot,
++          source == null || source.isNull()
++              ? Optional.empty()
++              : Optional.of(UInt64.valueOf(source.asLong())));
++    }
++    return plan;
++  }
++}
+diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotResult.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotResult.java
+new file mode 100644
+index 0000000..a1cd194
+--- /dev/null
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotResult.java
+@@ -0,0 +1,55 @@
++/*
++ * Copyright Consensys Software Inc., 2025
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
++ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations under the License.
++ */
++
++package tech.pegasys.teku.statetransition.forkchoice.fcr;
++
++import com.fasterxml.jackson.annotation.JsonProperty;
++import com.fasterxml.jackson.annotation.JsonPropertyOrder;
++
++@JsonPropertyOrder({
++  "slot",
++  "epoch",
++  "has_block",
++  "block_root",
++  "head_root",
++  "confirmed_root",
++  "confirmed_slot",
++  "confirmation_delay_slots",
++  "fast_confirmed",
++  "strict_one_slot_confirmed",
++  "finalized_epoch",
++  "justified_epoch",
++  "source_block_slot",
++  "num_attestations_injected",
++  "is_epoch_boundary",
++  "is_missed_slot",
++  "fcr_eval_duration_us"
++})
++public record SlotResult(
++    @JsonProperty("slot") long slot,
++    @JsonProperty("epoch") long epoch,
++    @JsonProperty("has_block") boolean hasBlock,
++    @JsonProperty("block_root") String blockRoot,
++    @JsonProperty("head_root") String headRoot,
++    @JsonProperty("confirmed_root") String confirmedRoot,
++    @JsonProperty("confirmed_slot") long confirmedSlot,
++    @JsonProperty("confirmation_delay_slots") long confirmationDelaySlots,
++    @JsonProperty("fast_confirmed") boolean fastConfirmed,
++    @JsonProperty("strict_one_slot_confirmed") boolean strictOneSlotConfirmed,
++    @JsonProperty("finalized_epoch") long finalizedEpoch,
++    @JsonProperty("justified_epoch") long justifiedEpoch,
++    @JsonProperty("source_block_slot") Long sourceBlockSlot,
++    @JsonProperty("num_attestations_injected") int numAttestationsInjected,
++    @JsonProperty("is_epoch_boundary") boolean isEpochBoundary,
++    @JsonProperty("is_missed_slot") boolean isMissedSlot,
++    @JsonProperty("fcr_eval_duration_us") long fcrEvalDurationUs) {}
+diff --git a/fcr-simulator-engine/src/main/resources/log4j2-fcr.xml b/fcr-simulator-engine/src/main/resources/log4j2-fcr.xml
+new file mode 100644
+index 0000000..b839d47
+--- /dev/null
++++ b/fcr-simulator-engine/src/main/resources/log4j2-fcr.xml
+@@ -0,0 +1,13 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<Configuration status="WARN">
++  <Appenders>
++    <Console name="Console" target="SYSTEM_ERR">
++      <PatternLayout pattern="%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n"/>
++    </Console>
++  </Appenders>
++  <Loggers>
++    <Root level="warn">
++      <AppenderRef ref="Console"/>
++    </Root>
++  </Loggers>
++</Configuration>
+diff --git a/settings.gradle b/settings.gradle
+index 46f1a32..47ac4d2 100644
+--- a/settings.gradle
++++ b/settings.gradle
+@@ -70,3 +70,4 @@ include 'eth-benchmark-tests'
+ include 'fork-choice-tests'
+ include 'ethereum:performance-trackers'
+ include 'services:zkchain'
++include 'fcr-simulator-engine'
+-- 
+2.50.1 (Apple Git-155)
+
