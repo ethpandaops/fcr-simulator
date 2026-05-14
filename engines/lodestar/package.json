@@ -1,0 +1,26 @@
+{
+  "name": "fcr-lodestar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^24.13.0"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "node --enable-source-maps dist/main.js"
+  },
+  "dependencies": {
+    "@lodestar/config": "workspace:*",
+    "@lodestar/fork-choice": "workspace:*",
+    "@lodestar/params": "workspace:*",
+    "@lodestar/state-transition": "workspace:*",
+    "@lodestar/types": "workspace:*",
+    "@lodestar/utils": "workspace:*",
+    "undici": "7.16.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10",
+    "typescript": "5.7.3"
+  }
+}

@@ -2,3 +2,6 @@
 	path = lighthouse
 	url = git@github.com:samcm/lighthouse.git
 	branch = fcr-simulator
+[submodule "engines/lodestar/lodestar"]
+	path = engines/lodestar/lodestar
+	url = https://github.com/nazarhussain/lodestar.git
