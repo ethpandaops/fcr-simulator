@@ -16,7 +16,6 @@ import {
 import {ForkSeq, GENESIS_SLOT} from "@lodestar/params";
 import {
   computeEpochAtSlot,
-  computeStartSlotAtEpoch,
   createCachedBeaconState,
   createPubkeyCache,
   stateTransition,
@@ -32,11 +31,10 @@ import {
   ssz,
   sszTypesFor,
   type Attestation,
-  type BeaconBlock,
   type IndexedAttestation,
   type SignedBeaconBlock,
 } from "@lodestar/types";
-import {toRootHex, fromHex} from "@lodestar/utils";
+import {toRootHex} from "@lodestar/utils";
 import {ForkName} from "@lodestar/params";
 import {request} from "undici";
 
@@ -54,11 +52,6 @@ interface CliConfig {
   attestationSourceMode: string;
   lookaheadCap: number;
   output: string;
-}
-
-interface PlanEntry {
-  simSlot: number;
-  sourceBlockSlot: number | null;
 }
 
 type ManifestExit = {kind: "manifest"};
@@ -493,14 +486,13 @@ function initializeForkChoiceFromAnchor(args: {
 
 async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void> {
   const writer = new JsonlWriter(cfg.output);
-  const {forkChoice, fetcher, plan, stateByStateRoot, stateByCheckpointKey, headStateRef, beaconConfig} = boot;
+  const {forkChoice, fetcher, plan, stateByStateRoot, stateByCheckpointKey, headStateRef} = boot;
 
   try {
     let slot = cfg.warmupStartSlot + 1;
     while (slot < cfg.endSlot) {
       const isRecording = slot >= cfg.startSlot;
 
-      // Advance time to current sim slot so that onBlock accepts block.slot == currentSlot.
       forkChoice.updateTime(slot);
 
       const blockFetch = await fetcher.fetchAtSlot(slot);
@@ -508,7 +500,7 @@ async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void>
       let blockRootHex: string | null = null;
       if (blockFetch) {
         try {
-          const postState = await processBlock(beaconConfig, headStateRef.state, blockFetch);
+          const postState = processBlock(headStateRef.state, blockFetch);
           stateByStateRoot.set(toRootHex(postState.hashTreeRoot()), postState);
           // Apply block to fork choice
           const protoBlock = forkChoice.onBlock(
@@ -570,22 +562,17 @@ async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void>
   }
 }
 
-async function processBlock(
-  beaconConfig: BeaconConfig,
+function processBlock(
   preState: CachedBeaconStateAllForks,
   blockFetch: BlockFetch,
-): Promise<CachedBeaconStateAllForks> {
-  // Replay shortcut: skip BLS, proposer signature, and state root verification.
-  // DA and EL payload status are forced valid.
-  const postState = stateTransition(preState, blockFetch.block, {
+): CachedBeaconStateAllForks {
+  return stateTransition(preState, blockFetch.block, {
     verifyStateRoot: false,
     verifyProposer: false,
     verifySignatures: false,
     executionPayloadStatus: ExecutionPayloadStatus.valid,
     dataAvailabilityStatus: DataAvailabilityStatus.Available,
   });
-  void beaconConfig;
-  return postState;
 }
 
 function injectAttestationsFromSource(
@@ -680,10 +667,6 @@ function formatError(err: unknown): string {
   if (err instanceof Error) return err.stack ?? err.message;
   return String(err);
 }
-
-// kept to silence unused import warnings in some bundler modes
-void computeStartSlotAtEpoch;
-void fromHex;
 
 main().catch((err) => {
   process.stderr.write(`fatal: ${formatError(err)}\n`);
