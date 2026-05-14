@@ -47,13 +47,17 @@ const (
 
 var version = "dev"
 
-var supportedEngines = map[string]bool{
-	"lighthouse": true,
-	"teku":       true,
-	"lodestar":   true,
-	"nimbus":     true,
-	"prysm":      true,
-	"grandine":   true,
+type engineSpec struct {
+	RequiredBuildFlags []string
+}
+
+var supportedEngines = map[string]engineSpec{
+	"lighthouse": {RequiredBuildFlags: []string{"fake_crypto"}},
+	"teku":       {RequiredBuildFlags: []string{"fake_crypto"}},
+	"lodestar":   {RequiredBuildFlags: []string{"fake_crypto"}},
+	"nimbus":     {RequiredBuildFlags: []string{"fake_crypto"}},
+	"prysm":      {RequiredBuildFlags: []string{"fake_crypto"}},
+	"grandine":   {RequiredBuildFlags: []string{"fake_crypto"}},
 }
 
 func supportedEngineList() string {
@@ -138,7 +142,7 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 
 	fs := flag.NewFlagSet("fcr-orchestrator", flag.ContinueOnError)
 	fs.SetOutput(output)
-	fs.StringVar(&cfg.Engine, "engine", "", "engine name (one of: lighthouse, teku, lodestar, nimbus, prysm, grandine)")
+	fs.StringVar(&cfg.Engine, "engine", "", "engine name (one of: "+supportedEngineList()+")")
 	fs.StringVar(&cfg.EngineBinary, "engine-binary", os.Getenv("FCR_ENGINE_BINARY"), "path to engine binary (env: FCR_ENGINE_BINARY)")
 	fs.StringVar(&cfg.Network, "network", "", "network name (V1 supports mainnet)")
 	fs.Var(&startEpoch, "start-epoch", "first epoch, inclusive")
@@ -200,7 +204,7 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 	if cfg.Engine == "" {
 		return fmt.Errorf("--engine is required")
 	}
-	if !supportedEngines[cfg.Engine] {
+	if _, ok := supportedEngines[cfg.Engine]; !ok {
 		return fmt.Errorf("--engine=%q is not supported; supported values are %s", cfg.Engine, supportedEngineList())
 	}
 	if cfg.EngineBinary == "" {
@@ -272,15 +276,17 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	if engineManifest.EngineName != "" && engineManifest.EngineName != cfg.Engine {
+	if engineManifest.EngineName == "" {
+		return 1, fmt.Errorf("engine manifest from %s did not report engine_name", cfg.EngineBinary)
+	}
+	if engineManifest.EngineName != cfg.Engine {
 		return 1, fmt.Errorf("engine manifest name %q does not match --engine=%q", engineManifest.EngineName, cfg.Engine)
 	}
-	if engineManifest.EngineName == "" {
-		engineManifest.EngineName = cfg.Engine
-	}
 
-	if !engineHasBuildFlag(engineManifest, "fake_crypto") {
-		return 1, fmt.Errorf("engine %s was not built with fake_crypto; refusing to run (build with `cargo build --features fake_crypto`)", cfg.EngineBinary)
+	for _, flag := range supportedEngines[cfg.Engine].RequiredBuildFlags {
+		if !engineHasBuildFlag(engineManifest, flag) {
+			return 1, fmt.Errorf("engine %s is missing required build flag %q (got build_flags=%v)", cfg.EngineBinary, flag, engineManifest.BuildFlags)
+		}
 	}
 
 	chunks := chunk.Split(cfg.StartEpoch, cfg.EndEpoch, cfg.WarmupEpochs, cfg.Parallel)
