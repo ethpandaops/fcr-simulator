@@ -181,8 +181,8 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 	if cfg.Engine == "" {
 		return fmt.Errorf("--engine is required")
 	}
-	if cfg.Engine != "lighthouse" {
-		return fmt.Errorf("--engine=%q is not supported in V1; supported value is %q", cfg.Engine, "lighthouse")
+	if cfg.Engine != "lighthouse" && cfg.Engine != "grandine" {
+		return fmt.Errorf("--engine=%q is not supported; supported values are %q, %q", cfg.Engine, "lighthouse", "grandine")
 	}
 	if cfg.EngineBinary == "" {
 		return fmt.Errorf("--engine-binary is required")
