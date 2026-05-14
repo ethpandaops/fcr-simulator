@@ -10,14 +10,32 @@ RESULTS_DIR="$ROOT/results"
 TEKU_SHA="c5825d53325cd67ab91b35cc544a7b660be317ff"
 
 if [[ -z "${JAVA_HOME:-}" ]]; then
-  if [[ -d /opt/homebrew/opt/openjdk@21 ]]; then
+  if command -v /usr/libexec/java_home >/dev/null 2>&1 && JAVA_HOME_CANDIDATE="$(/usr/libexec/java_home -v 21 2>/dev/null)"; then
+    export JAVA_HOME="$JAVA_HOME_CANDIDATE"
+  elif [[ -d /opt/homebrew/opt/openjdk@21 ]]; then
     export JAVA_HOME=/opt/homebrew/opt/openjdk@21
   elif [[ -d /usr/lib/jvm/java-21-openjdk-amd64 ]]; then
     export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+  elif command -v javac >/dev/null 2>&1; then
+    JAVAC_BIN="$(command -v javac)"
+    JAVAC_DIR="$(cd "$(dirname "$JAVAC_BIN")" && pwd -P)"
+    export JAVA_HOME="$(cd "$JAVAC_DIR/.." && pwd -P)"
+  elif command -v java >/dev/null 2>&1 && java -version 2>&1 | head -n1 | grep -Eq 'version "21(\.|")'; then
+    :
   else
-    echo "JAVA_HOME is unset and no JDK 21 was found at /opt/homebrew/opt/openjdk@21 or /usr/lib/jvm/java-21-openjdk-amd64" >&2
+    echo "JAVA_HOME is unset and no JDK 21 was found. Install JDK 21 or set JAVA_HOME." >&2
     exit 1
   fi
+fi
+
+if [[ -n "${JAVA_HOME:-}" ]]; then
+  JAVA_VERSION_OUTPUT="$("$JAVA_HOME/bin/java" -version 2>&1 | head -n1)"
+else
+  JAVA_VERSION_OUTPUT="$(java -version 2>&1 | head -n1)"
+fi
+if ! grep -Eq 'version "21(\.|")' <<<"$JAVA_VERSION_OUTPUT"; then
+  echo "JDK 21 is required; found: $JAVA_VERSION_OUTPUT" >&2
+  exit 1
 fi
 
 if [[ ! -d "$TEKU_SUBMODULE/.git" && ! -f "$TEKU_SUBMODULE/.git" ]]; then

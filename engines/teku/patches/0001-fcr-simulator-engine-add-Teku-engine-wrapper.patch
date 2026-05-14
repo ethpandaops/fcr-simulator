@@ -1,21 +1,21 @@
-From 6aa3e94ce24404c387ce04df056d2f3f64391279 Mon Sep 17 00:00:00 2001
+From f395706f6eb99291dff7392eb7dea561d482403c Mon Sep 17 00:00:00 2001
 From: Codex <codex@example.invalid>
 Date: Thu, 14 May 2026 19:13:12 +1000
-Subject: [PATCH 1/2] fcr-simulator-engine: add Teku engine wrapper
+Subject: [PATCH] fcr-simulator-engine: add Teku engine wrapper
 
 ---
- fcr-simulator-engine/build.gradle             |  69 ++++
- .../forkchoice/FcrForkChoiceAccess.java       |  25 ++
+ fcr-simulator-engine/build.gradle             |  69 +++
+ .../forkchoice/FcrForkChoiceAccess.java       |  59 +++
  .../forkchoice/fcr/Config.java                |  89 ++++
- .../forkchoice/fcr/Engine.java                | 385 ++++++++++++++++++
- .../forkchoice/fcr/HttpClient.java            | 100 +++++
+ .../forkchoice/fcr/Engine.java                | 396 ++++++++++++++++++
+ .../forkchoice/fcr/HttpClient.java            | 107 +++++
  .../statetransition/forkchoice/fcr/Main.java  | 111 +++++
  .../forkchoice/fcr/OutputWriter.java          |  65 +++
  .../forkchoice/fcr/PlanFetcher.java           |  55 +++
  .../forkchoice/fcr/SlotResult.java            |  55 +++
  .../src/main/resources/log4j2-fcr.xml         |  13 +
  settings.gradle                               |   1 +
- 11 files changed, 968 insertions(+)
+ 11 files changed, 1020 insertions(+)
  create mode 100644 fcr-simulator-engine/build.gradle
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
@@ -104,10 +104,10 @@ index 0000000..a7c3af3
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
 new file mode 100644
-index 0000000..22fd787
+index 0000000..e472735
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,59 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -123,8 +123,15 @@ index 0000000..22fd787
 +
 +package tech.pegasys.teku.statetransition.forkchoice;
 +
++import java.util.List;
++import java.util.function.BiConsumer;
 +import tech.pegasys.teku.infrastructure.async.SafeFuture;
 +import tech.pegasys.teku.infrastructure.unsigned.UInt64;
++import tech.pegasys.teku.spec.datastructures.attestation.ValidatableAttestation;
++import tech.pegasys.teku.spec.datastructures.forkchoice.VoteUpdater;
++import tech.pegasys.teku.spec.datastructures.operations.IndexedAttestation;
++import tech.pegasys.teku.storage.client.RecentChainData;
++import tech.pegasys.teku.storage.protoarray.ForkChoiceStrategy;
 +
 +public final class FcrForkChoiceAccess {
 +  private FcrForkChoiceAccess() {}
@@ -132,10 +139,37 @@ index 0000000..22fd787
 +  public static SafeFuture<Boolean> processHead(final ForkChoice forkChoice, final UInt64 nodeSlot) {
 +    return forkChoice.processHead(nodeSlot);
 +  }
++
++  public static int applyIndexedAttestations(
++      final ForkChoice forkChoice,
++      final RecentChainData recentChainData,
++      final List<ValidatableAttestation> attestations,
++      final BiConsumer<ValidatableAttestation, Throwable> onError) {
++    final ForkChoiceStrategy forkChoiceStrategy =
++        recentChainData.getUpdatableForkChoiceStrategy().orElseThrow();
++    int applied = 0;
++    for (ValidatableAttestation attestation : attestations) {
++      try {
++        final IndexedAttestation indexedAttestation =
++            attestation.getIndexedAttestation().orElseThrow();
++        if (!forkChoiceStrategy.contains(indexedAttestation.getData().getTarget().getRoot())
++            || !forkChoiceStrategy.contains(indexedAttestation.getData().getBeaconBlockRoot())) {
++          continue;
++        }
++        final VoteUpdater transaction = recentChainData.startVoteUpdate();
++        forkChoiceStrategy.onAttestation(transaction, indexedAttestation);
++        transaction.commit();
++        applied++;
++      } catch (final Throwable error) {
++        onError.accept(attestation, error);
++      }
++    }
++    return applied;
++  }
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
 new file mode 100644
-index 0000000..3c5421e
+index 0000000..da02bc9
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
 @@ -0,0 +1,89 @@
@@ -193,8 +227,8 @@ index 0000000..3c5421e
 +            parseLong(required(values, "warmup-start-slot"), "warmup-start-slot"),
 +            required(values, "network"),
 +            parseLong(values.getOrDefault("byzantine-threshold", "25"), "byzantine-threshold"),
-+            values.getOrDefault("attestation-source-mode", ""),
-+            parseLong(values.getOrDefault("lookahead-cap", "0"), "lookahead-cap"),
++            required(values, "attestation-source-mode"),
++            parseLong(required(values, "lookahead-cap"), "lookahead-cap"),
 +            Path.of(required(values, "output")));
 +    cfg.validate();
 +    return cfg;
@@ -204,11 +238,11 @@ index 0000000..3c5421e
 +    if (!network.equals("mainnet")) {
 +      throw new IllegalArgumentException("--network=" + network + " is not supported");
 +    }
-+    if (startSlot > endSlot) {
-+      throw new IllegalArgumentException("--start-slot must be <= --end-slot");
++    if (warmupStartSlot > startSlot) {
++      throw new IllegalArgumentException("--warmup-start-slot must be <= --start-slot");
 +    }
-+    if (warmupStartSlot >= endSlot) {
-+      throw new IllegalArgumentException("--warmup-start-slot must be < --end-slot");
++    if (startSlot >= endSlot) {
++      throw new IllegalArgumentException("--start-slot must be < --end-slot");
 +    }
 +  }
 +
@@ -230,10 +264,10 @@ index 0000000..3c5421e
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
 new file mode 100644
-index 0000000..abfc7f4
+index 0000000..3127bfe
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,396 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -261,6 +295,7 @@ index 0000000..abfc7f4
 +import tech.pegasys.teku.spec.Spec;
 +import tech.pegasys.teku.spec.SpecFactory;
 +import tech.pegasys.teku.spec.datastructures.attestation.ValidatableAttestation;
++import tech.pegasys.teku.spec.datastructures.blocks.BeaconBlockHeader;
 +import tech.pegasys.teku.spec.datastructures.blocks.SignedBeaconBlock;
 +import tech.pegasys.teku.spec.datastructures.blocks.SignedBlockAndState;
 +import tech.pegasys.teku.spec.datastructures.execution.ExecutionPayloadContext;
@@ -351,8 +386,13 @@ index 0000000..abfc7f4
 +    final UInt64 warmupStartSlot = UInt64.valueOf(cfg.warmupStartSlot());
 +    final BeaconState anchorState =
 +        spec.deserializeBeaconState(httpClient.getState(warmupStartSlot));
++    final Bytes32 anchorBlockRoot = BeaconBlockHeader.fromState(anchorState).getRoot();
 +    final SignedBeaconBlock anchorBlock =
-+        spec.deserializeSignedBeaconBlock(httpClient.getBlockRequired(warmupStartSlot));
++        spec.deserializeSignedBeaconBlock(
++            httpClient
++                .getBlockByRoot(anchorBlockRoot)
++                .orElseThrow(
++                    () -> new IOException("missing anchor block root " + anchorBlockRoot)));
 +
 +    final StorageSystem storageSystem =
 +        FileBackedStorageSystemBuilder.create()
@@ -511,8 +551,13 @@ index 0000000..abfc7f4
 +      validatableAttestation.setIndexedAttestation(indexedAttestation);
 +      validatableAttestations.add(validatableAttestation);
 +    }
-+    forkChoice.applyIndexedAttestations(validatableAttestations);
-+    return validatableAttestations.size();
++    return FcrForkChoiceAccess.applyIndexedAttestations(
++        forkChoice,
++        recentChainData,
++        validatableAttestations,
++        (attestation, error) ->
++            System.err.println(
++                "failed to apply indexed attestation: " + error.getMessage()));
 +  }
 +
 +  private SlotResult buildSlotResult(
@@ -621,10 +666,10 @@ index 0000000..abfc7f4
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java
 new file mode 100644
-index 0000000..1580a53
+index 0000000..f7a5e01
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,107 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -641,6 +686,8 @@ index 0000000..1580a53
 +package tech.pegasys.teku.statetransition.forkchoice.fcr;
 +
 +import tech.pegasys.teku.infrastructure.unsigned.UInt64;
++
++import org.apache.tuweni.bytes.Bytes32;
 +
 +import java.io.IOException;
 +import java.net.URI;
@@ -669,6 +716,11 @@ index 0000000..1580a53
 +
 +  public Optional<Bytes> getBlock(final UInt64 slot) throws IOException, InterruptedException {
 +    return getBytes("/eth/v2/beacon/blocks/" + slot, true);
++  }
++
++  public Optional<Bytes> getBlockByRoot(final Bytes32 root)
++      throws IOException, InterruptedException {
++    return getBytes("/eth/v2/beacon/blocks/" + root.toHexString(), true);
 +  }
 +
 +  public Bytes getBlockRequired(final UInt64 slot) throws IOException, InterruptedException {
