@@ -1,4 +1,4 @@
-From f395706f6eb99291dff7392eb7dea561d482403c Mon Sep 17 00:00:00 2001
+From 8dd7f72beccab73f9894fbd10e76757e56a58cac Mon Sep 17 00:00:00 2001
 From: Codex <codex@example.invalid>
 Date: Thu, 14 May 2026 19:13:12 +1000
 Subject: [PATCH] fcr-simulator-engine: add Teku engine wrapper
@@ -779,7 +779,7 @@ index 0000000..f7a5e01
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java
 new file mode 100644
-index 0000000..83551b4
+index 0000000..4a1d588
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java
 @@ -0,0 +1,111 @@
@@ -811,7 +811,7 @@ index 0000000..83551b4
 +  private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 +
 +  public static void main(final String[] args) {
-+    System.setProperty("log4j2.configurationFile", "log4j2-fcr.xml");
++    System.setProperty("log4j2.configurationFile", "classpath:log4j2-fcr.xml");
 +    System.exit(new Main().run(args));
 +  }
 +
