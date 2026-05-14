@@ -1,4 +1,4 @@
-From 8dd7f72beccab73f9894fbd10e76757e56a58cac Mon Sep 17 00:00:00 2001
+From a9bae0c1b93543c59e95edc85d7809d2c856f4e5 Mon Sep 17 00:00:00 2001
 From: Codex <codex@example.invalid>
 Date: Thu, 14 May 2026 19:13:12 +1000
 Subject: [PATCH] fcr-simulator-engine: add Teku engine wrapper
@@ -6,8 +6,8 @@ Subject: [PATCH] fcr-simulator-engine: add Teku engine wrapper
 ---
  fcr-simulator-engine/build.gradle             |  69 +++
  .../forkchoice/FcrForkChoiceAccess.java       |  59 +++
- .../forkchoice/fcr/Config.java                |  89 ++++
- .../forkchoice/fcr/Engine.java                | 396 ++++++++++++++++++
+ .../forkchoice/fcr/Config.java                |  94 ++++
+ .../forkchoice/fcr/Engine.java                | 401 ++++++++++++++++++
  .../forkchoice/fcr/HttpClient.java            | 107 +++++
  .../statetransition/forkchoice/fcr/Main.java  | 111 +++++
  .../forkchoice/fcr/OutputWriter.java          |  65 +++
@@ -15,7 +15,7 @@ Subject: [PATCH] fcr-simulator-engine: add Teku engine wrapper
  .../forkchoice/fcr/SlotResult.java            |  55 +++
  .../src/main/resources/log4j2-fcr.xml         |  13 +
  settings.gradle                               |   1 +
- 11 files changed, 1020 insertions(+)
+ 11 files changed, 1030 insertions(+)
  create mode 100644 fcr-simulator-engine/build.gradle
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
@@ -169,10 +169,10 @@ index 0000000..e472735
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
 new file mode 100644
-index 0000000..da02bc9
+index 0000000..43ebedc
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,94 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -238,6 +238,11 @@ index 0000000..da02bc9
 +    if (!network.equals("mainnet")) {
 +      throw new IllegalArgumentException("--network=" + network + " is not supported");
 +    }
++    if (!attestationSourceMode.equals("next-non-missed")
++        && !attestationSourceMode.equals("strict-source-block-k-minus-1")) {
++      throw new IllegalArgumentException(
++          "--attestation-source-mode=" + attestationSourceMode + " is not supported");
++    }
 +    if (warmupStartSlot > startSlot) {
 +      throw new IllegalArgumentException("--warmup-start-slot must be <= --start-slot");
 +    }
@@ -264,10 +269,10 @@ index 0000000..da02bc9
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
 new file mode 100644
-index 0000000..3127bfe
+index 0000000..e0a2755
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
-@@ -0,0 +1,396 @@
+@@ -0,0 +1,401 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -542,14 +547,19 @@ index 0000000..3127bfe
 +    final BeaconState headState = recentChainData.retrieveBlockState(headRoot).join().orElseThrow();
 +    final List<ValidatableAttestation> validatableAttestations = new ArrayList<>();
 +    for (Attestation attestation : sourceBlock.getMessage().getBody().getAttestations()) {
-+      final IndexedAttestation indexedAttestation =
-+          spec.atSlot(sourceBlock.getSlot())
-+              .getAttestationUtil()
-+              .getIndexedAttestation(headState, attestation);
-+      final ValidatableAttestation validatableAttestation =
-+          ValidatableAttestation.from(spec, attestation);
-+      validatableAttestation.setIndexedAttestation(indexedAttestation);
-+      validatableAttestations.add(validatableAttestation);
++      try {
++        final IndexedAttestation indexedAttestation =
++            spec.atSlot(sourceBlock.getSlot())
++                .getAttestationUtil()
++                .getIndexedAttestation(headState, attestation);
++        final ValidatableAttestation validatableAttestation =
++            ValidatableAttestation.from(spec, attestation);
++        validatableAttestation.setIndexedAttestation(indexedAttestation);
++        validatableAttestations.add(validatableAttestation);
++      } catch (final Throwable error) {
++        System.err.println(
++            "failed to get indexed attestation: " + error.getMessage());
++      }
 +    }
 +    return FcrForkChoiceAccess.applyIndexedAttestations(
 +        forkChoice,
