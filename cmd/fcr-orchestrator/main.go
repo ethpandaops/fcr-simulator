@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,24 @@ const (
 )
 
 var version = "dev"
+
+var supportedEngines = map[string]bool{
+	"lighthouse": true,
+	"teku":       true,
+	"lodestar":   true,
+	"nimbus":     true,
+	"prysm":      true,
+	"grandine":   true,
+}
+
+func supportedEngineList() string {
+	names := make([]string, 0, len(supportedEngines))
+	for name := range supportedEngines {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
 
 type config struct {
 	Engine                string
@@ -119,7 +138,7 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 
 	fs := flag.NewFlagSet("fcr-orchestrator", flag.ContinueOnError)
 	fs.SetOutput(output)
-	fs.StringVar(&cfg.Engine, "engine", "", "engine name (V1 supports lighthouse)")
+	fs.StringVar(&cfg.Engine, "engine", "", "engine name (one of: lighthouse, teku, lodestar, nimbus, prysm, grandine)")
 	fs.StringVar(&cfg.EngineBinary, "engine-binary", os.Getenv("FCR_ENGINE_BINARY"), "path to engine binary (env: FCR_ENGINE_BINARY)")
 	fs.StringVar(&cfg.Network, "network", "", "network name (V1 supports mainnet)")
 	fs.Var(&startEpoch, "start-epoch", "first epoch, inclusive")
@@ -181,8 +200,8 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 	if cfg.Engine == "" {
 		return fmt.Errorf("--engine is required")
 	}
-	if cfg.Engine != "lighthouse" {
-		return fmt.Errorf("--engine=%q is not supported in V1; supported value is %q", cfg.Engine, "lighthouse")
+	if !supportedEngines[cfg.Engine] {
+		return fmt.Errorf("--engine=%q is not supported; supported values are %s", cfg.Engine, supportedEngineList())
 	}
 	if cfg.EngineBinary == "" {
 		return fmt.Errorf("--engine-binary is required")
