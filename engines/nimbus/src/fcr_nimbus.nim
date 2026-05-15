@@ -401,6 +401,17 @@ proc processBlock(self: Engine, forked: ForkedSignedBeaconBlock):
     return err("processBlock: no BlockRef")
   ok(resultRef)
 
+func process_attestation(
+    self: var ForkChoiceBackend,
+    validator_index: ValidatorIndex, block_root: Eth2Digest, slot: Slot) =
+  self.votes.extend(validator_index.int + 1)
+
+  template vote: untyped = self.votes[validator_index]
+  if vote.slot != FAR_FUTURE_SLOT:
+    if slot.epoch > vote.slot.epoch or vote.next_root.isZero:
+      vote.next_root = block_root
+      vote.slot = slot
+
 proc injectAttestationsFromBlock(self: Engine, simSlot: Slot,
     sourceBlockSlot: Slot): Future[uint64]
     {.async: (raises: [CatchableError]).} =
@@ -409,8 +420,6 @@ proc injectAttestationsFromBlock(self: Engine, simSlot: Slot,
     raise newException(EngineError,
       "attestation plan referenced missing source block at slot " &
       $sourceBlockSlot.uint64)
-  let injectSlot = simSlot + 1
-  let wallTime = injectSlot.start_beacon_time(self.dag.timeParams)
   var injected: uint64 = 0
   withBlck(blckOpt.get()):
     for attestation in forkyBlck.message.body.attestations:
@@ -419,14 +428,11 @@ proc injectAttestationsFromBlock(self: Engine, simSlot: Slot,
         attestingIndices.add(vidx)
       if attestingIndices.len == 0:
         continue
-      let res = self.attPool[].forkChoice.on_attestation(
-        self.dag,
-        attestation.data.slot,
-        attestation.data.beacon_block_root,
-        attestingIndices,
-        wallTime)
-      if res.isOk:
-        inc injected
+      for validator_index in attestingIndices:
+        self.attPool[].forkChoice.backend.process_attestation(
+          validator_index, attestation.data.beacon_block_root,
+          attestation.data.slot)
+      inc injected
   injected
 
 proc recomputeHead(self: Engine, simSlot: Slot): Result[Eth2Digest, string] =
