@@ -1,13 +1,13 @@
-From f274164d6d5cffda2790e531ad93e052538f1ac4 Mon Sep 17 00:00:00 2001
+From fd821fbe5f3317479dfcd4b6442dbef30f590624 Mon Sep 17 00:00:00 2001
 From: Codex <codex@example.invalid>
-Date: Thu, 14 May 2026 19:13:12 +1000
+Date: Fri, 15 May 2026 20:22:43 +1000
 Subject: [PATCH] fcr-simulator-engine: add Teku engine wrapper
 
 ---
  fcr-simulator-engine/build.gradle             |  69 +++
  .../forkchoice/FcrForkChoiceAccess.java       |  59 +++
  .../forkchoice/fcr/Config.java                |  94 ++++
- .../forkchoice/fcr/Engine.java                | 425 ++++++++++++++++++
+ .../forkchoice/fcr/Engine.java                | 430 ++++++++++++++++++
  .../forkchoice/fcr/HttpClient.java            | 107 +++++
  .../statetransition/forkchoice/fcr/Main.java  | 111 +++++
  .../forkchoice/fcr/OutputWriter.java          |  65 +++
@@ -15,7 +15,7 @@ Subject: [PATCH] fcr-simulator-engine: add Teku engine wrapper
  .../forkchoice/fcr/SlotResult.java            |  55 +++
  .../src/main/resources/log4j2-fcr.xml         |  13 +
  settings.gradle                               |   1 +
- 11 files changed, 1054 insertions(+)
+ 11 files changed, 1059 insertions(+)
  create mode 100644 fcr-simulator-engine/build.gradle
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
@@ -29,7 +29,7 @@ Subject: [PATCH] fcr-simulator-engine: add Teku engine wrapper
 
 diff --git a/fcr-simulator-engine/build.gradle b/fcr-simulator-engine/build.gradle
 new file mode 100644
-index 0000000..a7c3af3
+index 0000000000..a7c3af304e
 --- /dev/null
 +++ b/fcr-simulator-engine/build.gradle
 @@ -0,0 +1,69 @@
@@ -104,7 +104,7 @@ index 0000000..a7c3af3
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
 new file mode 100644
-index 0000000..e472735
+index 0000000000..e4727352a6
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
 @@ -0,0 +1,59 @@
@@ -169,7 +169,7 @@ index 0000000..e472735
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
 new file mode 100644
-index 0000000..43ebedc
+index 0000000000..43ebedc15e
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
 @@ -0,0 +1,94 @@
@@ -269,10 +269,10 @@ index 0000000..43ebedc
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
 new file mode 100644
-index 0000000..5300b1d
+index 0000000000..361421b4f2
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,430 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -288,6 +288,7 @@ index 0000000..5300b1d
 +
 +package tech.pegasys.teku.statetransition.forkchoice.fcr;
 +
++import static tech.pegasys.teku.infrastructure.time.TimeUtilities.secondsToMillis;
 +import static tech.pegasys.teku.networks.Eth2NetworkConfiguration.DEFAULT_FORK_CHOICE_LATE_BLOCK_REORG_ENABLED;
 +
 +import com.google.common.io.MoreFiles;
@@ -502,7 +503,7 @@ index 0000000..5300b1d
 +  private void runSlot(final long simSlot) throws IOException, InterruptedException {
 +    final UInt64 slot = UInt64.valueOf(simSlot);
 +    final boolean isRecording = simSlot >= cfg.startSlot();
-+    storageSystem.chainUpdater().advanceCurrentSlotToAtLeast(slot);
++    advanceToSlot(slot);
 +    final Optional<SignedBeaconBlock> maybeBlock =
 +        httpClient.getBlock(slot).map(spec::deserializeSignedBeaconBlock);
 +    final boolean hasBlock = maybeBlock.isPresent();
@@ -524,7 +525,7 @@ index 0000000..5300b1d
 +    final int numInjected = injectSourceAttestations(sourceSlot);
 +
 +    final UInt64 evalSlot = UInt64.valueOf(simSlot + 1);
-+    storageSystem.chainUpdater().advanceCurrentSlotToAtLeast(evalSlot);
++    advanceToSlot(evalSlot);
 +    final long t0 = System.nanoTime();
 +    FcrForkChoiceAccess.processHead(forkChoice, evalSlot).join();
 +    final long durationUs = (System.nanoTime() - t0) / 1_000;
@@ -537,6 +538,10 @@ index 0000000..5300b1d
 +      outputWriter.write(
 +          buildSlotResult(slot, hasBlock, blockRoot, sourceSlot, numInjected, durationUs));
 +    }
++  }
++
++  private void advanceToSlot(final UInt64 slot) {
++    forkChoice.onTick(secondsToMillis(recentChainData.computeTimeAtSlot(slot)), Optional.empty());
 +  }
 +
 +  private void printSlotDiagnostic(
@@ -700,7 +705,7 @@ index 0000000..5300b1d
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java
 new file mode 100644
-index 0000000..f7a5e01
+index 0000000000..f7a5e011d4
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java
 @@ -0,0 +1,107 @@
@@ -813,7 +818,7 @@ index 0000000..f7a5e01
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java
 new file mode 100644
-index 0000000..4a1d588
+index 0000000000..4a1d5883ea
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java
 @@ -0,0 +1,111 @@
@@ -930,7 +935,7 @@ index 0000000..4a1d588
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java
 new file mode 100644
-index 0000000..289f132
+index 0000000000..289f1329fd
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java
 @@ -0,0 +1,65 @@
@@ -1001,7 +1006,7 @@ index 0000000..289f132
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/PlanFetcher.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/PlanFetcher.java
 new file mode 100644
-index 0000000..0f797cd
+index 0000000000..0f797cd983
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/PlanFetcher.java
 @@ -0,0 +1,55 @@
@@ -1062,7 +1067,7 @@ index 0000000..0f797cd
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotResult.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotResult.java
 new file mode 100644
-index 0000000..a1cd194
+index 0000000000..a1cd1943e0
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotResult.java
 @@ -0,0 +1,55 @@
@@ -1123,7 +1128,7 @@ index 0000000..a1cd194
 +    @JsonProperty("fcr_eval_duration_us") long fcrEvalDurationUs) {}
 diff --git a/fcr-simulator-engine/src/main/resources/log4j2-fcr.xml b/fcr-simulator-engine/src/main/resources/log4j2-fcr.xml
 new file mode 100644
-index 0000000..b839d47
+index 0000000000..b839d47a63
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/resources/log4j2-fcr.xml
 @@ -0,0 +1,13 @@
@@ -1141,7 +1146,7 @@ index 0000000..b839d47
 +  </Loggers>
 +</Configuration>
 diff --git a/settings.gradle b/settings.gradle
-index 46f1a32..47ac4d2 100644
+index 46f1a32cb5..47ac4d2ec9 100644
 --- a/settings.gradle
 +++ b/settings.gradle
 @@ -70,3 +70,4 @@ include 'eth-benchmark-tests'
