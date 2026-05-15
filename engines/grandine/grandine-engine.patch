@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index c42957d..cd1d871 100644
+index c42957d..7fbcd17 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -5719,6 +5719,34 @@ dependencies = [
+@@ -5719,6 +5719,35 @@ dependencies = [
   "bytes",
  ]
  
@@ -16,6 +16,7 @@ index c42957d..cd1d871 100644
 + "clap",
 + "crossbeam-utils",
 + "database",
++ "execution_engine",
 + "fork_choice_control",
 + "fork_choice_store",
 + "futures",
@@ -51,10 +52,10 @@ index 3f3f61a..623d22d 100644
      'benches',
 diff --git a/fcr-simulator/Cargo.toml b/fcr-simulator/Cargo.toml
 new file mode 100644
-index 0000000..9074d3c
+index 0000000..559e870
 --- /dev/null
 +++ b/fcr-simulator/Cargo.toml
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,40 @@
 +[package]
 +name = "fcr-grandine"
 +version = "0.1.0"
@@ -78,6 +79,7 @@ index 0000000..9074d3c
 +clap = { workspace = true }
 +crossbeam-utils = { workspace = true }
 +database = { workspace = true }
++execution_engine = { workspace = true }
 +fork_choice_control = { workspace = true }
 +fork_choice_store = { workspace = true }
 +futures = { workspace = true }
@@ -657,10 +659,10 @@ index 0000000..3b915f8
 +}
 diff --git a/fcr-simulator/src/sim/engine.rs b/fcr-simulator/src/sim/engine.rs
 new file mode 100644
-index 0000000..9f59628
+index 0000000..bc082f0
 --- /dev/null
 +++ b/fcr-simulator/src/sim/engine.rs
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,486 @@
 +use std::collections::HashMap;
 +use std::sync::Arc;
 +use std::time::Instant;
@@ -668,6 +670,7 @@ index 0000000..9f59628
 +use anyhow::{Context, Result, bail};
 +use crossbeam_utils::sync::WaitGroup;
 +use database::Database;
++use execution_engine::{PayloadStatusV1, PayloadValidationStatus};
 +use fork_choice_control::{AdHocBenchController, MutatorHandle};
 +use fork_choice_store::StoreConfig;
 +use helper_functions::{accessors, misc};
@@ -678,7 +681,7 @@ index 0000000..9f59628
 +    config::Config as ChainConfig,
 +    phase0::primitives::{H256, Slot},
 +    preset::{Mainnet, Preset},
-+    traits::SignedBeaconBlock as _,
++    traits::{BeaconState as _, SignedBeaconBlock as _},
 +};
 +
 +use crate::config::{Config, Network};
@@ -726,10 +729,58 @@ index 0000000..9f59628
 +        let fetcher = BeaconFetcher::new(config.beacon_node_url(), chain_config.clone())
 +            .context("failed to create HTTP fetcher")?;
 +
-+        // Walk back from warmup_start_slot to the nearest epoch-start slot with a non-missed block.
-+        // Grandine's Store::new requires an epoch-aligned anchor.
++        let warmup_state = fetcher.fetch_state_at_slot::<P>(warmup_start_slot).await?;
++        let finalized_cp = warmup_state.finalized_checkpoint();
++        info!(
++            finalized_epoch = %finalized_cp.epoch,
++            finalized_root = %format_root(finalized_cp.root),
++            "Read real finalized checkpoint from warmup state"
++        );
++
++        let expected_block_slot = misc::compute_start_slot_at_epoch::<P>(finalized_cp.epoch);
++        let scan_end_slot =
++            misc::compute_start_slot_at_epoch::<P>(finalized_cp.epoch.saturating_sub(1));
++        info!(
++            expected_block_slot,
++            scan_end_slot, "Scanning backward for finalized block"
++        );
++
++        let mut finalized_block_slot = None;
++        for slot in (scan_end_slot..=expected_block_slot).rev() {
++            let Some(block) = fetcher
++                .fetch_block_at_slot::<P>(slot)
++                .await
++                .with_context(|| {
++                    format!("failed to fetch finalized candidate block at slot {}", slot)
++                })?
++            else {
++                continue;
++            };
++
++            let block_root = block.message().hash_tree_root();
++            if block_root == finalized_cp.root {
++                finalized_block_slot = Some(slot);
++                break;
++            }
++        }
++
++        let Some(finalized_block_slot) = finalized_block_slot else {
++            bail!(
++                "finalized checkpoint block root {} was not found by scanning slots {} down to {}; orchestrator data may not include finalized_epoch {}",
++                format_root(finalized_cp.root),
++                expected_block_slot,
++                scan_end_slot,
++                finalized_cp.epoch,
++            );
++        };
++
++        info!(
++            finalized_block_slot = %finalized_block_slot,
++            "Fetched finalized block"
++        );
++
 +        let (anchor_slot, anchor_state, anchor_block) =
-+            find_epoch_aligned_anchor::<P>(&fetcher, warmup_start_slot)
++            find_epoch_aligned_anchor::<P>(&fetcher, finalized_block_slot)
 +                .await
 +                .context("failed to find epoch-aligned anchor")?;
 +
@@ -767,10 +818,6 @@ index 0000000..9f59628
 +            futures::sink::drain(),
 +        );
 +
-+        controller.on_slot(warmup_start_slot);
-+        controller.wait_for_tasks();
-+
-+        // Catchup: import blocks from anchor_slot + 1 through warmup_start_slot.
 +        info!(
 +            from = anchor_slot + 1,
 +            to = warmup_start_slot,
@@ -778,25 +825,35 @@ index 0000000..9f59628
 +        );
 +        let mut catchup_blocks = 0u64;
 +        for slot in (anchor_slot + 1)..=warmup_start_slot {
++            if misc::is_epoch_start::<P>(slot) {
++                info!(
++                    slot,
++                    epoch = misc::compute_epoch_at_slot::<P>(slot),
++                    "Warmup catchup crossed epoch boundary"
++                );
++            }
++
++            controller.on_slot(slot);
++            controller.wait_for_tasks();
++
 +            if let Some(block) = fetcher
 +                .fetch_block_at_slot::<P>(slot)
 +                .await
 +                .with_context(|| format!("failed to fetch catchup block at slot {}", slot))?
 +            {
-+                controller.on_replay_block(Arc::new(block));
++                let block = Arc::new(block);
++                controller.on_replay_block(block.clone());
 +                controller.wait_for_tasks();
++                promote_imported_payload_to_valid(&controller, block.as_ref());
 +                catchup_blocks += 1;
 +            }
 +        }
 +        info!(catchup_blocks, "Catchup complete");
 +
-+        let plan = fetch_attestation_plan(
-+            config.beacon_node_url(),
-+            warmup_start_slot + 1,
-+            end_slot,
-+        )
-+        .await
-+        .context("failed to fetch attestation plan")?;
++        let plan =
++            fetch_attestation_plan(config.beacon_node_url(), warmup_start_slot + 1, end_slot)
++                .await
++                .context("failed to fetch attestation plan")?;
 +        info!(plan_entries = plan.len(), "Attestation plan fetched");
 +
 +        for slot in (warmup_start_slot + 1)..end_slot {
@@ -855,13 +912,15 @@ index 0000000..9f59628
 +            if let Some(ref block) = block_at_slot {
 +                self.controller.on_replay_block(block.clone());
 +                self.controller.wait_for_tasks();
++                promote_imported_payload_to_valid(&self.controller, block.as_ref());
 +            }
 +
 +            let source_slot = self.plan.get(&slot).copied().flatten();
 +            let mut num_attestations_injected = 0u64;
 +            if let Some(source_block_slot) = source_slot {
-+                num_attestations_injected =
-+                    self.inject_attestations_from_source(source_block_slot).await?;
++                num_attestations_injected = self
++                    .inject_attestations_from_source(source_block_slot)
++                    .await?;
 +            }
 +
 +            let fcr_eval_start = Instant::now();
@@ -907,10 +966,7 @@ index 0000000..9f59628
 +        Ok(())
 +    }
 +
-+    async fn get_block_at_slot(
-+        &mut self,
-+        slot: Slot,
-+    ) -> Result<Option<Arc<SignedBeaconBlock<P>>>> {
++    async fn get_block_at_slot(&mut self, slot: Slot) -> Result<Option<Arc<SignedBeaconBlock<P>>>> {
 +        if let Some(cached) = self.block_cache.get(&slot) {
 +            return Ok(cached.clone());
 +        }
@@ -934,7 +990,11 @@ index 0000000..9f59628
 +                source_slot
 +            );
 +        };
-+        let attestation_count = source_block.message().body().combined_attestations().count();
++        let attestation_count = source_block
++            .message()
++            .body()
++            .combined_attestations()
++            .count();
 +        if attestation_count == 0 {
 +            return Ok(0);
 +        }
@@ -1054,6 +1114,36 @@ index 0000000..9f59628
 +
 +fn format_root(root: H256) -> String {
 +    format!("0x{}", hex::encode(root))
++}
++
++fn promote_imported_payload_to_valid<P: Preset>(
++    controller: &AdHocBenchController<P>,
++    block: &SignedBeaconBlock<P>,
++) {
++    let Some(payload) = block
++        .message()
++        .body()
++        .with_execution_payload()
++        .map(|body| body.execution_payload())
++    else {
++        return;
++    };
++
++    let block_hash = payload.block_hash();
++    if block_hash == Default::default() {
++        return;
++    }
++
++    controller.on_notified_new_payload(
++        block.message().hash_tree_root(),
++        block_hash,
++        PayloadStatusV1 {
++            status: PayloadValidationStatus::Valid,
++            latest_valid_hash: Some(block_hash),
++            validation_error: None,
++        },
++    );
++    controller.wait_for_tasks();
 +}
 +
 +fn micros_since(start: Instant) -> u64 {
