@@ -32,6 +32,7 @@ import {
   sszTypesFor,
   type Attestation,
   type IndexedAttestation,
+  type RootHex,
   type SignedBeaconBlock,
 } from "@lodestar/types";
 import {toRootHex} from "@lodestar/utils";
@@ -41,6 +42,11 @@ import {request} from "undici";
 import {LODESTAR_COMMIT, LODESTAR_VERSION} from "./version.js";
 
 const ZERO_ROOT_HEX = `0x${"0".repeat(64)}`;
+const RECENT_STATE_CACHE_SLOTS = 64;
+const CHECKPOINT_STATE_CACHE_EPOCHS = 4;
+const BLOCK_FETCH_CACHE_SLOTS = 64;
+const LOG_MEMORY = process.env.FCR_LODESTAR_LOG_MEMORY === "1";
+const MEMORY_LOG_INTERVAL_SLOTS = Number(process.env.FCR_LODESTAR_MEMORY_LOG_INTERVAL_SLOTS ?? 0);
 
 interface CliConfig {
   beaconNodeUrl: string;
@@ -137,6 +143,7 @@ async function fetchSsz(url: string): Promise<{body: Uint8Array; consensusVersio
     headers: {accept: "application/octet-stream"},
   });
   if (res.statusCode === 404) {
+    await res.body.dump();
     throw new NotFoundError(url);
   }
   if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -211,6 +218,14 @@ class BlockFetcher {
     }
   }
 
+  pruneBefore(slot: number): void {
+    for (const cachedSlot of this.cache.keys()) {
+      if (cachedSlot < slot) {
+        this.cache.delete(cachedSlot);
+      }
+    }
+  }
+
   async fetchByRoot(root: Uint8Array): Promise<BlockFetch> {
     const url = `${this.baseUrl}/eth/v2/beacon/blocks/${toRootHex(root)}`;
     const {body, consensusVersion} = await fetchSsz(url);
@@ -271,6 +286,37 @@ class JsonlWriter {
   }
 }
 
+class MemoryTracker {
+  private peakHeapUsed = 0;
+  private peakRss = 0;
+
+  observe(slot: number): void {
+    if (!LOG_MEMORY) return;
+
+    const usage = process.memoryUsage();
+    this.peakHeapUsed = Math.max(this.peakHeapUsed, usage.heapUsed);
+    this.peakRss = Math.max(this.peakRss, usage.rss);
+
+    if (MEMORY_LOG_INTERVAL_SLOTS > 0 && slot % MEMORY_LOG_INTERVAL_SLOTS === 0) {
+      process.stderr.write(
+        `[fcr-lodestar] memory slot=${slot} heap_used_mb=${toMiB(usage.heapUsed)} rss_mb=${toMiB(usage.rss)} peak_heap_used_mb=${toMiB(this.peakHeapUsed)} peak_rss_mb=${toMiB(this.peakRss)}\n`,
+      );
+    }
+  }
+
+  finish(): void {
+    if (!LOG_MEMORY) return;
+
+    process.stderr.write(
+      `[fcr-lodestar] memory peak_heap_used_mb=${toMiB(this.peakHeapUsed)} peak_rss_mb=${toMiB(this.peakRss)}\n`,
+    );
+  }
+}
+
+function toMiB(bytes: number): number {
+  return Math.round(bytes / 1024 / 1024);
+}
+
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
   if (parsed.kind === "manifest") {
@@ -300,15 +346,68 @@ interface BootstrapResult {
   beaconConfig: BeaconConfig;
   forkChoice: ForkChoice;
   fetcher: BlockFetcher;
-  warmupState: CachedBeaconStateAllForks;
   plan: Map<number, number | null>;
-  stateByStateRoot: Map<string, CachedBeaconStateAllForks>;
-  stateByCheckpointKey: Map<string, CachedBeaconStateAllForks>;
+  stateCache: StateCache;
   headStateRef: {state: CachedBeaconStateAllForks};
+  headStateRootRef: {rootHex: RootHex};
 }
 
 function checkpointKey(ep: number, rootHex: string, payloadStatus: PayloadStatus): string {
   return `${ep}:${rootHex}:${payloadStatus}`;
+}
+
+type StateCacheEntry = {
+  slot: number;
+  state: CachedBeaconStateAllForks;
+};
+
+type CheckpointStateCacheEntry = {
+  epoch: number;
+  state: CachedBeaconStateAllForks;
+};
+
+class StateCache {
+  private readonly stateByStateRoot = new Map<RootHex, StateCacheEntry>();
+  private readonly stateByCheckpointKey = new Map<string, CheckpointStateCacheEntry>();
+
+  setStateRoot(rootHex: RootHex, slot: number, state: CachedBeaconStateAllForks): void {
+    this.stateByStateRoot.set(rootHex, {slot, state});
+  }
+
+  getStateRoot(rootHex: RootHex): CachedBeaconStateAllForks | null {
+    return this.stateByStateRoot.get(rootHex)?.state ?? null;
+  }
+
+  setCheckpoint(
+    epoch: number,
+    rootHex: RootHex,
+    payloadStatus: PayloadStatus,
+    state: CachedBeaconStateAllForks,
+  ): void {
+    this.stateByCheckpointKey.set(checkpointKey(epoch, rootHex, payloadStatus), {epoch, state});
+  }
+
+  getCheckpoint(checkpoint: CheckpointWithPayloadStatus): CachedBeaconStateAllForks | null {
+    return this.stateByCheckpointKey.get(
+      checkpointKey(checkpoint.epoch, checkpoint.rootHex, checkpoint.payloadStatus),
+    )?.state ?? null;
+  }
+
+  prune(currentSlot: number, currentEpoch: number): void {
+    const minStateSlot = Math.max(0, currentSlot - RECENT_STATE_CACHE_SLOTS);
+    for (const [rootHex, entry] of this.stateByStateRoot.entries()) {
+      if (entry.slot < minStateSlot) {
+        this.stateByStateRoot.delete(rootHex);
+      }
+    }
+
+    const minCheckpointEpoch = Math.max(0, currentEpoch - CHECKPOINT_STATE_CACHE_EPOCHS);
+    for (const [key, entry] of this.stateByCheckpointKey.entries()) {
+      if (entry.epoch < minCheckpointEpoch) {
+        this.stateByCheckpointKey.delete(key);
+      }
+    }
+  }
 }
 
 async function bootstrapEngine(cfg: CliConfig): Promise<BootstrapResult> {
@@ -336,13 +435,13 @@ async function bootstrapEngine(cfg: CliConfig): Promise<BootstrapResult> {
 
   // 4. Initialize fork choice from finalized state
   const fetcher = new BlockFetcher(cfg.beaconNodeUrl, beaconConfig);
-  const stateByStateRoot = new Map<string, CachedBeaconStateAllForks>();
-  const stateByCheckpointKey = new Map<string, CachedBeaconStateAllForks>();
+  const stateCache = new StateCache();
 
   // Seed caches with the anchor state
   const anchorStateRoot = toRootHex(cachedState.hashTreeRoot());
-  stateByStateRoot.set(anchorStateRoot, cachedState);
+  stateCache.setStateRoot(anchorStateRoot, cachedState.slot, cachedState);
   const headStateRef = {state: cachedState};
+  const headStateRootRef = {rootHex: anchorStateRoot};
 
   // Build BeaconStateView wrapper for the bootstrap state (used by FCR via stateGetter).
   const bootstrapStateView = new BeaconStateView(cachedState);
@@ -360,14 +459,15 @@ async function bootstrapEngine(cfg: CliConfig): Promise<BootstrapResult> {
   // State getter for FCR: serve from the per-block postState cache.
   const stateGetter: ForkChoiceStateGetter = (opts) => {
     if (opts.stateRoot !== undefined) {
-      const s = stateByStateRoot.get(opts.stateRoot);
+      if (opts.stateRoot === headStateRootRef.rootHex) {
+        return new BeaconStateView(headStateRef.state);
+      }
+      const s = stateCache.getStateRoot(opts.stateRoot);
       if (!s) return null;
       return new BeaconStateView(s);
     }
     if (opts.checkpoint !== undefined) {
-      const cp = opts.checkpoint;
-      const key = checkpointKey(cp.epoch, cp.rootHex, cp.payloadStatus);
-      const s = stateByCheckpointKey.get(key);
+      const s = stateCache.getCheckpoint(opts.checkpoint);
       if (!s) {
         // Fallback: process the head state forward to the checkpoint epoch boundary.
         // The FCR will tolerate null and skip rules requiring this state.
@@ -380,7 +480,6 @@ async function bootstrapEngine(cfg: CliConfig): Promise<BootstrapResult> {
 
   const {forkChoice} = initializeForkChoiceFromAnchor({
     beaconConfig,
-    cachedState,
     bootstrapStateView,
     currentSlot: cfg.warmupStartSlot,
     justifiedBalancesGetter,
@@ -390,8 +489,7 @@ async function bootstrapEngine(cfg: CliConfig): Promise<BootstrapResult> {
   // Seed the checkpoint-state cache: the anchor state is the justified+finalized
   // checkpoint state at bootstrap.
   const anchor = bootstrapStateView.computeAnchorCheckpoint();
-  const anchorCpKey = checkpointKey(anchor.checkpoint.epoch, toRootHex(anchor.checkpoint.root), PayloadStatus.FULL);
-  stateByCheckpointKey.set(anchorCpKey, cachedState);
+  stateCache.setCheckpoint(anchor.checkpoint.epoch, toRootHex(anchor.checkpoint.root), PayloadStatus.FULL, cachedState);
 
   // 5. Fetch plan
   const plan = await fetchPlan(cfg.beaconNodeUrl, cfg.warmupStartSlot + 1, cfg.endSlot);
@@ -405,23 +503,21 @@ async function bootstrapEngine(cfg: CliConfig): Promise<BootstrapResult> {
     beaconConfig,
     forkChoice,
     fetcher,
-    warmupState: cachedState,
     plan,
-    stateByStateRoot,
-    stateByCheckpointKey,
+    stateCache,
     headStateRef,
+    headStateRootRef,
   };
 }
 
 function initializeForkChoiceFromAnchor(args: {
   beaconConfig: BeaconConfig;
-  cachedState: CachedBeaconStateAllForks;
   bootstrapStateView: BeaconStateView;
   currentSlot: number;
   justifiedBalancesGetter: JustifiedBalancesGetter;
   stateGetter: ForkChoiceStateGetter;
 }): {forkChoice: ForkChoice} {
-  const {beaconConfig, cachedState, bootstrapStateView, currentSlot, justifiedBalancesGetter, stateGetter} = args;
+  const {beaconConfig, bootstrapStateView, currentSlot, justifiedBalancesGetter, stateGetter} = args;
   const {checkpoint, blockHeader} = bootstrapStateView.computeAnchorCheckpoint();
 
   const finalizedCheckpoint = {...checkpoint};
@@ -486,10 +582,12 @@ function initializeForkChoiceFromAnchor(args: {
 
 async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void> {
   const writer = new JsonlWriter(cfg.output);
-  const {forkChoice, fetcher, plan, stateByStateRoot, stateByCheckpointKey, headStateRef} = boot;
+  const memory = new MemoryTracker();
+  const {forkChoice, fetcher, plan, stateCache, headStateRef, headStateRootRef} = boot;
 
   try {
     let slot = cfg.warmupStartSlot + 1;
+    let lastPrunedFinalizedRoot = forkChoice.getFinalizedCheckpoint().rootHex;
     while (slot < cfg.endSlot) {
       const isRecording = slot >= cfg.startSlot;
 
@@ -501,7 +599,8 @@ async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void>
       if (blockFetch) {
         try {
           const postState = processBlock(headStateRef.state, blockFetch);
-          stateByStateRoot.set(toRootHex(postState.hashTreeRoot()), postState);
+          const postStateRoot = toRootHex(blockFetch.block.message.stateRoot);
+          stateCache.setStateRoot(postStateRoot, slot, postState);
           // Apply block to fork choice
           const protoBlock = forkChoice.onBlock(
             blockFetch.block.message,
@@ -513,13 +612,13 @@ async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void>
           );
           blockRootHex = protoBlock.blockRoot;
           headStateRef.state = postState;
+          headStateRootRef.rootHex = postStateRoot;
 
           // If this block is an epoch boundary, cache it as a potential checkpoint
-          // state under both FULL and PENDING payload statuses to satisfy FCR lookups.
+          // state under FULL payload status to satisfy FCR lookups.
           if (slot % 32 === 0) {
             const epoch = computeEpochAtSlot(slot);
-            const keyFull = checkpointKey(epoch, protoBlock.blockRoot, PayloadStatus.FULL);
-            stateByCheckpointKey.set(keyFull, postState);
+            stateCache.setCheckpoint(epoch, protoBlock.blockRoot, PayloadStatus.FULL, postState);
           }
         } catch (err) {
           throw new Error(`failed to process block at slot ${slot}: ${formatError(err)}`);
@@ -555,9 +654,19 @@ async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void>
         }));
       }
 
+      const finalized = forkChoice.getFinalizedCheckpoint();
+      if (finalized.rootHex !== lastPrunedFinalizedRoot) {
+        forkChoice.prune(finalized.rootHex);
+        lastPrunedFinalizedRoot = finalized.rootHex;
+      }
+      stateCache.prune(slot, computeEpochAtSlot(slot));
+      fetcher.pruneBefore(Math.max(0, slot - BLOCK_FETCH_CACHE_SLOTS));
+      memory.observe(slot);
+
       slot += 1;
     }
   } finally {
+    memory.finish();
     writer.close();
   }
 }
