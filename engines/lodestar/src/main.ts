@@ -35,7 +35,7 @@ import {
   type RootHex,
   type SignedBeaconBlock,
 } from "@lodestar/types";
-import {toRootHex} from "@lodestar/utils";
+import {toRootHex, type LogData, type Logger} from "@lodestar/utils";
 import {ForkName} from "@lodestar/params";
 import {request} from "undici";
 
@@ -47,6 +47,12 @@ const CHECKPOINT_STATE_CACHE_EPOCHS = 4;
 const BLOCK_FETCH_CACHE_SLOTS = 64;
 const LOG_MEMORY = process.env.FCR_LODESTAR_LOG_MEMORY === "1";
 const MEMORY_LOG_INTERVAL_SLOTS = Number(process.env.FCR_LODESTAR_MEMORY_LOG_INTERVAL_SLOTS ?? 0);
+const DEBUG_CACHE = process.env.FCR_LODESTAR_DEBUG_CACHE === "1";
+const DEBUG_FCR = process.env.FCR_LODESTAR_DEBUG_FCR === "1";
+const DEBUG_SLOTS = parseSlotSet(process.env.FCR_LODESTAR_DEBUG_SLOTS);
+const DEBUG_EVICTION_HISTORY_LIMIT = 1024;
+const LODESTAR_NULL_VOTE_INDEX = 0xffffffff;
+const LODESTAR_INIT_VOTE_SLOT = 0;
 
 interface CliConfig {
   beaconNodeUrl: string;
@@ -348,12 +354,38 @@ interface BootstrapResult {
   fetcher: BlockFetcher;
   plan: Map<number, number | null>;
   stateCache: StateCache;
+  debug: DebugTracer;
   headStateRef: {state: CachedBeaconStateAllForks};
   headStateRootRef: {rootHex: RootHex};
 }
 
 function checkpointKey(ep: number, rootHex: string, payloadStatus: PayloadStatus): string {
   return `${ep}:${rootHex}:${payloadStatus}`;
+}
+
+function parseSlotSet(raw: string | undefined): Set<number> | null {
+  if (!raw) return null;
+  const slots = new Set<number>();
+  for (const part of raw.split(",")) {
+    const slot = Number(part.trim());
+    if (Number.isInteger(slot) && slot >= 0) {
+      slots.add(slot);
+    }
+  }
+  return slots;
+}
+
+function logDataToFields(data: LogData | undefined): DebugFields {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return {};
+  return data as DebugFields;
+}
+
+function trimMap<K, V>(map: Map<K, V>, limit: number): void {
+  while (map.size > limit) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) return;
+    map.delete(oldest);
+  }
 }
 
 type StateCacheEntry = {
@@ -366,16 +398,97 @@ type CheckpointStateCacheEntry = {
   state: CachedBeaconStateAllForks;
 };
 
+type DebugFields = Record<string, unknown>;
+
+class DebugTracer {
+  private phase = "bootstrap";
+  private loopSlot: number | null = null;
+  private evalSlot: number | null = null;
+
+  constructor(
+    readonly cacheEnabled: boolean,
+    private readonly fcrEnabled: boolean,
+    private readonly slots: Set<number> | null,
+  ) {}
+
+  setPhase(phase: string, loopSlot: number | null, evalSlot: number | null = null): void {
+    this.phase = phase;
+    this.loopSlot = loopSlot;
+    this.evalSlot = evalSlot;
+  }
+
+  cache(event: string, fields: DebugFields): void {
+    if (!this.cacheEnabled) return;
+    this.write(event, fields);
+  }
+
+  lodestarLogger(): Logger | undefined {
+    if (!this.fcrEnabled) return undefined;
+    return {
+      error: (message, context, error) => this.fcr("error", message, context, error),
+      warn: (message, context, error) => this.fcr("warn", message, context, error),
+      info: (message, context, error) => this.fcr("info", message, context, error),
+      verbose: (message, context, error) => this.fcr("verbose", message, context, error),
+      debug: (message, context, error) => this.fcr("debug", message, context, error),
+    };
+  }
+
+  private fcr(level: string, message: string, context?: LogData, error?: Error): void {
+    if (!this.fcrEnabled) return;
+    this.write("fcr_log", {level, message, ...logDataToFields(context), error: error?.stack ?? error?.message});
+  }
+
+  private write(event: string, fields: DebugFields): void {
+    if (!this.shouldLog(fields)) return;
+    process.stderr.write(
+      `[fcr-lodestar-debug] ${JSON.stringify({
+        event,
+        phase: this.phase,
+        loopSlot: this.loopSlot,
+        evalSlot: this.evalSlot,
+        ...fields,
+      })}\n`,
+    );
+  }
+
+  private shouldLog(fields: DebugFields): boolean {
+    if (!this.slots || this.slots.size === 0) return true;
+    if (this.loopSlot !== null && this.slots.has(this.loopSlot)) return true;
+    if (this.evalSlot !== null && this.slots.has(this.evalSlot)) return true;
+    for (const key of ["slot", "currentSlot", "blockSlot", "confirmedSlot", "evictedAtSlot"]) {
+      const value = fields[key];
+      if (typeof value === "number" && this.slots.has(value)) return true;
+    }
+    return false;
+  }
+}
+
 class StateCache {
   private readonly stateByStateRoot = new Map<RootHex, StateCacheEntry>();
   private readonly stateByCheckpointKey = new Map<string, CheckpointStateCacheEntry>();
+  private readonly evictedStateRoots = new Map<RootHex, {slot: number; evictedAtSlot: number}>();
+  private readonly evictedCheckpoints = new Map<string, {epoch: number; evictedAtSlot: number}>();
+
+  constructor(private readonly debug: DebugTracer) {}
 
   setStateRoot(rootHex: RootHex, slot: number, state: CachedBeaconStateAllForks): void {
     this.stateByStateRoot.set(rootHex, {slot, state});
+    this.evictedStateRoots.delete(rootHex);
   }
 
   getStateRoot(rootHex: RootHex): CachedBeaconStateAllForks | null {
-    return this.stateByStateRoot.get(rootHex)?.state ?? null;
+    const entry = this.stateByStateRoot.get(rootHex);
+    if (entry) return entry.state;
+    const evicted = this.evictedStateRoots.get(rootHex);
+    this.debug.cache("state_cache_miss", {
+      kind: "state_root",
+      rootHex,
+      evictedSlot: evicted?.slot,
+      evictedAtSlot: evicted?.evictedAtSlot,
+      stateRoots: this.stateByStateRoot.size,
+      checkpoints: this.stateByCheckpointKey.size,
+    });
+    return null;
   }
 
   setCheckpoint(
@@ -384,13 +497,28 @@ class StateCache {
     payloadStatus: PayloadStatus,
     state: CachedBeaconStateAllForks,
   ): void {
-    this.stateByCheckpointKey.set(checkpointKey(epoch, rootHex, payloadStatus), {epoch, state});
+    const key = checkpointKey(epoch, rootHex, payloadStatus);
+    this.stateByCheckpointKey.set(key, {epoch, state});
+    this.evictedCheckpoints.delete(key);
   }
 
   getCheckpoint(checkpoint: CheckpointWithPayloadStatus): CachedBeaconStateAllForks | null {
-    return this.stateByCheckpointKey.get(
-      checkpointKey(checkpoint.epoch, checkpoint.rootHex, checkpoint.payloadStatus),
-    )?.state ?? null;
+    const key = checkpointKey(checkpoint.epoch, checkpoint.rootHex, checkpoint.payloadStatus);
+    const entry = this.stateByCheckpointKey.get(key);
+    if (entry) return entry.state;
+    const evicted = this.evictedCheckpoints.get(key);
+    this.debug.cache("state_cache_miss", {
+      kind: "checkpoint",
+      key,
+      checkpointEpoch: checkpoint.epoch,
+      checkpointRoot: checkpoint.rootHex,
+      payloadStatus: checkpoint.payloadStatus,
+      evictedEpoch: evicted?.epoch,
+      evictedAtSlot: evicted?.evictedAtSlot,
+      stateRoots: this.stateByStateRoot.size,
+      checkpoints: this.stateByCheckpointKey.size,
+    });
+    return null;
   }
 
   prune(currentSlot: number, currentEpoch: number): void {
@@ -398,6 +526,16 @@ class StateCache {
     for (const [rootHex, entry] of this.stateByStateRoot.entries()) {
       if (entry.slot < minStateSlot) {
         this.stateByStateRoot.delete(rootHex);
+        this.rememberEvictedState(rootHex, entry.slot, currentSlot);
+        this.debug.cache("state_cache_evict", {
+          kind: "state_root",
+          rootHex,
+          slot: entry.slot,
+          currentSlot,
+          minStateSlot,
+          stateRoots: this.stateByStateRoot.size,
+          checkpoints: this.stateByCheckpointKey.size,
+        });
       }
     }
 
@@ -405,8 +543,30 @@ class StateCache {
     for (const [key, entry] of this.stateByCheckpointKey.entries()) {
       if (entry.epoch < minCheckpointEpoch) {
         this.stateByCheckpointKey.delete(key);
+        this.rememberEvictedCheckpoint(key, entry.epoch, currentSlot);
+        this.debug.cache("state_cache_evict", {
+          kind: "checkpoint",
+          key,
+          epoch: entry.epoch,
+          currentSlot,
+          minCheckpointEpoch,
+          stateRoots: this.stateByStateRoot.size,
+          checkpoints: this.stateByCheckpointKey.size,
+        });
       }
     }
+  }
+
+  private rememberEvictedState(rootHex: RootHex, slot: number, evictedAtSlot: number): void {
+    if (!this.debug.cacheEnabled) return;
+    this.evictedStateRoots.set(rootHex, {slot, evictedAtSlot});
+    trimMap(this.evictedStateRoots, DEBUG_EVICTION_HISTORY_LIMIT);
+  }
+
+  private rememberEvictedCheckpoint(key: string, epoch: number, evictedAtSlot: number): void {
+    if (!this.debug.cacheEnabled) return;
+    this.evictedCheckpoints.set(key, {epoch, evictedAtSlot});
+    trimMap(this.evictedCheckpoints, DEBUG_EVICTION_HISTORY_LIMIT);
   }
 }
 
@@ -435,7 +595,8 @@ async function bootstrapEngine(cfg: CliConfig): Promise<BootstrapResult> {
 
   // 4. Initialize fork choice from finalized state
   const fetcher = new BlockFetcher(cfg.beaconNodeUrl, beaconConfig);
-  const stateCache = new StateCache();
+  const debug = new DebugTracer(DEBUG_CACHE, DEBUG_FCR, DEBUG_SLOTS);
+  const stateCache = new StateCache(debug);
 
   // Seed caches with the anchor state
   const anchorStateRoot = toRootHex(cachedState.hashTreeRoot());
@@ -484,6 +645,7 @@ async function bootstrapEngine(cfg: CliConfig): Promise<BootstrapResult> {
     currentSlot: cfg.warmupStartSlot,
     justifiedBalancesGetter,
     stateGetter,
+    logger: debug.lodestarLogger(),
   });
 
   // Seed the checkpoint-state cache: the anchor state is the justified+finalized
@@ -505,6 +667,7 @@ async function bootstrapEngine(cfg: CliConfig): Promise<BootstrapResult> {
     fetcher,
     plan,
     stateCache,
+    debug,
     headStateRef,
     headStateRootRef,
   };
@@ -516,8 +679,9 @@ function initializeForkChoiceFromAnchor(args: {
   currentSlot: number;
   justifiedBalancesGetter: JustifiedBalancesGetter;
   stateGetter: ForkChoiceStateGetter;
+  logger?: Logger;
 }): {forkChoice: ForkChoice} {
-  const {beaconConfig, bootstrapStateView, currentSlot, justifiedBalancesGetter, stateGetter} = args;
+  const {beaconConfig, bootstrapStateView, currentSlot, justifiedBalancesGetter, stateGetter, logger} = args;
   const {checkpoint, blockHeader} = bootstrapStateView.computeAnchorCheckpoint();
 
   const finalizedCheckpoint = {...checkpoint};
@@ -574,7 +738,7 @@ function initializeForkChoiceFromAnchor(args: {
     bootstrapStateView.validatorCount,
     null,
     {fastConfirmation: true, proposerBoost: false, proposerBoostReorg: false, computeUnrealized: true},
-    undefined,
+    logger,
   );
 
   return {forkChoice};
@@ -583,7 +747,7 @@ function initializeForkChoiceFromAnchor(args: {
 async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void> {
   const writer = new JsonlWriter(cfg.output);
   const memory = new MemoryTracker();
-  const {forkChoice, fetcher, plan, stateCache, headStateRef, headStateRootRef} = boot;
+  const {forkChoice, fetcher, plan, stateCache, debug, headStateRef, headStateRootRef} = boot;
 
   try {
     let slot = cfg.warmupStartSlot + 1;
@@ -591,6 +755,7 @@ async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void>
     while (slot < cfg.endSlot) {
       const isRecording = slot >= cfg.startSlot;
 
+      debug.setPhase("pre_slot_update", slot, slot);
       forkChoice.updateTime(slot);
 
       const blockFetch = await fetcher.fetchAtSlot(slot);
@@ -632,12 +797,14 @@ async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void>
         if (!sourceBlock) {
           throw new Error(`plan referenced missing source block at slot ${sourceSlot}`);
         }
-        numAttestationsInjected = injectAttestationsFromSource(forkChoice, headStateRef.state, sourceBlock);
+        numAttestationsInjected = injectAttestationsFromSource(forkChoice, headStateRef.state, sourceBlock, slot + 1);
       }
 
       // Recompute head + run FCR at slot+1
       const fcrStart = hrtime.bigint();
+      debug.setPhase("post_attestation_update", slot, slot + 1);
       forkChoice.updateTime(slot + 1);
+      debug.setPhase("record_head", slot, slot + 1);
       const head = forkChoice.updateHead();
       const fcrEvalUs = microsSince(fcrStart);
 
@@ -659,9 +826,11 @@ async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void>
         forkChoice.prune(finalized.rootHex);
         lastPrunedFinalizedRoot = finalized.rootHex;
       }
+      debug.setPhase("prune", slot);
       stateCache.prune(slot, computeEpochAtSlot(slot));
       fetcher.pruneBefore(Math.max(0, slot - BLOCK_FETCH_CACHE_SLOTS));
       memory.observe(slot);
+      debug.setPhase("idle", null);
 
       slot += 1;
     }
@@ -688,6 +857,7 @@ function injectAttestationsFromSource(
   forkChoice: ForkChoice,
   headState: CachedBeaconStateAllForks,
   sourceBlock: BlockFetch,
+  injectSlot: number,
 ): number {
   const attestations = sourceBlock.block.message.body.attestations as Attestation[];
   if (attestations.length === 0) return 0;
@@ -707,13 +877,107 @@ function injectAttestationsFromSource(
       sszTypesFor(sourceBlock.fork).AttestationData.hashTreeRoot(attestation.data),
     );
     try {
-      forkChoice.onAttestation(indexed, attDataRoot, true);
+      injectAttestationAtSlot(forkChoice, indexed, attDataRoot, injectSlot);
       injected++;
     } catch {
       // Match Lighthouse policy: log-and-continue on injection failure.
     }
   }
   return injected;
+}
+
+type ForkChoiceWithInternals = ForkChoice & {
+  fcStore: {
+    currentSlot: number;
+    equivocatingIndices: Set<number>;
+  };
+  protoArray: {
+    getDefaultVariant(rootHex: RootHex): PayloadStatus | undefined;
+    getNodeIndexByRootAndStatus(rootHex: RootHex, payloadStatus: PayloadStatus): number | undefined;
+  };
+  validateOnAttestation(
+    indexedAttestation: IndexedAttestation,
+    slot: number,
+    blockRootHex: string,
+    targetEpoch: number,
+    attDataRoot: string,
+    forceImport?: boolean,
+  ): void;
+  voteCurrentIndices: number[];
+  voteNextIndices: number[];
+  voteNextSlots: number[];
+};
+
+function injectAttestationAtSlot(
+  forkChoice: ForkChoice,
+  indexed: IndexedAttestation,
+  attDataRoot: string,
+  injectSlot: number,
+): void {
+  if (indexed.data.slot >= injectSlot) {
+    withForkChoiceCurrentSlot(forkChoice, injectSlot, () => forkChoice.onAttestation(indexed, attDataRoot, true));
+    return;
+  }
+
+  const blockRootHex = toRootHex(indexed.data.beaconBlockRoot);
+  if (isZeroRoot(blockRootHex)) return;
+
+  const internal = forkChoice as ForkChoiceWithInternals;
+  withForkChoiceCurrentSlot(forkChoice, injectSlot, () => {
+    internal.validateOnAttestation(
+      indexed,
+      indexed.data.slot,
+      blockRootHex,
+      indexed.data.target.epoch,
+      attDataRoot,
+      true,
+    );
+  });
+
+  const payloadStatus = internal.protoArray.getDefaultVariant(blockRootHex) ?? PayloadStatus.FULL;
+  for (const validatorIndex of indexed.attestingIndices) {
+    if (!internal.fcStore.equivocatingIndices.has(validatorIndex)) {
+      addLatestMessageBySlot(internal, validatorIndex, indexed.data.slot, blockRootHex, payloadStatus);
+    }
+  }
+}
+
+function withForkChoiceCurrentSlot<T>(forkChoice: ForkChoice, slot: number, fn: () => T): T {
+  const internal = forkChoice as ForkChoiceWithInternals;
+  const previousSlot = internal.fcStore.currentSlot;
+  internal.fcStore.currentSlot = slot;
+  try {
+    return fn();
+  } finally {
+    internal.fcStore.currentSlot = previousSlot;
+  }
+}
+
+function addLatestMessageBySlot(
+  forkChoice: ForkChoiceWithInternals,
+  validatorIndex: number,
+  nextSlot: number,
+  nextRoot: RootHex,
+  nextPayloadStatus: PayloadStatus,
+): void {
+  const nextIndex = forkChoice.protoArray.getNodeIndexByRootAndStatus(nextRoot, nextPayloadStatus);
+  if (nextIndex === undefined) {
+    throw new Error(`Could not find proto index for nextRoot ${nextRoot} with payloadStatus ${nextPayloadStatus}`);
+  }
+
+  if (forkChoice.voteNextSlots.length < validatorIndex + 1) {
+    for (let i = forkChoice.voteNextSlots.length; i < validatorIndex + 1; i++) {
+      forkChoice.voteNextSlots[i] = LODESTAR_INIT_VOTE_SLOT;
+      forkChoice.voteCurrentIndices[i] = LODESTAR_NULL_VOTE_INDEX;
+      forkChoice.voteNextIndices[i] = LODESTAR_NULL_VOTE_INDEX;
+    }
+  }
+
+  const existingNextSlot = forkChoice.voteNextSlots[validatorIndex];
+  if (existingNextSlot === LODESTAR_INIT_VOTE_SLOT || nextSlot > existingNextSlot) {
+    forkChoice.voteNextIndices[validatorIndex] = nextIndex;
+    forkChoice.voteNextSlots[validatorIndex] = nextSlot;
+  }
 }
 
 interface BuildRecordArgs {
