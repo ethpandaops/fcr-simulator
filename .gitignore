@@ -4,6 +4,8 @@ target/
 /fcr-lighthouse
 /results/fcr-orchestrator
 /results/fcr-lighthouse
+/results/fcr-grandine
+/engines/grandine/grandine/
 
 # Cache
 *.cache
