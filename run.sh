@@ -130,6 +130,79 @@ echo "Cache:            $CACHE_DIR"
 echo "Output:           $OUTPUT_DIR"
 echo ""
 
+CHUNK_RETRIES=3
+RETRY_SLEEP=60
+FAILED_FILE="$OUTPUT_DIR/failed_chunks.txt"
+: > "$FAILED_FILE"
+
+run_orchestrator() {
+    local start="$1"
+    local end="$2"
+    local chunk_file="$3"
+    shift 3
+    "$ORCHESTRATOR" \
+        --engine "$ENGINE" \
+        --engine-binary "$ENGINE_BINARY" \
+        --network mainnet \
+        --start-epoch "$start" \
+        --end-epoch "$end" \
+        --warmup-epochs "$WARMUP_EPOCHS" \
+        --parallel "$PARALLEL" \
+        --beacon-node-url "$BEACON_NODE_URL" \
+        --output "$chunk_file" \
+        --output-format both \
+        --attestation-source-mode "$ATT_MODE" \
+        --lookahead-cap "$LOOKAHEAD_CAP" \
+        --cache-dir "$CACHE_DIR" \
+        "$@"
+}
+
+echo "=== Prep pass: caching ERA + checkpoint states for all chunks ==="
+PREP_FAILED=0
+PREP_CURSOR=$START_EPOCH
+PREP_NUM=0
+while [[ $PREP_CURSOR -lt $END_EPOCH ]]; do
+    PREP_END=$((PREP_CURSOR + CHUNK_SIZE))
+    if [[ $PREP_END -gt $END_EPOCH ]]; then
+        PREP_END=$END_EPOCH
+    fi
+    PREP_NUM=$((PREP_NUM + 1))
+    PREP_CHUNK_FILE="$OUTPUT_DIR/chunk-${PREP_CURSOR}-${PREP_END}.csv"
+
+    if chunk_complete "$PREP_CHUNK_FILE" "$PREP_CURSOR" "$PREP_END"; then
+        echo "[prep $PREP_NUM/$TOTAL_CHUNKS] chunk $PREP_CURSOR..$PREP_END already complete, skipping prep"
+        PREP_CURSOR=$PREP_END
+        continue
+    fi
+
+    echo "[prep $PREP_NUM/$TOTAL_CHUNKS] caching $PREP_CURSOR..$PREP_END"
+    PREP_OK=false
+    for attempt in $(seq 1 "$CHUNK_RETRIES"); do
+        if run_orchestrator "$PREP_CURSOR" "$PREP_END" "$PREP_CHUNK_FILE" --prep-only; then
+            PREP_OK=true
+            break
+        fi
+        echo "[prep $PREP_NUM/$TOTAL_CHUNKS] attempt $attempt failed, sleeping ${RETRY_SLEEP}s before retry"
+        sleep "$RETRY_SLEEP"
+    done
+    if [[ "$PREP_OK" != true ]]; then
+        echo "[prep $PREP_NUM/$TOTAL_CHUNKS] PREP FAILED after $CHUNK_RETRIES attempts for $PREP_CURSOR..$PREP_END"
+        echo "prep:$PREP_CURSOR-$PREP_END" >> "$FAILED_FILE"
+        PREP_FAILED=$((PREP_FAILED + 1))
+    fi
+
+    PREP_CURSOR=$PREP_END
+done
+
+if [[ $PREP_FAILED -gt 0 ]]; then
+    echo ""
+    echo "=== Prep pass had $PREP_FAILED failed chunks; aborting before engine run ==="
+    echo "See $FAILED_FILE"
+    exit 1
+fi
+echo "=== Prep pass complete ==="
+echo ""
+
 CURSOR=$START_EPOCH
 COMPLETED=0
 FAILED=0
@@ -152,25 +225,31 @@ while [[ $CURSOR -lt $END_EPOCH ]]; do
 
     echo "[$CHUNK_NUM/$TOTAL_CHUNKS] running chunk $CURSOR..$CHUNK_END"
 
-    if "$ORCHESTRATOR" \
-        --engine "$ENGINE" \
-        --engine-binary "$ENGINE_BINARY" \
-        --network mainnet \
-        --start-epoch "$CURSOR" \
-        --end-epoch "$CHUNK_END" \
-        --warmup-epochs "$WARMUP_EPOCHS" \
-        --parallel "$PARALLEL" \
-        --beacon-node-url "$BEACON_NODE_URL" \
-        --output "$CHUNK_FILE" \
-        --output-format both \
-        --attestation-source-mode "$ATT_MODE" \
-        --lookahead-cap "$LOOKAHEAD_CAP" \
-        --cache-dir "$CACHE_DIR"; then
+    CHUNK_OK=false
+    for attempt in $(seq 1 "$CHUNK_RETRIES"); do
+        exit_code=0
+        run_orchestrator "$CURSOR" "$CHUNK_END" "$CHUNK_FILE" || exit_code=$?
+        if [[ $exit_code -eq 0 ]] && chunk_complete "$CHUNK_FILE" "$CURSOR" "$CHUNK_END"; then
+            CHUNK_OK=true
+            break
+        fi
+        if [[ $exit_code -eq 0 ]]; then
+            echo "[$CHUNK_NUM/$TOTAL_CHUNKS] attempt $attempt: orchestrator returned 0 but chunk output is invalid; retrying"
+        else
+            echo "[$CHUNK_NUM/$TOTAL_CHUNKS] attempt $attempt failed (exit $exit_code); retrying"
+        fi
+        if [[ $attempt -lt $CHUNK_RETRIES ]]; then
+            sleep "$RETRY_SLEEP"
+        fi
+    done
+
+    if [[ "$CHUNK_OK" == true ]]; then
         COMPLETED=$((COMPLETED + 1))
         echo "[$CHUNK_NUM/$TOTAL_CHUNKS] chunk complete"
     else
         FAILED=$((FAILED + 1))
-        echo "[$CHUNK_NUM/$TOTAL_CHUNKS] chunk FAILED (exit $?)"
+        echo "[$CHUNK_NUM/$TOTAL_CHUNKS] chunk FAILED after $CHUNK_RETRIES attempts"
+        echo "run:$CURSOR-$CHUNK_END" >> "$FAILED_FILE"
     fi
 
     merge_chunks
@@ -183,3 +262,8 @@ echo ""
 echo "=== Summary ==="
 echo "Completed: $COMPLETED / $TOTAL_CHUNKS chunks"
 echo "Failed:    $FAILED"
+if [[ $FAILED -gt 0 ]]; then
+    echo "Failed chunks recorded in $FAILED_FILE:"
+    cat "$FAILED_FILE"
+    exit 1
+fi

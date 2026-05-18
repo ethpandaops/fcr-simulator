@@ -64,6 +64,7 @@ type config struct {
 	LookaheadCap          uint64
 	HTTPListen            string
 	KeepCache             bool
+	PrepOnly              bool
 }
 
 type requiredUint64Flag struct {
@@ -136,6 +137,7 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 	fs.Uint64Var(&cfg.LookaheadCap, "lookahead-cap", defaultLookaheadCap, "attestation lookahead cap")
 	fs.StringVar(&cfg.HTTPListen, "http-listen", defaultHTTPListen, "local HTTP listen address")
 	fs.BoolVar(&cfg.KeepCache, "keep-cache", false, "keep intermediate cache after run")
+	fs.BoolVar(&cfg.PrepOnly, "prep-only", false, "download ERA files and checkpoint state then exit (no engine run)")
 	fs.BoolVar(&printVersion, "version", false, "print orchestrator version and exit")
 
 	if err := fs.Parse(args); err != nil {
@@ -300,6 +302,13 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 	fmt.Fprintln(stdout, "fetching genesis state")
 	if _, err := fetcher.FetchGenesisStateSSZ(); err != nil {
 		return 1, fmt.Errorf("fetch genesis state: %w", err)
+	}
+
+	if cfg.PrepOnly {
+		_ = eraReader
+		fmt.Fprintf(stdout, "prep complete: %d checkpoint state(s) cached for %d worker(s)\n",
+			len(checkpointStates), len(workerInfos))
+		return 0, nil
 	}
 
 	server, serverURL, shutdown, err := startBeaconAPIServer(cfg, eraReader, fetcher, checkpointBlocks)
