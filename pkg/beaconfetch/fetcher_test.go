@@ -170,14 +170,14 @@ func TestFetchCheckpointAtWarmupSlot_MissedSlotFallback(t *testing.T) {
 			headerCalls.Add(1)
 			slot := pathSlot(t, r.URL.Path)
 			require.Equal(t, acceptJSON, r.Header.Get("Accept"))
-			if slot == 97 {
+			if slot == 36 {
 				_, _ = fmt.Fprintf(w, `{"data":{"root":%q}}`, rootHex(root))
 				return
 			}
 			http.NotFound(w, r)
-		case r.URL.Path == "/eth/v2/debug/beacon/states/97":
+		case r.URL.Path == "/eth/v2/debug/beacon/states/36":
 			require.Equal(t, acceptSSZ, r.Header.Get("Accept"))
-			_, _ = w.Write([]byte("state-97"))
+			_, _ = w.Write([]byte("state-36"))
 		default:
 			http.NotFound(w, r)
 		}
@@ -185,9 +185,9 @@ func TestFetchCheckpointAtWarmupSlot_MissedSlotFallback(t *testing.T) {
 
 	actualSlot, stateSSZ, err := fetcher.FetchCheckpointAtWarmupSlot(100)
 	require.NoError(t, err)
-	require.Equal(t, uint64(97), actualSlot)
-	require.Equal(t, []byte("state-97"), stateSSZ)
-	require.EqualValues(t, 4, headerCalls.Load())
+	require.Equal(t, uint64(36), actualSlot)
+	require.Equal(t, []byte("state-36"), stateSSZ)
+	require.EqualValues(t, 3, headerCalls.Load())
 }
 
 func TestFetchCheckpointAtWarmupSlot_ExhaustedFallback(t *testing.T) {
@@ -206,7 +206,7 @@ func TestFetchCheckpointAtWarmupSlot_ExhaustedFallback(t *testing.T) {
 	require.Nil(t, stateSSZ)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrNotFound), "expected error to wrap ErrNotFound: %v", err)
-	require.EqualValues(t, 33, headerCalls.Load())
+	require.EqualValues(t, 4, headerCalls.Load())
 }
 
 func TestFetchCheckpointAtWarmupSlot_StateNotFoundAfterHeaderHit(t *testing.T) {

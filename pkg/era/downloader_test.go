@@ -101,8 +101,8 @@ func TestDownloaderRetriesFailedDownloads(t *testing.T) {
 
 	err = downloader.PreDownload(0, 0)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "failed to download ERA 1 after 3 attempts")
-	require.Equal(t, 3, attempts)
+	require.Contains(t, err.Error(), fmt.Sprintf("failed to download ERA 1 after %d attempts", defaultMaxRetries))
+	require.Equal(t, defaultMaxRetries, attempts)
 }
 
 func TestDownloaderInvalidRangeAndNilCacheDir(t *testing.T) {

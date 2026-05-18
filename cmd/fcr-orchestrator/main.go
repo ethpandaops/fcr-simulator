@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +47,28 @@ const (
 
 var version = "dev"
 
+type engineSpec struct {
+	RequiredBuildFlags []string
+}
+
+var supportedEngines = map[string]engineSpec{
+	"lighthouse": {RequiredBuildFlags: []string{"fake_crypto"}},
+	"teku":       {RequiredBuildFlags: []string{"fake_crypto"}},
+	"lodestar":   {RequiredBuildFlags: []string{"fake_crypto"}},
+	"nimbus":     {RequiredBuildFlags: []string{"fake_crypto"}},
+	"prysm":      {RequiredBuildFlags: []string{"fake_crypto"}},
+	"grandine":   {RequiredBuildFlags: []string{"fake_crypto"}},
+}
+
+func supportedEngineList() string {
+	names := make([]string, 0, len(supportedEngines))
+	for name := range supportedEngines {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
 type config struct {
 	Engine                string
 	EngineBinary          string
@@ -64,6 +87,7 @@ type config struct {
 	LookaheadCap          uint64
 	HTTPListen            string
 	KeepCache             bool
+	PrepOnly              bool
 }
 
 type requiredUint64Flag struct {
@@ -119,7 +143,7 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 
 	fs := flag.NewFlagSet("fcr-orchestrator", flag.ContinueOnError)
 	fs.SetOutput(output)
-	fs.StringVar(&cfg.Engine, "engine", "", "engine name (supported: lighthouse, lodestar)")
+	fs.StringVar(&cfg.Engine, "engine", "", "engine name (one of: "+supportedEngineList()+")")
 	fs.StringVar(&cfg.EngineBinary, "engine-binary", os.Getenv("FCR_ENGINE_BINARY"), "path to engine binary (env: FCR_ENGINE_BINARY)")
 	fs.StringVar(&cfg.Network, "network", "", "network name (V1 supports mainnet)")
 	fs.Var(&startEpoch, "start-epoch", "first epoch, inclusive")
@@ -136,6 +160,7 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 	fs.Uint64Var(&cfg.LookaheadCap, "lookahead-cap", defaultLookaheadCap, "attestation lookahead cap")
 	fs.StringVar(&cfg.HTTPListen, "http-listen", defaultHTTPListen, "local HTTP listen address")
 	fs.BoolVar(&cfg.KeepCache, "keep-cache", false, "keep intermediate cache after run")
+	fs.BoolVar(&cfg.PrepOnly, "prep-only", false, "download ERA files and checkpoint state then exit (no engine run)")
 	fs.BoolVar(&printVersion, "version", false, "print orchestrator version and exit")
 
 	if err := fs.Parse(args); err != nil {
@@ -181,8 +206,8 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 	if cfg.Engine == "" {
 		return fmt.Errorf("--engine is required")
 	}
-	if !isSupportedEngine(cfg.Engine) {
-		return fmt.Errorf("--engine=%q is not supported; supported values are %s", cfg.Engine, strings.Join(supportedEngines(), ", "))
+	if _, ok := supportedEngines[cfg.Engine]; !ok {
+		return fmt.Errorf("--engine=%q is not supported; supported values are %s", cfg.Engine, supportedEngineList())
 	}
 	if cfg.EngineBinary == "" {
 		return fmt.Errorf("--engine-binary is required")
@@ -253,15 +278,8 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	if engineManifest.EngineName != "" && engineManifest.EngineName != cfg.Engine {
-		return 1, fmt.Errorf("engine manifest name %q does not match --engine=%q", engineManifest.EngineName, cfg.Engine)
-	}
-	if engineManifest.EngineName == "" {
-		engineManifest.EngineName = cfg.Engine
-	}
-
-	if !engineHasBuildFlag(engineManifest, "fake_crypto") {
-		return 1, fmt.Errorf("engine %s was not built with fake_crypto; refusing to run", cfg.EngineBinary)
+	if err := validateEngineManifest(cfg.Engine, cfg.EngineBinary, engineManifest); err != nil {
+		return 1, err
 	}
 
 	chunks := chunk.Split(cfg.StartEpoch, cfg.EndEpoch, cfg.WarmupEpochs, cfg.Parallel)
@@ -300,6 +318,13 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 	fmt.Fprintln(stdout, "fetching genesis state")
 	if _, err := fetcher.FetchGenesisStateSSZ(); err != nil {
 		return 1, fmt.Errorf("fetch genesis state: %w", err)
+	}
+
+	if cfg.PrepOnly {
+		_ = eraReader
+		fmt.Fprintf(stdout, "prep complete: %d checkpoint state(s) cached for %d worker(s)\n",
+			len(checkpointStates), len(workerInfos))
+		return 0, nil
 	}
 
 	server, serverURL, shutdown, err := startBeaconAPIServer(cfg, eraReader, fetcher, checkpointBlocks)
@@ -367,19 +392,6 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 	return 0, nil
 }
 
-func supportedEngines() []string {
-	return []string{"lighthouse", "lodestar"}
-}
-
-func isSupportedEngine(name string) bool {
-	for _, e := range supportedEngines() {
-		if name == e {
-			return true
-		}
-	}
-	return false
-}
-
 func engineHasBuildFlag(m manifest.EngineManifest, flag string) bool {
 	for _, f := range m.BuildFlags {
 		if f == flag {
@@ -387,6 +399,21 @@ func engineHasBuildFlag(m manifest.EngineManifest, flag string) bool {
 		}
 	}
 	return false
+}
+
+func validateEngineManifest(engine, binary string, m manifest.EngineManifest) error {
+	if m.EngineName == "" {
+		return fmt.Errorf("engine manifest from %s did not report engine_name", binary)
+	}
+	if m.EngineName != engine {
+		return fmt.Errorf("engine manifest name %q does not match --engine=%q", m.EngineName, engine)
+	}
+	for _, flag := range supportedEngines[engine].RequiredBuildFlags {
+		if !engineHasBuildFlag(m, flag) {
+			return fmt.Errorf("engine %s is missing required build flag %q (got build_flags=%v)", binary, flag, m.BuildFlags)
+		}
+	}
+	return nil
 }
 
 func captureEngineManifest(ctx context.Context, engineBinary string) (manifest.EngineManifest, error) {

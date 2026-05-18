@@ -33,7 +33,7 @@ Required = engine MUST emit. Orchestrator-added = engine MUST NOT emit (orchestr
 | `head_root` | string | Required | no | Hex-prefixed root of fork-choice head after this slot's processing |
 | `confirmed_root` | string | Required | no | Hex-prefixed FCR-confirmed root, or `0x000...` if none |
 | `confirmed_slot` | uint64 | Required | no | Slot of the confirmed root, or 0 if none |
-| `confirmation_delay_slots` | uint64 | Required | no | `slot - confirmed_slot` (saturating sub) |
+| `confirmation_delay_slots` | uint64 | Required | no | `(slot + 1) - confirmed_slot` (saturating sub). The `+1` matches the slot the engine recomputed the head at; a same-slot confirmation therefore reports delay=1. Matches Lighthouse `engine.rs:346`. |
 | `fast_confirmed` | bool | Required | no | True iff `confirmed_root != 0x000...` AND `confirmed_slot == slot` |
 | `strict_one_slot_confirmed` | bool | Required | no | True iff strict 1-slot confirmation rule fired |
 | `finalized_epoch` | uint64 | Required | no | Engine's reported finalized epoch at this slot |
@@ -111,7 +111,7 @@ Path: alongside `results.csv`, named `results.manifest.json`.
 ## JSONL example record
 
 ```json
-{"schema_version":3,"engine_name":"lighthouse","engine_version":"5.x","engine_commit":"abc123","slot":13920100,"epoch":435003,"has_block":true,"block_root":"0xabc...","head_root":"0xabc...","confirmed_root":"0xabc...","confirmed_slot":13920100,"confirmation_delay_slots":0,"fast_confirmed":true,"strict_one_slot_confirmed":true,"finalized_epoch":435001,"justified_epoch":435002,"source_block_slot":13920101,"num_attestations_injected":128,"is_epoch_boundary":false,"is_missed_slot":false,"fcr_eval_duration_us":42,"attestation_source_mode":"next-non-missed","lookahead_cap":4}
+{"schema_version":3,"engine_name":"lighthouse","engine_version":"5.x","engine_commit":"abc123","slot":13920100,"epoch":435003,"has_block":true,"block_root":"0xabc...","head_root":"0xabc...","confirmed_root":"0xabc...","confirmed_slot":13920100,"confirmation_delay_slots":1,"fast_confirmed":true,"strict_one_slot_confirmed":true,"finalized_epoch":435001,"justified_epoch":435002,"source_block_slot":13920101,"num_attestations_injected":128,"is_epoch_boundary":false,"is_missed_slot":false,"fcr_eval_duration_us":42,"attestation_source_mode":"next-non-missed","lookahead_cap":4}
 ```
 
 ## Missing field policy
