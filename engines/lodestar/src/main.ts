@@ -573,7 +573,7 @@ function initializeForkChoiceFromAnchor(args: {
     protoArray,
     bootstrapStateView.validatorCount,
     null,
-    {fastConfirmation: true, proposerBoost: false, proposerBoostReorg: false},
+    {fastConfirmation: true, proposerBoost: false, proposerBoostReorg: false, computeUnrealized: true},
     undefined,
   );
 
