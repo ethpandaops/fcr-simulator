@@ -1,0 +1,1232 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index c42957d..7fbcd17 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5719,6 +5719,35 @@ dependencies = [
+  "bytes",
+ ]
+ 
++[[package]]
++name = "fcr-grandine"
++version = "0.1.0"
++dependencies = [
++ "anyhow",
++ "bls",
++ "bytesize",
++ "clap",
++ "crossbeam-utils",
++ "database",
++ "execution_engine",
++ "fork_choice_control",
++ "fork_choice_store",
++ "futures",
++ "helper_functions",
++ "hex",
++ "kzg_utils",
++ "pubkey_cache",
++ "reqwest 0.13.2",
++ "serde",
++ "serde_json",
++ "ssz",
++ "tempfile",
++ "tokio",
++ "tracing",
++ "tracing-subscriber 0.3.23",
++ "types",
++]
++
+ [[package]]
+ name = "features"
+ version = "0.0.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 3f3f61a..623d22d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -2,6 +2,7 @@
+ members = [
+     'ad_hoc_bench',
+     'allocator',
++    'fcr-simulator',
+     'arithmetic',
+     'attestation_verifier',
+     'benches',
+diff --git a/fcr-simulator/Cargo.toml b/fcr-simulator/Cargo.toml
+new file mode 100644
+index 0000000..559e870
+--- /dev/null
++++ b/fcr-simulator/Cargo.toml
+@@ -0,0 +1,40 @@
++[package]
++name = "fcr-grandine"
++version = "0.1.0"
++edition = { workspace = true }
++authors = ["ethpandaops"]
++
++[lints]
++workspace = true
++
++[[bin]]
++name = "fcr-grandine"
++path = "src/main.rs"
++
++[features]
++default = ["bls/blst", "kzg_utils/blst"]
++
++[dependencies]
++anyhow = { workspace = true }
++bls = { workspace = true }
++bytesize = { workspace = true }
++clap = { workspace = true }
++crossbeam-utils = { workspace = true }
++database = { workspace = true }
++execution_engine = { workspace = true }
++fork_choice_control = { workspace = true }
++fork_choice_store = { workspace = true }
++futures = { workspace = true }
++helper_functions = { workspace = true }
++hex = { workspace = true }
++kzg_utils = { workspace = true }
++pubkey_cache = { workspace = true }
++reqwest = { workspace = true }
++serde = { workspace = true }
++serde_json = { workspace = true }
++ssz = { workspace = true }
++tempfile = { workspace = true }
++tokio = { workspace = true }
++tracing = { workspace = true }
++tracing-subscriber = { workspace = true }
++types = { workspace = true }
+diff --git a/fcr-simulator/src/config.rs b/fcr-simulator/src/config.rs
+new file mode 100644
+index 0000000..cf1d871
+--- /dev/null
++++ b/fcr-simulator/src/config.rs
+@@ -0,0 +1,128 @@
++use std::path::{Path, PathBuf};
++
++use anyhow::{Result, bail};
++use clap::{Parser, ValueEnum};
++
++#[derive(Parser, Debug, Clone)]
++#[command(name = "fcr-grandine")]
++#[command(about = "Grandine FCR simulation engine")]
++pub struct Config {
++    #[arg(long)]
++    pub beacon_node_url: Option<String>,
++
++    #[arg(long)]
++    pub start_slot: Option<u64>,
++
++    #[arg(long)]
++    pub end_slot: Option<u64>,
++
++    #[arg(long)]
++    pub warmup_start_slot: Option<u64>,
++
++    #[arg(long, value_enum)]
++    pub network: Option<Network>,
++
++    #[arg(long, default_value_t = 25)]
++    pub byzantine_threshold: u64,
++
++    #[arg(long, value_enum)]
++    pub attestation_source_mode: Option<AttestationSourceMode>,
++
++    #[arg(long)]
++    pub lookahead_cap: Option<u64>,
++
++    #[arg(long)]
++    pub output: Option<PathBuf>,
++
++    #[arg(long)]
++    pub manifest_json: bool,
++}
++
++impl Config {
++    pub fn validate(&self) -> Result<()> {
++        if self.manifest_json {
++            return Ok(());
++        }
++
++        let start_slot = self.required_u64(self.start_slot, "--start-slot")?;
++        let end_slot = self.required_u64(self.end_slot, "--end-slot")?;
++        let warmup_start_slot = self.required_u64(self.warmup_start_slot, "--warmup-start-slot")?;
++
++        self.required_str(self.beacon_node_url.as_deref(), "--beacon-node-url")?;
++        self.required(self.network, "--network")?;
++        self.required(self.attestation_source_mode, "--attestation-source-mode")?;
++        self.required_u64(self.lookahead_cap, "--lookahead-cap")?;
++        self.required_path(self.output.as_deref(), "--output")?;
++
++        if warmup_start_slot > start_slot {
++            bail!("--warmup-start-slot must be <= --start-slot");
++        }
++
++        if start_slot >= end_slot {
++            bail!("--start-slot must be < --end-slot");
++        }
++
++        Ok(())
++    }
++
++    pub fn beacon_node_url(&self) -> &str {
++        self.beacon_node_url
++            .as_deref()
++            .expect("validated config should include --beacon-node-url")
++    }
++
++    pub fn start_slot(&self) -> u64 {
++        self.start_slot
++            .expect("validated config should include --start-slot")
++    }
++
++    pub fn end_slot(&self) -> u64 {
++        self.end_slot
++            .expect("validated config should include --end-slot")
++    }
++
++    pub fn warmup_start_slot(&self) -> u64 {
++        self.warmup_start_slot
++            .expect("validated config should include --warmup-start-slot")
++    }
++
++    pub fn network(&self) -> Network {
++        self.network
++            .expect("validated config should include --network")
++    }
++
++    pub fn output(&self) -> &Path {
++        self.output
++            .as_deref()
++            .expect("validated config should include --output")
++    }
++
++    fn required_str<'a>(&self, value: Option<&'a str>, flag: &str) -> Result<&'a str> {
++        value.ok_or_else(|| anyhow::anyhow!("missing required flag {flag}"))
++    }
++
++    fn required_path<'a>(&self, value: Option<&'a Path>, flag: &str) -> Result<&'a Path> {
++        value.ok_or_else(|| anyhow::anyhow!("missing required flag {flag}"))
++    }
++
++    fn required<T: Copy>(&self, value: Option<T>, flag: &str) -> Result<T> {
++        value.ok_or_else(|| anyhow::anyhow!("missing required flag {flag}"))
++    }
++
++    fn required_u64(&self, value: Option<u64>, flag: &str) -> Result<u64> {
++        value.ok_or_else(|| anyhow::anyhow!("missing required flag {flag}"))
++    }
++}
++
++#[derive(Debug, Clone, Copy, ValueEnum)]
++pub enum Network {
++    Mainnet,
++}
++
++#[derive(Debug, Clone, Copy, ValueEnum)]
++pub enum AttestationSourceMode {
++    #[value(name = "next-non-missed")]
++    NextNonMissed,
++    #[value(name = "strict-source-block-k-minus-1")]
++    StrictSourceBlockKMinus1,
++}
+diff --git a/fcr-simulator/src/http/fetcher.rs b/fcr-simulator/src/http/fetcher.rs
+new file mode 100644
+index 0000000..ca7790d
+--- /dev/null
++++ b/fcr-simulator/src/http/fetcher.rs
+@@ -0,0 +1,110 @@
++use std::sync::Arc;
++
++use anyhow::{Context, Result, bail};
++use ssz::SszRead;
++use types::{
++    combined::{BeaconState, SignedBeaconBlock},
++    config::Config as ChainConfig,
++    phase0::primitives::{H256, Slot},
++    preset::Preset,
++};
++
++use crate::http::{base_url, build_client};
++
++#[derive(Clone)]
++pub struct BeaconFetcher {
++    base_url: String,
++    client: reqwest::Client,
++    config: Arc<ChainConfig>,
++}
++
++impl BeaconFetcher {
++    pub fn new(beacon_node_url: &str, config: Arc<ChainConfig>) -> Result<Self> {
++        Ok(Self {
++            base_url: base_url(beacon_node_url),
++            client: build_client()?,
++            config,
++        })
++    }
++
++    pub async fn fetch_state_at_slot<P: Preset>(&self, slot: Slot) -> Result<BeaconState<P>> {
++        let url = format!("{}/eth/v2/debug/beacon/states/{}", self.base_url, slot);
++        let data = self.fetch_ssz(&url).await?;
++        BeaconState::<P>::from_ssz(&self.config, &data)
++            .map_err(|e| anyhow::anyhow!("failed to decode state SSZ at slot {}: {:?}", slot, e))
++    }
++
++    pub async fn fetch_block_by_root<P: Preset>(
++        &self,
++        root: H256,
++    ) -> Result<SignedBeaconBlock<P>> {
++        let url = format!("{}/eth/v2/beacon/blocks/0x{}", self.base_url, hex::encode(root));
++        let data = self.fetch_ssz(&url).await?;
++        SignedBeaconBlock::<P>::from_ssz(&self.config, &data).map_err(|e| {
++            anyhow::anyhow!("failed to decode block SSZ for root 0x{}: {:?}", hex::encode(root), e)
++        })
++    }
++
++    pub async fn fetch_block_at_slot<P: Preset>(
++        &self,
++        slot: Slot,
++    ) -> Result<Option<SignedBeaconBlock<P>>> {
++        let url = format!("{}/eth/v2/beacon/blocks/{}", self.base_url, slot);
++        let response = self
++            .client
++            .get(&url)
++            .header("Accept", "application/octet-stream")
++            .send()
++            .await
++            .with_context(|| format!("failed to fetch {}", url))?;
++
++        if response.status() == reqwest::StatusCode::NOT_FOUND {
++            return Ok(None);
++        }
++
++        let data = read_success_body(response, &url).await?;
++        let block = SignedBeaconBlock::<P>::from_ssz(&self.config, &data)
++            .map_err(|e| anyhow::anyhow!("failed to decode block SSZ at slot {}: {:?}", slot, e))?;
++
++        Ok(Some(block))
++    }
++
++    async fn fetch_ssz(&self, url: &str) -> Result<Vec<u8>> {
++        let response = self
++            .client
++            .get(url)
++            .header("Accept", "application/octet-stream")
++            .send()
++            .await
++            .with_context(|| format!("failed to fetch {}", url))?;
++        read_success_body(response, url).await
++    }
++}
++
++async fn read_success_body(response: reqwest::Response, url: &str) -> Result<Vec<u8>> {
++    let status = response.status();
++    if !status.is_success() {
++        let body = response.text().await.unwrap_or_default();
++        bail!("HTTP {} from {}: {}", status, url, trim_body(&body));
++    }
++    Ok(response
++        .bytes()
++        .await
++        .context("failed to read body")?
++        .to_vec())
++}
++
++fn trim_body(body: &str) -> &str {
++    const MAX_LEN: usize = 512;
++    if body.len() <= MAX_LEN {
++        body
++    } else {
++        let end = body
++            .char_indices()
++            .map(|(idx, _)| idx)
++            .take_while(|idx| *idx <= MAX_LEN)
++            .last()
++            .unwrap_or(0);
++        &body[..end]
++    }
++}
+diff --git a/fcr-simulator/src/http/mod.rs b/fcr-simulator/src/http/mod.rs
+new file mode 100644
+index 0000000..7a2c77b
+--- /dev/null
++++ b/fcr-simulator/src/http/mod.rs
+@@ -0,0 +1,18 @@
++pub mod fetcher;
++pub mod plan;
++
++pub use fetcher::BeaconFetcher;
++pub use plan::{AttestationPlan, fetch_attestation_plan};
++
++use anyhow::{Context, Result};
++
++pub fn build_client() -> Result<reqwest::Client> {
++    reqwest::Client::builder()
++        .timeout(std::time::Duration::from_secs(600))
++        .build()
++        .context("failed to build HTTP client")
++}
++
++pub fn base_url(base_url: &str) -> String {
++    base_url.trim_end_matches('/').to_string()
++}
+diff --git a/fcr-simulator/src/http/plan.rs b/fcr-simulator/src/http/plan.rs
+new file mode 100644
+index 0000000..d1b50d2
+--- /dev/null
++++ b/fcr-simulator/src/http/plan.rs
+@@ -0,0 +1,69 @@
++use std::collections::HashMap;
++
++use anyhow::{Context, Result, bail};
++use serde::Deserialize;
++use types::phase0::primitives::Slot;
++
++use crate::http::{base_url, build_client};
++
++pub type AttestationPlan = HashMap<Slot, Option<Slot>>;
++
++#[derive(Deserialize)]
++struct PlanResponse {
++    entries: Vec<PlanEntry>,
++}
++
++#[derive(Deserialize)]
++struct PlanEntry {
++    sim_slot: u64,
++    source_block_slot: Option<u64>,
++}
++
++pub async fn fetch_attestation_plan(
++    beacon_node_url: &str,
++    from: Slot,
++    to: Slot,
++) -> Result<AttestationPlan> {
++    let client = build_client()?;
++    let base_url = base_url(beacon_node_url);
++    let url = format!("{}/fcr-sim/v1/plan?from={}&to={}", base_url, from, to);
++
++    let response = client
++        .get(&url)
++        .header("Accept", "application/json")
++        .send()
++        .await
++        .with_context(|| format!("failed to fetch {}", url))?;
++
++    let status = response.status();
++    if !status.is_success() {
++        let body = response.text().await.unwrap_or_default();
++        bail!("HTTP {} from {}: {}", status, url, trim_body(&body));
++    }
++
++    let plan_response = response
++        .json::<PlanResponse>()
++        .await
++        .context("failed to decode attestation plan JSON")?;
++
++    Ok(plan_response
++        .entries
++        .into_iter()
++        .map(|entry| (entry.sim_slot, entry.source_block_slot))
++        .collect())
++}
++
++fn trim_body(body: &str) -> &str {
++    const MAX_LEN: usize = 512;
++    if body.len() <= MAX_LEN {
++        body
++    } else {
++        let end = body
++            .char_indices()
++            .map(|(idx, _)| idx)
++            .take_while(|idx| *idx <= MAX_LEN)
++            .last()
++            .unwrap_or(0);
++        &body[..end]
++    }
++}
+diff --git a/fcr-simulator/src/main.rs b/fcr-simulator/src/main.rs
+new file mode 100644
+index 0000000..4a8673b
+--- /dev/null
++++ b/fcr-simulator/src/main.rs
+@@ -0,0 +1,120 @@
++use bls as _;
++use kzg_utils as _;
++
++mod config;
++mod http;
++mod output;
++mod sim;
++
++use std::process::ExitCode;
++
++use anyhow::Result;
++use clap::{Parser, error::ErrorKind};
++use config::Config;
++use serde::Serialize;
++
++fn main() -> ExitCode {
++    init_tracing();
++
++    let config = match Config::try_parse() {
++        Ok(config) => config,
++        Err(err) => {
++            let code = if matches!(
++                err.kind(),
++                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
++            ) {
++                0
++            } else {
++                1
++            };
++            let _ = err.print();
++            return ExitCode::from(code);
++        }
++    };
++
++    if let Err(err) = config.validate() {
++        eprintln!("configuration error: {err:#}");
++        return ExitCode::from(1);
++    }
++
++    if config.manifest_json {
++        if let Err(err) = print_manifest() {
++            eprintln!("manifest error: {err:#}");
++            return ExitCode::from(1);
++        }
++        return ExitCode::SUCCESS;
++    }
++
++    let runtime = match tokio::runtime::Builder::new_multi_thread()
++        .enable_all()
++        .build()
++    {
++        Ok(rt) => rt,
++        Err(err) => {
++            eprintln!("failed to build tokio runtime: {err:#}");
++            return ExitCode::from(1);
++        }
++    };
++
++    runtime.block_on(async_main(config))
++}
++
++async fn async_main(config: Config) -> ExitCode {
++    let mut engine = match sim::Engine::new(&config).await {
++        Ok(engine) => engine,
++        Err(err) => {
++            eprintln!("bootstrap failure: {err:#}");
++            return ExitCode::from(2);
++        }
++    };
++
++    if let Err(err) = engine.run().await {
++        eprintln!("simulation failure: {err:#}");
++        return ExitCode::from(3);
++    }
++
++    ExitCode::SUCCESS
++}
++
++fn init_tracing() {
++    tracing_subscriber::fmt()
++        .with_writer(std::io::stderr)
++        .with_env_filter(
++            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
++                tracing_subscriber::EnvFilter::new(
++                    "info,fork_choice_control=warn,fork_choice_store=warn,transition_functions=warn,state_cache=warn",
++                )
++            }),
++        )
++        .init();
++}
++
++#[derive(Serialize)]
++struct EngineManifest {
++    engine_name: &'static str,
++    engine_version: &'static str,
++    engine_commit: &'static str,
++    build_flags: Vec<&'static str>,
++    fcr_spec_commit: &'static str,
++}
++
++fn print_manifest() -> Result<()> {
++    let manifest = EngineManifest {
++        engine_name: "grandine",
++        engine_version: env!("CARGO_PKG_VERSION"),
++        engine_commit: option_env!("GRANDINE_GIT_SHA").unwrap_or(""),
++        build_flags: build_flags(),
++        fcr_spec_commit: "",
++    };
++
++    println!("{}", serde_json::to_string_pretty(&manifest)?);
++    Ok(())
++}
++
++fn build_flags() -> Vec<&'static str> {
++    vec![
++        "fake_crypto",
++        "notify_execution_layer_off",
++        "data_availability_check_off",
++    ]
++}
+diff --git a/fcr-simulator/src/output/mod.rs b/fcr-simulator/src/output/mod.rs
+new file mode 100644
+index 0000000..9d58a02
+--- /dev/null
++++ b/fcr-simulator/src/output/mod.rs
+@@ -0,0 +1,5 @@
++mod schema;
++mod writer;
++
++pub use schema::SlotResult;
++pub use writer::OutputWriter;
+diff --git a/fcr-simulator/src/output/schema.rs b/fcr-simulator/src/output/schema.rs
+new file mode 100644
+index 0000000..eb71f64
+--- /dev/null
++++ b/fcr-simulator/src/output/schema.rs
+@@ -0,0 +1,22 @@
++use serde::Serialize;
++
++#[derive(Debug, Serialize)]
++pub struct SlotResult {
++    pub slot: u64,
++    pub epoch: u64,
++    pub has_block: bool,
++    pub block_root: Option<String>,
++    pub head_root: String,
++    pub confirmed_root: String,
++    pub confirmed_slot: u64,
++    pub confirmation_delay_slots: u64,
++    pub fast_confirmed: bool,
++    pub strict_one_slot_confirmed: bool,
++    pub finalized_epoch: u64,
++    pub justified_epoch: u64,
++    pub source_block_slot: Option<u64>,
++    pub num_attestations_injected: u64,
++    pub is_epoch_boundary: bool,
++    pub is_missed_slot: bool,
++    pub fcr_eval_duration_us: u64,
++}
+diff --git a/fcr-simulator/src/output/writer.rs b/fcr-simulator/src/output/writer.rs
+new file mode 100644
+index 0000000..3b915f8
+--- /dev/null
++++ b/fcr-simulator/src/output/writer.rs
+@@ -0,0 +1,41 @@
++use std::fs::File;
++use std::io::{BufWriter, Write};
++use std::path::Path;
++
++use anyhow::{Context, Result};
++
++use crate::output::SlotResult;
++
++pub struct OutputWriter {
++    writer: BufWriter<File>,
++}
++
++impl OutputWriter {
++    pub fn new(path: &Path) -> Result<Self> {
++        let file = File::create(path)
++            .with_context(|| format!("failed to create output file: {}", path.display()))?;
++
++        Ok(Self {
++            writer: BufWriter::new(file),
++        })
++    }
++
++    pub fn write(&mut self, result: &SlotResult) -> Result<()> {
++        serde_json::to_writer(&mut self.writer, result).context("failed to write JSONL record")?;
++        self.writer
++            .write_all(b"\n")
++            .context("failed to write JSONL newline")?;
++        Ok(())
++    }
++
++    pub fn flush_if_needed(&mut self, records_written: u64) -> Result<()> {
++        if records_written % 100 == 0 {
++            self.flush()?;
++        }
++        Ok(())
++    }
++
++    pub fn flush(&mut self) -> Result<()> {
++        self.writer.flush().context("failed to flush JSONL writer")
++    }
++}
+diff --git a/fcr-simulator/src/sim/engine.rs b/fcr-simulator/src/sim/engine.rs
+new file mode 100644
+index 0000000..bc082f0
+--- /dev/null
++++ b/fcr-simulator/src/sim/engine.rs
+@@ -0,0 +1,486 @@
++use std::collections::HashMap;
++use std::sync::Arc;
++use std::time::Instant;
++
++use anyhow::{Context, Result, bail};
++use crossbeam_utils::sync::WaitGroup;
++use database::Database;
++use execution_engine::{PayloadStatusV1, PayloadValidationStatus};
++use fork_choice_control::{AdHocBenchController, MutatorHandle};
++use fork_choice_store::StoreConfig;
++use helper_functions::{accessors, misc};
++use pubkey_cache::PubkeyCache;
++use tracing::{info, warn};
++use types::{
++    combined::{BeaconState, SignedBeaconBlock},
++    config::Config as ChainConfig,
++    phase0::primitives::{H256, Slot},
++    preset::{Mainnet, Preset},
++    traits::{BeaconState as _, SignedBeaconBlock as _},
++};
++
++use crate::config::{Config, Network};
++use crate::http::{AttestationPlan, BeaconFetcher, fetch_attestation_plan};
++use crate::output::{OutputWriter, SlotResult};
++
++type P = Mainnet;
++
++pub struct Engine {
++    controller: Arc<AdHocBenchController<P>>,
++    _mutator_handle: MutatorHandle<P, WaitGroup>,
++    fetcher: BeaconFetcher,
++    block_cache: HashMap<Slot, Option<Arc<SignedBeaconBlock<P>>>>,
++    plan: AttestationPlan,
++    output: OutputWriter,
++    config: EngineConfig,
++    _db_dir: tempfile::TempDir,
++}
++
++struct EngineConfig {
++    start_slot: Slot,
++    end_slot: Slot,
++    warmup_start_slot: Slot,
++}
++
++impl Engine {
++    pub async fn new(config: &Config) -> Result<Self> {
++        let chain_config = Arc::new(match config.network() {
++            Network::Mainnet => {
++                let mut c = ChainConfig::mainnet();
++                c.confirmation_byzantine_threshold = config.byzantine_threshold;
++                c
++            }
++        });
++
++        let start_slot = config.start_slot();
++        let end_slot = config.end_slot();
++        let warmup_start_slot = config.warmup_start_slot();
++
++        info!(
++            warmup_start_slot,
++            start_slot, end_slot, "Initializing Grandine FCR engine"
++        );
++
++        let fetcher = BeaconFetcher::new(config.beacon_node_url(), chain_config.clone())
++            .context("failed to create HTTP fetcher")?;
++
++        let warmup_state = fetcher.fetch_state_at_slot::<P>(warmup_start_slot).await?;
++        let finalized_cp = warmup_state.finalized_checkpoint();
++        info!(
++            finalized_epoch = %finalized_cp.epoch,
++            finalized_root = %format_root(finalized_cp.root),
++            "Read real finalized checkpoint from warmup state"
++        );
++
++        let expected_block_slot = misc::compute_start_slot_at_epoch::<P>(finalized_cp.epoch);
++        let scan_end_slot =
++            misc::compute_start_slot_at_epoch::<P>(finalized_cp.epoch.saturating_sub(1));
++        info!(
++            expected_block_slot,
++            scan_end_slot, "Scanning backward for finalized block"
++        );
++
++        let mut finalized_block_slot = None;
++        for slot in (scan_end_slot..=expected_block_slot).rev() {
++            let Some(block) = fetcher
++                .fetch_block_at_slot::<P>(slot)
++                .await
++                .with_context(|| {
++                    format!("failed to fetch finalized candidate block at slot {}", slot)
++                })?
++            else {
++                continue;
++            };
++
++            let block_root = block.message().hash_tree_root();
++            if block_root == finalized_cp.root {
++                finalized_block_slot = Some(slot);
++                break;
++            }
++        }
++
++        let Some(finalized_block_slot) = finalized_block_slot else {
++            bail!(
++                "finalized checkpoint block root {} was not found by scanning slots {} down to {}; orchestrator data may not include finalized_epoch {}",
++                format_root(finalized_cp.root),
++                expected_block_slot,
++                scan_end_slot,
++                finalized_cp.epoch,
++            );
++        };
++
++        info!(
++            finalized_block_slot = %finalized_block_slot,
++            "Fetched finalized block"
++        );
++
++        let (anchor_slot, anchor_state, anchor_block) =
++            find_epoch_aligned_anchor::<P>(&fetcher, finalized_block_slot)
++                .await
++                .context("failed to find epoch-aligned anchor")?;
++
++        info!(
++            anchor_slot,
++            warmup_start_slot,
++            catchup_slots = warmup_start_slot - anchor_slot,
++            "Selected epoch-aligned anchor",
++        );
++
++        let db_dir = tempfile::Builder::new()
++            .prefix("fcr-grandine-")
++            .rand_bytes(10)
++            .tempdir()
++            .context("failed to create temp DB dir")?;
++
++        let database = Database::in_memory();
++
++        let store_config = StoreConfig {
++            fast_confirmation_rule: true,
++            ..StoreConfig::default()
++        };
++
++        let pubkey_cache = Arc::new(PubkeyCache::default());
++        let anchor_block_arc = Arc::new(anchor_block);
++        let anchor_state_arc = Arc::new(anchor_state);
++
++        let (controller, mutator_handle) = AdHocBenchController::with_p2p_tx(
++            chain_config.clone(),
++            pubkey_cache,
++            store_config,
++            anchor_block_arc,
++            anchor_state_arc,
++            database,
++            futures::sink::drain(),
++        );
++
++        info!(
++            from = anchor_slot + 1,
++            to = warmup_start_slot,
++            "Catching up anchor to warmup_start_slot"
++        );
++        let mut catchup_blocks = 0u64;
++        for slot in (anchor_slot + 1)..=warmup_start_slot {
++            if misc::is_epoch_start::<P>(slot) {
++                info!(
++                    slot,
++                    epoch = misc::compute_epoch_at_slot::<P>(slot),
++                    "Warmup catchup crossed epoch boundary"
++                );
++            }
++
++            controller.on_slot(slot);
++            controller.wait_for_tasks();
++
++            if let Some(block) = fetcher
++                .fetch_block_at_slot::<P>(slot)
++                .await
++                .with_context(|| format!("failed to fetch catchup block at slot {}", slot))?
++            {
++                let block = Arc::new(block);
++                controller.on_replay_block(block.clone());
++                controller.wait_for_tasks();
++                promote_imported_payload_to_valid(&controller, block.as_ref());
++                catchup_blocks += 1;
++            }
++        }
++        info!(catchup_blocks, "Catchup complete");
++
++        let plan =
++            fetch_attestation_plan(config.beacon_node_url(), warmup_start_slot + 1, end_slot)
++                .await
++                .context("failed to fetch attestation plan")?;
++        info!(plan_entries = plan.len(), "Attestation plan fetched");
++
++        for slot in (warmup_start_slot + 1)..end_slot {
++            if !plan.contains_key(&slot) {
++                bail!(
++                    "attestation plan is missing sim_slot {}; orchestrator served an incomplete plan",
++                    slot
++                );
++            }
++        }
++
++        let output =
++            OutputWriter::new(config.output()).context("failed to create JSONL output writer")?;
++
++        Ok(Self {
++            controller,
++            _mutator_handle: mutator_handle,
++            fetcher,
++            block_cache: HashMap::new(),
++            plan,
++            output,
++            config: EngineConfig {
++                start_slot,
++                end_slot,
++                warmup_start_slot,
++            },
++            _db_dir: db_dir,
++        })
++    }
++
++    pub async fn run(&mut self) -> Result<()> {
++        let mut slot = self.config.warmup_start_slot + 1;
++        let mut total_recorded = 0u64;
++        let run_start = Instant::now();
++
++        info!(
++            start_slot = slot,
++            end_slot = self.config.end_slot,
++            recording_from = self.config.start_slot,
++            "Entering simulation loop"
++        );
++
++        while slot < self.config.end_slot {
++            let is_recording = slot >= self.config.start_slot;
++            let slot_start = Instant::now();
++
++            self.controller.on_slot(slot);
++            self.controller.wait_for_tasks();
++
++            let block_at_slot = self.get_block_at_slot(slot).await?;
++            let has_block = block_at_slot.is_some();
++            let block_root = block_at_slot
++                .as_ref()
++                .map(|block| block.message().hash_tree_root());
++
++            if let Some(ref block) = block_at_slot {
++                self.controller.on_replay_block(block.clone());
++                self.controller.wait_for_tasks();
++                promote_imported_payload_to_valid(&self.controller, block.as_ref());
++            }
++
++            let source_slot = self.plan.get(&slot).copied().flatten();
++            let mut num_attestations_injected = 0u64;
++            if let Some(source_block_slot) = source_slot {
++                num_attestations_injected = self
++                    .inject_attestations_from_source(source_block_slot)
++                    .await?;
++            }
++
++            let fcr_eval_start = Instant::now();
++            self.controller.on_slot(slot + 1);
++            self.controller.wait_for_tasks();
++            let fcr_eval_duration_us = micros_since(fcr_eval_start);
++
++            info!(
++                slot,
++                is_recording,
++                has_block,
++                num_attestations_injected,
++                fcr_eval_ms = fcr_eval_duration_us / 1000,
++                slot_ms = slot_start.elapsed().as_millis() as u64,
++                "slot done"
++            );
++
++            if is_recording {
++                let result = self.build_slot_result(
++                    slot,
++                    has_block,
++                    block_root,
++                    source_slot,
++                    num_attestations_injected,
++                    fcr_eval_duration_us,
++                );
++                total_recorded += 1;
++                self.output.write(&result)?;
++                self.output.flush_if_needed(total_recorded)?;
++            }
++
++            slot += 1;
++        }
++
++        self.output.flush()?;
++
++        info!(
++            total_slots = total_recorded,
++            duration_secs = format!("{:.1}", run_start.elapsed().as_secs_f64()),
++            "Simulation complete"
++        );
++
++        Ok(())
++    }
++
++    async fn get_block_at_slot(&mut self, slot: Slot) -> Result<Option<Arc<SignedBeaconBlock<P>>>> {
++        if let Some(cached) = self.block_cache.get(&slot) {
++            return Ok(cached.clone());
++        }
++        let block = self
++            .fetcher
++            .fetch_block_at_slot::<P>(slot)
++            .await?
++            .map(Arc::new);
++        self.block_cache.insert(slot, block.clone());
++        Ok(block)
++    }
++
++    /// Replays attestations from the source block at `source_slot` using
++    /// `AttestationOrigin::Block(block_root)`. The source block need not be in the store —
++    /// `validate_attestation` only requires the attestation's target/beacon_block_root to be
++    /// present in fork-choice, not the source block itself.
++    async fn inject_attestations_from_source(&mut self, source_slot: Slot) -> Result<u64> {
++        let Some(source_block) = self.get_block_at_slot(source_slot).await? else {
++            bail!(
++                "attestation plan referenced missing source block at slot {}",
++                source_slot
++            );
++        };
++        let attestation_count = source_block
++            .message()
++            .body()
++            .combined_attestations()
++            .count();
++        if attestation_count == 0 {
++            return Ok(0);
++        }
++
++        let block_root = source_block.message().hash_tree_root();
++        self.controller
++            .on_replay_block_attestations(block_root, source_block);
++        self.controller.wait_for_tasks();
++
++        // BlockAttestationsTask doesn't return per-attestation success counts to user space.
++        // Report the count of attestations in the source block as injected; failures are
++        // logged via mutator's warning path.
++        Ok(attestation_count as u64)
++    }
++
++    fn build_slot_result(
++        &self,
++        slot: Slot,
++        has_block: bool,
++        block_root: Option<H256>,
++        source_block_slot: Option<Slot>,
++        num_attestations_injected: u64,
++        fcr_eval_duration_us: u64,
++    ) -> SlotResult {
++        let head = self.controller.head().value;
++        let head_root = head.block_root;
++
++        let justified_epoch = self.controller.justified_checkpoint().epoch;
++        let finalized_epoch = self.controller.finalized_epoch();
++
++        let (confirmed_root, confirmed_slot) = match self.controller.confirmed_root() {
++            Some(root) if root != H256::zero() => {
++                let slot = self
++                    .controller
++                    .block_by_root(root)
++                    .ok()
++                    .flatten()
++                    .map(|with_status| with_status.value.message().slot())
++                    .unwrap_or(0);
++                (root, slot)
++            }
++            _ => (H256::zero(), 0),
++        };
++
++        let fast_confirmed = confirmed_root != H256::zero() && confirmed_slot == slot;
++        let eval_slot = slot.saturating_add(1);
++        let delay = eval_slot.saturating_sub(confirmed_slot);
++        let strict_one_slot_confirmed = has_block
++            && confirmed_root != H256::zero()
++            && block_root == Some(confirmed_root)
++            && confirmed_slot == slot
++            && delay == 1;
++
++        SlotResult {
++            slot,
++            epoch: misc::compute_epoch_at_slot::<P>(slot),
++            has_block,
++            block_root: block_root.map(format_root),
++            head_root: format_root(head_root),
++            confirmed_root: format_root(confirmed_root),
++            confirmed_slot,
++            confirmation_delay_slots: delay,
++            fast_confirmed,
++            strict_one_slot_confirmed,
++            finalized_epoch,
++            justified_epoch,
++            source_block_slot,
++            num_attestations_injected,
++            is_epoch_boundary: misc::is_epoch_start::<P>(slot),
++            is_missed_slot: !has_block,
++            fcr_eval_duration_us,
++        }
++    }
++}
++
++async fn find_epoch_aligned_anchor<P: Preset>(
++    fetcher: &BeaconFetcher,
++    warmup_start_slot: Slot,
++) -> Result<(Slot, BeaconState<P>, SignedBeaconBlock<P>)> {
++    let initial_epoch = misc::compute_epoch_at_slot::<P>(warmup_start_slot);
++    for epoch in (0..=initial_epoch).rev() {
++        let epoch_slot = misc::compute_start_slot_at_epoch::<P>(epoch);
++        match fetcher.fetch_block_at_slot::<P>(epoch_slot).await {
++            Ok(Some(block)) => {
++                let state = fetcher
++                    .fetch_state_at_slot::<P>(epoch_slot)
++                    .await
++                    .with_context(|| {
++                        format!("failed to fetch state at anchor slot {}", epoch_slot)
++                    })?;
++                // Sanity: state.latest_block_root must equal block.hash_tree_root.
++                let latest = accessors::latest_block_root(&state);
++                let block_root = block.message().hash_tree_root();
++                if latest != block_root {
++                    warn!(
++                        epoch_slot,
++                        latest = ?latest,
++                        block_root = ?block_root,
++                        "anchor state's latest_block_root != block.root; skipping",
++                    );
++                    continue;
++                }
++                return Ok((epoch_slot, state, block));
++            }
++            Ok(None) => continue,
++            Err(e) => {
++                warn!(epoch_slot, error = ?e, "failed to fetch candidate anchor block; trying earlier epoch");
++                continue;
++            }
++        }
++    }
++    bail!(
++        "no epoch-aligned non-missed slot found at or before warmup_start_slot {}",
++        warmup_start_slot
++    )
++}
++
++fn format_root(root: H256) -> String {
++    format!("0x{}", hex::encode(root))
++}
++
++fn promote_imported_payload_to_valid<P: Preset>(
++    controller: &AdHocBenchController<P>,
++    block: &SignedBeaconBlock<P>,
++) {
++    let Some(payload) = block
++        .message()
++        .body()
++        .with_execution_payload()
++        .map(|body| body.execution_payload())
++    else {
++        return;
++    };
++
++    let block_hash = payload.block_hash();
++    if block_hash == Default::default() {
++        return;
++    }
++
++    controller.on_notified_new_payload(
++        block.message().hash_tree_root(),
++        block_hash,
++        PayloadStatusV1 {
++            status: PayloadValidationStatus::Valid,
++            latest_valid_hash: Some(block_hash),
++            validation_error: None,
++        },
++    );
++    controller.wait_for_tasks();
++}
++
++fn micros_since(start: Instant) -> u64 {
++    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
++}
+diff --git a/fcr-simulator/src/sim/mod.rs b/fcr-simulator/src/sim/mod.rs
+new file mode 100644
+index 0000000..ded3cc8
+--- /dev/null
++++ b/fcr-simulator/src/sim/mod.rs
+@@ -0,0 +1,3 @@
++mod engine;
++
++pub use engine::Engine;
+diff --git a/fork_choice_control/src/controller.rs b/fork_choice_control/src/controller.rs
+index 0ac4a87..9809f18 100644
+--- a/fork_choice_control/src/controller.rs
++++ b/fork_choice_control/src/controller.rs
+@@ -65,9 +65,9 @@ use crate::{
+     state_at_slot_cache::StateAtSlotCache,
+     storage::Storage,
+     tasks::{
+-        AggregateAndProofTask, AttestationTask, AttesterSlashingTask, BlobSidecarTask, BlockTask,
+-        BlockVerifyForGossipTask, DataColumnSidecarTask, ExecutionPayloadBidTask,
+-        StateAtSlotCacheFlushTask,
++        AggregateAndProofTask, AttestationTask, AttesterSlashingTask, BlobSidecarTask,
++        BlockAttestationsTask, BlockTask, BlockVerifyForGossipTask, DataColumnSidecarTask,
++        ExecutionPayloadBidTask, StateAtSlotCacheFlushTask,
+     },
+     thread_pool::{Spawn, ThreadPool},
+     unbounded_sink::UnboundedSink,
+@@ -309,6 +309,41 @@ where
+         self.spawn_block_task(block, BlockOrigin::Requested(peer_id))
+     }
+ 
++    /// Imports a block via the `Persisted` origin, which uses `NullVerifier`,
++    /// `NullExecutionEngine`, and the trusted state-root / data-availability policies.
++    ///
++    /// Intended for historical canonical-chain replay (fcr-simulator). Skips BLS, EL, DA.
++    #[instrument(
++        parent = None,
++        skip_all
++        fields(slot = block.message().slot())
++    )]
++    pub fn on_replay_block(&self, block: Arc<SignedBeaconBlock<P>>) {
++        self.spawn_block_task(block, BlockOrigin::Persisted)
++    }
++
++    /// Re-runs the block-attestation pipeline against the current store snapshot,
++    /// using `AttestationOrigin::Block(block_root)`. The block must already be present
++    /// in the store.
++    ///
++    /// Intended for historical canonical-chain replay (fcr-simulator). Lets the simulator
++    /// replay a known block's attestations at an arbitrary later store slot without
++    /// re-importing the block.
++    pub fn on_replay_block_attestations(
++        &self,
++        block_root: H256,
++        block: Arc<SignedBeaconBlock<P>>,
++    ) {
++        self.spawn(BlockAttestationsTask {
++            store_snapshot: self.owned_store_snapshot(),
++            mutator_tx: self.owned_mutator_tx(),
++            wait_group: self.owned_wait_group(),
++            block_root,
++            block,
++            metrics: self.metrics.clone(),
++        })
++    }
++
+     #[instrument(
+         parent = None,
+         skip_all
+diff --git a/fork_choice_control/src/lib.rs b/fork_choice_control/src/lib.rs
+index d9877ca..92806e9 100644
+--- a/fork_choice_control/src/lib.rs
++++ b/fork_choice_control/src/lib.rs
+@@ -13,7 +13,7 @@
+ //! [`storage`]: ::storage
+ 
+ pub use crate::{
+-    controller::Controller,
++    controller::{Controller, MutatorHandle},
+     events::{DEFAULT_MAX_EVENTS, Event, EventChannels, Topic},
+     messages::{
+         AttestationVerifierMessage, P2pMessage, PoolMessage, SubnetMessage, SyncMessage,
