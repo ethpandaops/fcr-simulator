@@ -281,7 +281,7 @@ Honest about data limitation: during missed-slot runs, FCR evaluations have no f
 | Teku | Nashatyrev/teku:confirmation-2 (Anton, personal fork, no upstream PR yet) | Phase 3 |
 | Lodestar | ChainSafe/lodestar#8837 (nazarhussain), most mature non-merged | Future — `@lodestar/fork-choice` is npm-importable |
 | Nimbus | ~25 PRs merged into master (Etan Kissling) | Future — adapt their test runner (PR #8131) |
-| Prysm | OffchainLabs/prysm#15164 (terencechain), draft, OLD algorithm | Future — wait for rebase |
+| Prysm | OffchainLabs/prysm#15164 (terencechain), draft, OLD algorithm | Blocked — PR implements adiasg/eth2.0-specs:3e3ef28a, not consensus-specs#4747. See `docs/ENGINES_PRYSM.md` |
 | Grandine | grandinetech/grandine#656 (bomanaps), Apr 2026, external contributor | Future — Rust, similar to Lighthouse pattern |
 
 ### Codex review takeaways (folded into plan above)
