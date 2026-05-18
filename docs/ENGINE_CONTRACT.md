@@ -102,6 +102,10 @@ Engine fetches the plan ONCE at startup, before the slot loop:
 - Response: JSON `{ "entries": [{ "sim_slot": N, "source_block_slot": K | null }, ...] }`
 - Engine builds an in-memory map `sim_slot → source_block_slot` for fast lookup.
 
+**Plan completeness is contractual.** The response MUST contain exactly one entry per `sim_slot` in `[warmup_start_slot+1, end_slot)`, in ascending order, with no duplicates. Missing, duplicate, or out-of-order entries are a fatal bootstrap error (exit 2) — the engine validates this before starting the slot loop, matching Lighthouse `engine.rs:105`.
+
+**`source_block_slot` may equal or exceed `end_slot`.** The `next-non-missed` planner scans forward up to `lookahead_cap` slots and is permitted to point at a block past the recording range. The orchestrator's `/eth/v2/beacon/blocks/{K}` endpoint MUST serve any `K` that appears as a non-null `source_block_slot` in the plan. If such a fetch returns 404, that is a fatal mid-run error (exit 3) — the orchestrator gave an inconsistent plan.
+
 For each sim_slot during the loop, engine looks up the source and fetches the source block (if non-nil) to extract attestations.
 
 ## Attestation injection (CRITICAL)
@@ -117,9 +121,17 @@ For Lighthouse, this is `fc.on_attestation(inject_slot, indexed, AttestationFrom
 
 For other engines (future), they must use their equivalent injection mode. If no such mode exists, the engine cannot be added to this simulator without spec-level investigation.
 
-`inject_slot = sim_slot + 1`. This matches current Lighthouse behavior.
+### Slot-clock and indexing-state (CRITICAL — pin Lighthouse semantics)
 
-After injecting all source attestations for a sim_slot, engine calls `chain.recompute_head_at_slot(sim_slot + 1)`.
+The exact ordering inside one sim_slot iteration is part of the contract. Engines MUST follow it or cross-client comparison is invalid (matches Lighthouse `engine.rs:143`/`engine.rs:261`/`engine.rs:282`/`engine.rs:170`):
+
+1. Advance the chain's internal slot clock to `sim_slot`.
+2. If a block exists at `sim_slot`, import it (state transition).
+3. Snapshot the head state. Attestations from the plan's `source_block_slot` MUST be indexed (committee → validator index resolution) against THIS state — `chain.head_snapshot().beacon_state` after the sim_slot block is imported but BEFORE `recompute_head` runs. Engines that index from the source block's post-state will diverge.
+4. For each indexed attestation, call the from-block injection with `current_slot = inject_slot`.
+5. Call the engine's equivalent of `chain.recompute_head_at_slot(inject_slot)`.
+
+`inject_slot = sim_slot + 1`. This is unchanged across epoch boundaries: when `sim_slot % 32 == 31`, `inject_slot` is the first slot of the next epoch — the engine MUST inject/recompute at that slot WITHOUT importing the block at `sim_slot + 1` (the source block is fetched only for attestation extraction; if it happens to be `sim_slot + 1` the block at `sim_slot + 1` is still imported normally on the NEXT iteration when `slot = sim_slot + 1`).
 
 ## Replay shortcuts (must be enabled — historical canonical-chain replay)
 
