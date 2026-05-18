@@ -15,7 +15,7 @@ Usage: $0 \
     --end-epoch END \
     --beacon-node-url URL \
     [--engine NAME]               (default: lighthouse)
-    [--engine-binary PATH]        (default: \$FCR_ENGINE_BINARY or ./results/fcr-lighthouse)
+    [--engine-binary PATH]        (optional override; defaults to ./results/fcr-<engine>)
     [--orchestrator PATH]         (default: ./results/fcr-orchestrator)
     [--warmup-epochs N]           (default: 10)
     [--parallel WORKERS]          (default: 2)
@@ -34,7 +34,7 @@ CHUNK_SIZE=1000
 PARALLEL=2
 WARMUP_EPOCHS=10
 ENGINE="lighthouse"
-ENGINE_BINARY="${FCR_ENGINE_BINARY:-./results/fcr-lighthouse}"
+ENGINE_BINARY="${FCR_ENGINE_BINARY:-}"
 ORCHESTRATOR="./results/fcr-orchestrator"
 ATT_MODE="next-non-missed"
 LOOKAHEAD_CAP=4
@@ -142,7 +142,7 @@ run_orchestrator() {
     shift 3
     "$ORCHESTRATOR" \
         --engine "$ENGINE" \
-        --engine-binary "$ENGINE_BINARY" \
+        ${ENGINE_BINARY:+--engine-binary "$ENGINE_BINARY"} \
         --network mainnet \
         --start-epoch "$start" \
         --end-epoch "$end" \
