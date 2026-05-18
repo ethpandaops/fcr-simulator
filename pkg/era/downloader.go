@@ -14,7 +14,12 @@ import (
 	"time"
 )
 
-const downloaderHTTPTimeout = 600 * time.Second
+const (
+	downloaderHTTPTimeout = 600 * time.Second
+	defaultMaxRetries     = 10
+	retryBackoffStepSec   = 5
+	retryBackoffMaxSec    = 30
+)
 
 var downloaderRetrySleep = time.Sleep
 
@@ -53,7 +58,7 @@ func NewDownloader(baseURL, cacheDir string) (*Downloader, error) {
 // PreDownload fetches every era covering [startSlot, endSlot+32].
 //
 // Files already present in the cache are skipped. Each missing file is retried
-// up to 3 times.
+// up to defaultMaxRetries times with capped linear backoff.
 func (d *Downloader) PreDownload(startSlot, endSlot uint64) error {
 	if d == nil {
 		return fmt.Errorf("nil ERA downloader")
@@ -84,7 +89,7 @@ func (d *Downloader) PreDownload(startSlot, endSlot uint64) error {
 	}
 
 	for _, eraNumber := range needed {
-		if err := d.downloadEraWithRetries(eraNumber, 3); err != nil {
+		if err := d.downloadEraWithRetries(eraNumber, defaultMaxRetries); err != nil {
 			return err
 		}
 	}
@@ -189,7 +194,8 @@ func (d *Downloader) downloadEraWithRetries(eraNumber uint64, maxRetries uint32)
 		if err := d.tryDownload(url, filename); err != nil {
 			lastErr = err
 			if attempt < maxRetries {
-				downloaderRetrySleep(5 * time.Duration(attempt) * time.Second)
+				backoff := min(retryBackoffStepSec*int(attempt), retryBackoffMaxSec)
+				downloaderRetrySleep(time.Duration(backoff) * time.Second)
 			}
 			continue
 		}
