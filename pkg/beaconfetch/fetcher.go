@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	httpTimeout             = 600 * time.Second
-	checkpointFallbackSlots = uint64(32)
+	httpTimeout              = 600 * time.Second
+	slotsPerEpoch            = uint64(32)
+	checkpointFallbackEpochs = uint64(4)
 )
 
 // ErrNotFound is returned when the beacon node returns 404 (slot missed,
@@ -85,16 +86,25 @@ func (f *Fetcher) FetchBlockSSZByRoot(root [32]byte) ([]byte, error) {
 }
 
 // FetchCheckpointAtWarmupSlot fetches the checkpoint state at the warmup slot.
-// If the warmup slot is missed, retries with slot-1, slot-2, ..., up to
-// 32 slots back. Returns the actual slot used + the state SSZ.
-// Returns an error if no non-missed slot found within the fallback window.
+//
+// Lighthouse's weak_subjectivity_state bootstrap requires the state to be on an
+// epoch boundary and will per-slot advance it to the next boundary if not.
+// If the boundary slot was missed on mainnet, Lighthouse advances the state's
+// slot past the latest block, sets split_slot above the block's slot, and then
+// fails when reading head state (block.slot < split_slot puts the block in
+// cold-DB territory).
+//
+// To stay safely epoch-aligned, this fallback shifts back by a full epoch (32
+// slots) per attempt, not by single slots. The caller is expected to pass a
+// warmup slot that is already epoch-aligned.
 func (f *Fetcher) FetchCheckpointAtWarmupSlot(warmupSlot uint64) (actualSlot uint64, stateSSZ []byte, err error) {
-	for offset := uint64(0); offset <= checkpointFallbackSlots; offset++ {
-		if offset > warmupSlot {
+	for epochOffset := uint64(0); epochOffset <= checkpointFallbackEpochs; epochOffset++ {
+		step := epochOffset * slotsPerEpoch
+		if step > warmupSlot {
 			break
 		}
 
-		slot := warmupSlot - offset
+		slot := warmupSlot - step
 		_, err := f.CheckpointBlockRootAtSlot(slot)
 		if errors.Is(err, ErrNotFound) {
 			continue
@@ -111,7 +121,7 @@ func (f *Fetcher) FetchCheckpointAtWarmupSlot(warmupSlot uint64) (actualSlot uin
 		return slot, stateSSZ, nil
 	}
 
-	return 0, nil, fmt.Errorf("no non-missed checkpoint slot found at or before warmup slot %d within %d slots: %w", warmupSlot, checkpointFallbackSlots, ErrNotFound)
+	return 0, nil, fmt.Errorf("no non-missed epoch-aligned checkpoint slot found at or before warmup slot %d within %d epochs: %w", warmupSlot, checkpointFallbackEpochs, ErrNotFound)
 }
 
 // CheckpointBlockRootAtSlot returns data.root from /eth/v1/beacon/headers/{slot}.
