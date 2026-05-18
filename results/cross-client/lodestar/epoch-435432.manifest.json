@@ -1,0 +1,101 @@
+{
+  "schema_version": 3,
+  "fcr_simulator_version": "0a46fc8426636f993e9046ce84bc8a992e3a0be0",
+  "ran_at": "2026-05-14T10:32:34Z",
+  "config": {
+    "engine": "lodestar",
+    "network": "mainnet",
+    "start_epoch": 435432,
+    "end_epoch": 435433,
+    "warmup_epochs": 3,
+    "parallel": 1,
+    "attestation_source_mode": "next-non-missed",
+    "lookahead_cap": 4,
+    "byzantine_threshold": 25,
+    "beacon_node_url": "https://ethpandaops:12ofmpoqwmlcasc@bn-mainnet-lighthouse-geth-001.utility.production.platform.ethpandaops.io",
+    "era_url": "https://mainnet.era.nimbus.team"
+  },
+  "engine_manifest": {
+    "engine_name": "lodestar",
+    "engine_version": "v0.39.0-3198-g549b4c390c",
+    "engine_commit": "549b4c390cd5bb6d2bb35c48f59e7a04575ba496",
+    "build_flags": [
+      "fake_crypto",
+      "no_el_notification",
+      "no_da_check"
+    ],
+    "fcr_spec_commit": ""
+  },
+  "inputs": {
+    "era_files": [
+      {
+        "era": 1432,
+        "url": "https://mainnet.era.nimbus.team/mainnet-01432-a0634156.era",
+        "sha256": "35b12c232651adfb69c59ad0fa19b4988d0fb17cf9fe4d062c8c516923c487bd"
+      },
+      {
+        "era": 1433,
+        "url": "https://mainnet.era.nimbus.team/mainnet-01433-ed3ba647.era",
+        "sha256": "e4b3c577913366caac2aa5cc7f8bf7c8ca31450a0f3bb590c959abefd1e3488a"
+      },
+      {
+        "era": 1434,
+        "url": "https://mainnet.era.nimbus.team/mainnet-01434-80a6e7c7.era",
+        "sha256": "cda77c352ff0f2b58c1d63e257a955a6b0d6d3c1eb483f5d86d3755882a57b82"
+      },
+      {
+        "era": 1435,
+        "url": "https://mainnet.era.nimbus.team/mainnet-01435-12527fcc.era",
+        "sha256": "3f45999b793e0319e1edd32d9c1a61a2b05c97da7621ed749fb6502e5700b6cd"
+      },
+      {
+        "era": 1436,
+        "url": "https://mainnet.era.nimbus.team/mainnet-01436-96e5270c.era",
+        "sha256": "bcb18e785c7b21cb68851038d41fa938451ee0a04330c5fbafc28fd1a5f7df10"
+      },
+      {
+        "era": 1437,
+        "url": "https://mainnet.era.nimbus.team/mainnet-01437-4dd8dc46.era",
+        "sha256": "781a36141be350e3e880f90027bc9f8f851099a09bcec20dcb59798dbdbd4f5f"
+      },
+      {
+        "era": 1438,
+        "url": "https://mainnet.era.nimbus.team/mainnet-01438-b7868426.era",
+        "sha256": "a7ac1a94f2f5a5ef3c28bca5601728c84f9c2c30f223e9612a3c8092017823d0"
+      },
+      {
+        "era": 1439,
+        "url": "https://mainnet.era.nimbus.team/mainnet-01439-e67413f7.era",
+        "sha256": "1ea80a4e0557153ea5e38949ba5721e3bfdc27cba557d1b8226deead974741ae"
+      },
+      {
+        "era": 1440,
+        "url": "https://mainnet.era.nimbus.team/mainnet-01440-5726ebd1.era",
+        "sha256": "0db27282b0fac705efe087930b0bc10d10602fc081f8cee0456a67aa6659bb15"
+      },
+      {
+        "era": 1701,
+        "url": "https://mainnet.era.nimbus.team/mainnet-01701-76567504.era",
+        "sha256": "6c8d71033f8c3ec23f02d361fb70526b761dfe38af20795f352df1589910c43d"
+      },
+      {
+        "era": 1719,
+        "url": "https://mainnet.era.nimbus.team/mainnet-01719-99193f12.era",
+        "sha256": "dc21e751ef9949982d11f385f6448f50fbf9b6f3c92a36cd8bbf550fece42f00"
+      }
+    ],
+    "checkpoint_states": [
+      {
+        "worker": 0,
+        "slot": 13933728,
+        "sha256": "ab25252efcb598aafc78ca806052efad1c6b9c9e1575f5a4653324e198b4ebe7"
+      }
+    ]
+  },
+  "outputs": {
+    "results_jsonl_sha256": "6361e7429a011139d09516628f082a42577dd13c560db44018797c016f60fb8f",
+    "results_csv_sha256": "d2c56022f5fb63af7987469dad31b8b294ce767d90d0ed0a1991ad0b4fca9a1b",
+    "total_slots": 32,
+    "fast_confirmed_count": 25
+  }
+}

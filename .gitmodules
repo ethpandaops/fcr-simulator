@@ -1,3 +1,6 @@
+[submodule "engines/lodestar/lodestar"]
+	path = engines/lodestar/lodestar
+	url = https://github.com/nazarhussain/lodestar.git
 [submodule "engines/nimbus/nimbus-eth2"]
 	path = engines/nimbus/nimbus-eth2
 	url = https://github.com/status-im/nimbus-eth2.git
