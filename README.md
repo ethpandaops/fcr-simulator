@@ -2,7 +2,7 @@
 
 Replays historical Ethereum mainnet blocks through CL clients' [Fast Confirmation Rule](https://github.com/ethereum/consensus-specs/pull/4747) implementations to measure what percentage of blocks would have fast-confirmed.
 
-V1 ships with the Lighthouse engine. The architecture is engine-agnostic; adding Teku / Lodestar / Nimbus / Prysm / Grandine is "implement the engine CLI contract".
+V1 ships with Lighthouse and Teku engines. The architecture is engine-agnostic; adding Lodestar / Nimbus / Prysm / Grandine is "implement the engine CLI contract".
 
 ## Architecture
 
@@ -22,7 +22,7 @@ A Go orchestrator owns everything engine-agnostic: ERA file download, checkpoint
                      │
        ┌─────────────┴─────────────┐
        │  fcr-lighthouse  (Rust)   │
-       │  fcr-teku        (future) │
+       │  fcr-teku        (Java)   │
        └───────────────────────────┘
 ```
 
@@ -60,9 +60,13 @@ The planner is a pure function; all boundary scenarios (missed slots, cap edges,
 git clone --recursive https://github.com/ethpandaops/fcr-simulator.git
 cd fcr-simulator
 
-# Engine (~10-20 min cold, much faster on rebuild)
+# Lighthouse engine (~10-20 min cold, much faster on rebuild)
 ( cd lighthouse && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build -p fcr-simulator --features fake_crypto --release )
 cp lighthouse/target/release/fcr-lighthouse ./results/fcr-lighthouse
+
+# Teku engine (requires JDK 21; ~5 min cold, much faster on rebuild)
+bash engines/teku/build.sh
+# produces ./results/fcr-teku (a shim that exec's java -jar)
 
 # Orchestrator (seconds)
 go build -o ./results/fcr-orchestrator ./cmd/fcr-orchestrator
@@ -80,6 +84,25 @@ go build -o ./results/fcr-orchestrator ./cmd/fcr-orchestrator
   --end-epoch 435100 \
   --warmup-epochs 10 \
   --parallel 2 \
+  --output results/results.csv \
+  --output-format both \
+  --attestation-source-mode next-non-missed \
+  --lookahead-cap 4 \
+  --cache-dir ~/.cache/fcr-simulator
+```
+
+Run Teku (same flags, different `--engine` and `--engine-binary`):
+
+```bash
+./results/fcr-orchestrator \
+  --engine teku \
+  --engine-binary ./results/fcr-teku \
+  --network mainnet \
+  --beacon-node-url http://your-beacon-node:5052 \
+  --start-epoch 435000 \
+  --end-epoch 435100 \
+  --warmup-epochs 10 \
+  --parallel 1 \
   --output results/results.csv \
   --output-format both \
   --attestation-source-mode next-non-missed \
