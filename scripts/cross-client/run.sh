@@ -3,7 +3,9 @@
 # writing results to results/cross-client/<engine>/epoch-<N>.{jsonl,csv,manifest.json}.
 #
 # Usage:
-#   scripts/cross-client/run.sh <engine> <engine-binary>
+#   scripts/cross-client/run.sh <engine> [engine-binary]
+#
+# engine-binary defaults to ./results/fcr-<engine>; orchestrator auto-builds if missing.
 #
 # Requires:
 #   - ./results/fcr-orchestrator on disk
@@ -12,7 +14,7 @@
 set -euo pipefail
 
 ENGINE="${1:?engine name required (e.g. lighthouse, teku, lodestar, nimbus, prysm, grandine)}"
-ENGINE_BINARY="${2:?engine binary path required}"
+ENGINE_BINARY="${2:-}"
 
 ORCHESTRATOR="${ORCHESTRATOR:-./results/fcr-orchestrator}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-./results/cross-client}"
@@ -24,10 +26,6 @@ LOOKAHEAD_CAP="${LOOKAHEAD_CAP:-4}"
 
 if [[ ! -x "$ORCHESTRATOR" ]]; then
     echo "missing orchestrator at $ORCHESTRATOR; build with: go build -o $ORCHESTRATOR ./cmd/fcr-orchestrator" >&2
-    exit 2
-fi
-if [[ ! -x "$ENGINE_BINARY" ]]; then
-    echo "missing engine binary at $ENGINE_BINARY" >&2
     exit 2
 fi
 if [[ -f .env ]]; then
@@ -51,7 +49,7 @@ for ep in $EPOCHS; do
     echo "[$ENGINE] epoch $ep -> $out_base.csv"
     if "$ORCHESTRATOR" \
             --engine "$ENGINE" \
-            --engine-binary "$ENGINE_BINARY" \
+            ${ENGINE_BINARY:+--engine-binary "$ENGINE_BINARY"} \
             --network mainnet \
             --start-epoch "$ep" \
             --end-epoch "$((ep + 1))" \

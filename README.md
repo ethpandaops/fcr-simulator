@@ -4,13 +4,15 @@ Replays historical Ethereum mainnet blocks through each CL client's [Fast Confir
 
 ## Engines
 
-| Engine | Upstream pin | Build |
-|---|---|---|
-| lighthouse | submodule `lighthouse/` | `( cd lighthouse && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build -p fcr-simulator --features fake_crypto --release )` then `cp lighthouse/target/release/fcr-lighthouse results/fcr-lighthouse` |
-| teku       | submodule `engines/teku/teku` (Nashatyrev/teku `confirmation-2`) | `bash engines/teku/build.sh` |
-| nimbus     | submodule `engines/nimbus/nimbus-eth2` (status-im/nimbus-eth2 `unstable`) | `bash engines/nimbus/build.sh` |
-| lodestar   | submodule `engines/lodestar/lodestar` (ChainSafe/lodestar PR #8837) | `bash engines/lodestar/build.sh` |
-| grandine   | upstream `bomanaps/grandine` PR #656 via `engines/grandine/grandine-engine.patch` | `bash engines/grandine/build.sh` |
+All engines live under `engines/<name>/`. Each has a `build.sh` that produces `results/fcr-<name>`.
+
+| Engine | Upstream pin |
+|---|---|
+| lighthouse | submodule `engines/lighthouse/lighthouse` (samcm/lighthouse `fcr-simulator`) |
+| teku       | submodule `engines/teku/teku` (Nashatyrev/teku `confirmation-2`) |
+| nimbus     | submodule `engines/nimbus/nimbus-eth2` (status-im/nimbus-eth2 `unstable`) |
+| lodestar   | submodule `engines/lodestar/lodestar` (ChainSafe/lodestar PR #8837) |
+| grandine   | upstream `bomanaps/grandine` PR #656 via `engines/grandine/grandine-engine.patch` |
 
 Prysm is deferred: PR #15164 implements an older spec (`adiasg/eth2.0-specs:3e3ef28`), not [consensus-specs#4747](https://github.com/ethereum/consensus-specs/pull/4747). Shipping a binary against the older algorithm would contaminate cross-engine comparison. Revisit once the upstream PR rebases.
 
@@ -32,7 +34,7 @@ Per sim slot N the engine: fetches block N, imports it, looks up `plan[N].source
 
 BLS, execution-layer, and blob/DA checks are bypassed in each engine — historical canonical-chain replay doesn't need them. The orchestrator hard-rejects any engine binary that doesn't declare `fake_crypto` in its `--manifest-json` `build_flags`.
 
-Engine contract: [`ENGINE_CONTRACT.md`](ENGINE_CONTRACT.md). Output schema: [`SCHEMA.md`](SCHEMA.md). Attestation planner spec: [`pkg/attplan/SPEC.md`](pkg/attplan/SPEC.md).
+The engine contract is enforced in code: CLI flags + manifest validation in `cmd/fcr-orchestrator/main.go`, HTTP endpoints in `pkg/beaconapi/`, output schema in `pkg/schema/`. Attestation-source planner spec next to its code at [`pkg/attplan/SPEC.md`](pkg/attplan/SPEC.md).
 
 ## Attestation source modes
 
@@ -50,15 +52,21 @@ cd fcr-simulator
 # Orchestrator (seconds)
 go build -o ./results/fcr-orchestrator ./cmd/fcr-orchestrator
 
-# Each engine (see Engines table above for the build command)
+# Engines (each writes results/fcr-<name>)
+bash engines/lighthouse/build.sh   # Rust,  ~10-20 min cold
+bash engines/teku/build.sh         # Java,  ~5 min cold (needs JDK 21)
+bash engines/nimbus/build.sh       # Nim,   ~5-10 min cold
+bash engines/lodestar/build.sh     # Node,  ~3-5 min cold (needs Node 24+, pnpm)
+bash engines/grandine/build.sh     # Rust,  ~10-15 min cold
 ```
+
+The orchestrator auto-runs `engines/<engine>/build.sh` if the corresponding binary is missing.
 
 ## Run
 
 ```bash
 ./results/fcr-orchestrator \
   --engine lighthouse \
-  --engine-binary ./results/fcr-lighthouse \
   --network mainnet \
   --beacon-node-url http://your-beacon-node:5052 \
   --start-epoch 435000 --end-epoch 435100 \
@@ -68,7 +76,7 @@ go build -o ./results/fcr-orchestrator ./cmd/fcr-orchestrator
   --cache-dir ~/.cache/fcr-simulator
 ```
 
-Swap `--engine` and `--engine-binary` for any other built engine.
+`--engine-binary` defaults to `./results/fcr-<engine>`; override via `--engine-binary` flag or `FCR_ENGINE_BINARY` env if you want a different path.
 
 For long resumable runs, [`run.sh`](run.sh) chunks the range and merges on completion:
 
@@ -87,13 +95,13 @@ Per-worker RAM: ~2–3 GB for the Rust engines; Lodestar settles around 4 GB aft
 
 - `pick-epochs.py` — deterministic 10-epoch mainnet sample (seed `20260514`, range `[435000, 445000)`).
 - `manifest-check.sh` — fast contract validation across every `results/fcr-<engine>` binary.
-- `run.sh <engine> <binary>` — run that engine over the sample, write per-epoch CSVs under `results/cross-client/<engine>/`.
+- `run.sh <engine>` — run that engine over the sample, write per-epoch CSVs under `results/cross-client/<engine>/`.
 - `_run-1hr.sh`, `_run-12hr.sh` — parallel 5-engine runs over a fixed window, write `results/<window>/<engine>/run.csv`.
 - `diff.py` — per-slot cross-engine diff, emits `per-slot.csv` + `divergences.csv` + a per-column disagreement summary.
 
 ## Output
 
-CSV starts with `# fcr-simulator-csv-schema-version:3` followed by the header row. JSONL is one record per line. Full schema in [`SCHEMA.md`](SCHEMA.md). Key columns: `slot`, `epoch`, `has_block`, `block_root`, `head_root`, `confirmed_root`, `confirmed_slot`, `confirmation_delay_slots`, `fast_confirmed`, `strict_one_slot_confirmed`, `source_block_slot`, `num_attestations_injected`, `engine_name`, `engine_version`, `engine_commit`.
+CSV starts with `# fcr-simulator-csv-schema-version:3` followed by the header row. JSONL is one record per line. Schema is the `SlotResult` struct in `pkg/schema/schema.go`. Key columns: `slot`, `epoch`, `has_block`, `block_root`, `head_root`, `confirmed_root`, `confirmed_slot`, `confirmation_delay_slots`, `fast_confirmed`, `strict_one_slot_confirmed`, `source_block_slot`, `num_attestations_injected`, `engine_name`, `engine_version`, `engine_commit`.
 
 A sidecar `<output>.manifest.json` captures engine manifest, run config, ERA file hashes, and output hashes for reproducibility.
 

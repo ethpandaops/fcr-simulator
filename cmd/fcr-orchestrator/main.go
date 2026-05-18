@@ -72,6 +72,7 @@ func supportedEngineList() string {
 type config struct {
 	Engine                string
 	EngineBinary          string
+	engineBinarySource    engineBinarySource
 	Network               string
 	StartEpoch            uint64
 	EndEpoch              uint64
@@ -89,6 +90,14 @@ type config struct {
 	KeepCache             bool
 	PrepOnly              bool
 }
+
+type engineBinarySource int
+
+const (
+	engineBinarySourceDefault engineBinarySource = iota
+	engineBinarySourceEnv
+	engineBinarySourceFlag
+)
 
 type requiredUint64Flag struct {
 	value uint64
@@ -127,6 +136,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
+	if err := prepareEngineBinary(ctx, &cfg, stderr); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
 	exitCode, err := execute(ctx, cfg, stdout)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -144,7 +158,7 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 	fs := flag.NewFlagSet("fcr-orchestrator", flag.ContinueOnError)
 	fs.SetOutput(output)
 	fs.StringVar(&cfg.Engine, "engine", "", "engine name (one of: "+supportedEngineList()+")")
-	fs.StringVar(&cfg.EngineBinary, "engine-binary", os.Getenv("FCR_ENGINE_BINARY"), "path to engine binary (env: FCR_ENGINE_BINARY)")
+	fs.StringVar(&cfg.EngineBinary, "engine-binary", "", "optional path to engine binary (env: FCR_ENGINE_BINARY; default: ./results/fcr-<engine>, auto-builds via engines/<engine>/build.sh if missing)")
 	fs.StringVar(&cfg.Network, "network", "", "network name (V1 supports mainnet)")
 	fs.Var(&startEpoch, "start-epoch", "first epoch, inclusive")
 	fs.Var(&endEpoch, "end-epoch", "end epoch, exclusive")
@@ -173,10 +187,27 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 		return config{}, false, fmt.Errorf("unexpected positional arguments: %s", strings.Join(fs.Args(), " "))
 	}
 
+	engineBinaryFlagSet := flagWasSet(fs, "engine-binary")
+	switch {
+	case engineBinaryFlagSet:
+		if cfg.EngineBinary == "" {
+			return config{}, false, fmt.Errorf("--engine-binary cannot be empty")
+		}
+		cfg.engineBinarySource = engineBinarySourceFlag
+	case os.Getenv("FCR_ENGINE_BINARY") != "":
+		cfg.EngineBinary = os.Getenv("FCR_ENGINE_BINARY")
+		cfg.engineBinarySource = engineBinarySourceEnv
+	default:
+		cfg.engineBinarySource = engineBinarySourceDefault
+	}
+
 	cfg.StartEpoch = startEpoch.value
 	cfg.EndEpoch = endEpoch.value
 	if err := validateConfig(&cfg, startEpoch.set, endEpoch.set); err != nil {
 		return config{}, false, err
+	}
+	if cfg.engineBinarySource == engineBinarySourceDefault {
+		cfg.EngineBinary = defaultEngineBinaryPath(cfg.Engine)
 	}
 
 	expandedCacheDir, err := expandPath(cfg.CacheDir)
@@ -184,12 +215,6 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 		return config{}, false, err
 	}
 	cfg.CacheDir = expandedCacheDir
-
-	engineBinary, err := resolveExecutable(cfg.EngineBinary)
-	if err != nil {
-		return config{}, false, err
-	}
-	cfg.EngineBinary = engineBinary
 
 	cfg.BeaconNodeURL = strings.TrimRight(strings.TrimSpace(cfg.BeaconNodeURL), "/")
 	cfg.EraURL = strings.TrimRight(strings.TrimSpace(cfg.EraURL), "/")
@@ -208,9 +233,6 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 	}
 	if _, ok := supportedEngines[cfg.Engine]; !ok {
 		return fmt.Errorf("--engine=%q is not supported; supported values are %s", cfg.Engine, supportedEngineList())
-	}
-	if cfg.EngineBinary == "" {
-		return fmt.Errorf("--engine-binary is required")
 	}
 	if cfg.Network == "" {
 		return fmt.Errorf("--network is required")
@@ -801,6 +823,74 @@ func validateHTTPURL(value, name string) error {
 	if parsed.Host == "" {
 		return fmt.Errorf("%s must include a host", name)
 	}
+	return nil
+}
+
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
+func defaultEngineBinaryPath(engine string) string {
+	return "." + string(os.PathSeparator) + filepath.Join("results", "fcr-"+engine)
+}
+
+func defaultEngineBuildScript(engine string) string {
+	return filepath.Join("engines", engine, "build.sh")
+}
+
+func prepareEngineBinary(ctx context.Context, cfg *config, stderr io.Writer) error {
+	if cfg.engineBinarySource != engineBinarySourceDefault {
+		engineBinary, err := resolveExecutable(cfg.EngineBinary)
+		if err != nil {
+			return err
+		}
+		cfg.EngineBinary = engineBinary
+		return nil
+	}
+
+	engineBinary, err := resolveExecutable(cfg.EngineBinary)
+	if err == nil {
+		cfg.EngineBinary = engineBinary
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	buildScript := defaultEngineBuildScript(cfg.Engine)
+	info, statErr := os.Stat(buildScript)
+	if statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("engine binary not found at %s; build it via %s or pass --engine-binary <path>", cfg.EngineBinary, buildScript)
+		}
+		return fmt.Errorf("stat engine build script %q: %w", buildScript, statErr)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("engine build script %q is a directory", buildScript)
+	}
+
+	fmt.Fprintf(stderr, "binary not found, running %s...\n", buildScript)
+	cmd := exec.CommandContext(ctx, buildScript)
+	cmd.Stdout = stderr
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("run %s: %w", buildScript, err)
+	}
+
+	engineBinary, err = resolveExecutable(cfg.EngineBinary)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("engine build script %s completed but engine binary not found at %s", buildScript, cfg.EngineBinary)
+		}
+		return err
+	}
+	cfg.EngineBinary = engineBinary
 	return nil
 }
 

@@ -11,9 +11,9 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 COPY . .
 
-RUN cd lighthouse && git submodule update --init --recursive
+RUN cd engines/lighthouse/lighthouse && git submodule update --init --recursive
 
-WORKDIR /build/lighthouse
+WORKDIR /build/engines/lighthouse/lighthouse
 
 RUN CARGO_NET_GIT_FETCH_WITH_CLI=true \
     cargo build -p fcr-simulator --features fake_crypto --release
@@ -44,7 +44,7 @@ RUN apt-get update && \
     apt-get install -y ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=rust-builder /build/lighthouse/target/release/fcr-lighthouse /usr/local/bin/fcr-lighthouse
+COPY --from=rust-builder /build/engines/lighthouse/lighthouse/target/release/fcr-lighthouse /usr/local/bin/fcr-lighthouse
 COPY --from=teku-builder /build/engines/teku/.build/dist/fcr-teku-all.jar /usr/local/lib/fcr-teku-all.jar
 COPY --from=go-builder /out/fcr-orchestrator /usr/local/bin/fcr-orchestrator
 
