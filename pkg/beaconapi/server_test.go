@@ -138,9 +138,11 @@ func TestHandlePlan_Valid(t *testing.T) {
 	require.Equal(t, uint64(104), backend.planTo)
 
 	var got struct {
+		Version uint64      `json:"version"`
 		Entries []PlanEntry `json:"entries"`
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Equal(t, uint64(2), got.Version)
 	require.Len(t, got.Entries, 4)
 	require.Equal(t, uint64(100), got.Entries[0].SimSlot)
 	require.NotNil(t, got.Entries[0].SourceBlockSlot)

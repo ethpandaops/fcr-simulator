@@ -44,6 +44,24 @@ type GenesisInfo struct {
 }
 
 type PlanEntry struct {
-	SimSlot         uint64  `json:"sim_slot"`
+	SimSlot            uint64                  `json:"sim_slot"`
+	EvalSlot           uint64                  `json:"eval_slot"`
+	ImportBlocks       []PlanBlockImport       `json:"import_blocks"`
+	AttestationSources []PlanAttestationSource `json:"attestation_sources"`
+	// SourceBlockSlot is the legacy representative source, kept for output
+	// compatibility while engines migrate to AttestationSources.
 	SourceBlockSlot *uint64 `json:"source_block_slot"`
+}
+
+type PlanBlockImport struct {
+	Slot      uint64 `json:"slot"`
+	Root      string `json:"root"`
+	Canonical bool   `json:"canonical"`
+}
+
+type PlanAttestationSource struct {
+	Slot uint64 `json:"slot"`
+	// MaxAttestationSlot is set for greedy-lookahead. Nil means the engine
+	// should preserve the old mode behavior and inject the source block as-is.
+	MaxAttestationSlot *uint64 `json:"max_attestation_slot"`
 }

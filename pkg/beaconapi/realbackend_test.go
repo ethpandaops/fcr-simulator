@@ -8,11 +8,13 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/fcr-simulator/pkg/attplan"
 	"github.com/ethpandaops/fcr-simulator/pkg/beaconfetch"
 	"github.com/ethpandaops/fcr-simulator/pkg/blockarchive"
 	"github.com/ethpandaops/fcr-simulator/pkg/era"
 	"github.com/golang/snappy"
+	bitfield "github.com/prysmaticlabs/go-bitfield"
 	"github.com/stretchr/testify/require"
 )
 
@@ -58,10 +60,109 @@ func TestRealBackendBlockSlotRootAndPlan(t *testing.T) {
 		sourceSlot(103),
 		sourceSlot(104),
 	})
+	require.Empty(t, entries[0].ImportBlocks)
+	require.Len(t, entries[1].ImportBlocks, 1)
+	require.True(t, entries[1].ImportBlocks[0].Canonical)
+	require.Equal(t, uint64(101), entries[1].ImportBlocks[0].Slot)
+	require.Len(t, entries[1].AttestationSources, 1)
+	require.Equal(t, uint64(103), entries[1].AttestationSources[0].Slot)
+	require.Nil(t, entries[1].AttestationSources[0].MaxAttestationSlot)
 
 	entries, err = backend.BuildPlan(104, 100)
 	require.Nil(t, entries)
 	require.Error(t, err)
+}
+
+func TestRealBackendGreedyPlanIncludesWindowSourcesAndOrphanImports(t *testing.T) {
+	cacheDir := t.TempDir()
+
+	orphanParentSSZ := encodeTestSignedBeaconBlockWithAttestations(100, [32]byte{}, nil)
+	orphanParentRoot := testBlockRoot(t, orphanParentSSZ)
+	orphanHeadSSZ := encodeTestSignedBeaconBlockWithAttestations(101, orphanParentRoot, nil)
+	orphanHeadRoot := testBlockRoot(t, orphanHeadSSZ)
+
+	canonical101 := encodeTestSignedBeaconBlock(101)
+	canonical101Root := testBlockRoot(t, canonical101)
+	source102 := encodeTestSignedBeaconBlockWithAttestations(102, canonical101Root, []*phase0.Attestation{
+		testAttestation(101, orphanHeadRoot, orphanParentRoot),
+		testAttestation(103, testRoot(0x88), testRoot(0x99)),
+	})
+	writeTestEraFileWithBlocks(t, cacheDir, 1, canonical101, source102)
+
+	archiveDir := filepath.Join(cacheDir, "archive")
+	require.NoError(t, os.MkdirAll(archiveDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(archiveDir, rootHex(orphanParentRoot)+".ssz"), orphanParentSSZ, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(archiveDir, rootHex(orphanHeadRoot)+".ssz"), orphanHeadSSZ, 0o644))
+
+	reader, err := era.New(cacheDir)
+	require.NoError(t, err)
+	archiveClient, err := blockarchive.New("http://archive.test", "mainnet", archiveDir)
+	require.NoError(t, err)
+	backend := NewRealBackend(RealBackendConfig{
+		EraReader:    reader,
+		Mode:         attplan.ModeGreedyLookahead,
+		LookaheadCap: 2,
+		BlockArchive: archiveClient,
+	})
+
+	entries, err := backend.BuildPlan(101, 102)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, uint64(101), entries[0].SimSlot)
+	require.Equal(t, uint64(102), entries[0].EvalSlot)
+	require.Len(t, entries[0].AttestationSources, 1)
+	require.Equal(t, uint64(102), entries[0].AttestationSources[0].Slot)
+	require.NotNil(t, entries[0].AttestationSources[0].MaxAttestationSlot)
+	require.Equal(t, uint64(102), *entries[0].AttestationSources[0].MaxAttestationSlot)
+
+	require.Len(t, entries[0].ImportBlocks, 2)
+	require.Equal(t, PlanBlockImport{Slot: 101, Root: formatRoot(canonical101Root), Canonical: true}, entries[0].ImportBlocks[0])
+	require.Equal(t, PlanBlockImport{Slot: 101, Root: formatRoot(orphanHeadRoot), Canonical: false}, entries[0].ImportBlocks[1])
+}
+
+func TestRealBackendGreedyPlanSchedulesFutureSlotOrphanAtBlockSlot(t *testing.T) {
+	cacheDir := t.TempDir()
+
+	canonical101 := encodeTestSignedBeaconBlock(101)
+	canonical101Root := testBlockRoot(t, canonical101)
+	orphan102 := encodeTestSignedBeaconBlockWithAttestations(102, canonical101Root, nil)
+	orphan102Root := testBlockRoot(t, orphan102)
+	canonical102 := encodeTestSignedBeaconBlockWithAttestations(102, canonical101Root, []*phase0.Attestation{
+		testAttestation(102, orphan102Root, orphan102Root),
+	})
+	canonical103 := encodeTestSignedBeaconBlockWithAttestations(103, testBlockRoot(t, canonical102), []*phase0.Attestation{
+		testAttestation(102, orphan102Root, orphan102Root),
+	})
+	canonical102Root := testBlockRoot(t, canonical102)
+
+	writeTestEraFileWithBlocks(t, cacheDir, 1, canonical101, canonical102, canonical103)
+
+	archiveDir := filepath.Join(cacheDir, "archive")
+	require.NoError(t, os.MkdirAll(archiveDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(archiveDir, rootHex(orphan102Root)+".ssz"), orphan102, 0o644))
+
+	reader, err := era.New(cacheDir)
+	require.NoError(t, err)
+	archiveClient, err := blockarchive.New("http://archive.test", "mainnet", archiveDir)
+	require.NoError(t, err)
+	backend := NewRealBackend(RealBackendConfig{
+		EraReader:    reader,
+		Mode:         attplan.ModeGreedyLookahead,
+		LookaheadCap: 2,
+		BlockArchive: archiveClient,
+	})
+
+	entries, err := backend.BuildPlan(101, 103)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	require.Len(t, entries[0].ImportBlocks, 1)
+	require.Equal(t, PlanBlockImport{Slot: 101, Root: formatRoot(canonical101Root), Canonical: true}, entries[0].ImportBlocks[0])
+
+	require.Len(t, entries[1].ImportBlocks, 2)
+	require.Equal(t, PlanBlockImport{Slot: 102, Root: formatRoot(canonical102Root), Canonical: true}, entries[1].ImportBlocks[0])
+	require.Equal(t, PlanBlockImport{Slot: 102, Root: formatRoot(orphan102Root), Canonical: false}, entries[1].ImportBlocks[1])
+	require.Len(t, entries[1].AttestationSources, 1)
+	require.Equal(t, uint64(103), entries[1].AttestationSources[0].Slot)
 }
 
 func TestRealBackendFetcherAndGenesisInfo(t *testing.T) {
@@ -185,10 +286,20 @@ func sourceSlot(slot uint64) *uint64 {
 func writeTestEraFile(t *testing.T, dir string, eraNumber uint64, slots ...uint64) {
 	t.Helper()
 
+	blocks := make([][]byte, 0, len(slots))
+	for _, slot := range slots {
+		blocks = append(blocks, encodeTestSignedBeaconBlock(slot))
+	}
+	writeTestEraFileWithBlocks(t, dir, eraNumber, blocks...)
+}
+
+func writeTestEraFileWithBlocks(t *testing.T, dir string, eraNumber uint64, blocks ...[]byte) {
+	t.Helper()
+
 	var buf bytes.Buffer
 	writeTestRecord(t, &buf, 0x3265, nil)
-	for _, slot := range slots {
-		writeTestRecord(t, &buf, 0x0001, snappyCompress(t, encodeTestSignedBeaconBlock(slot)))
+	for _, block := range blocks {
+		writeTestRecord(t, &buf, 0x0001, snappyCompress(t, block))
 	}
 
 	path := filepath.Join(dir, fmt.Sprintf("mainnet-%05d-deadbeef.era", eraNumber))
@@ -219,13 +330,56 @@ func snappyCompress(t *testing.T, data []byte) []byte {
 }
 
 func encodeTestSignedBeaconBlock(slot uint64) []byte {
-	const (
-		signedBeaconBlockMessageOffset = 100
-		slotSize                       = 8
-	)
+	return encodeTestSignedBeaconBlockWithAttestations(slot, [32]byte{}, nil)
+}
 
-	ssz := make([]byte, signedBeaconBlockMessageOffset+slotSize)
-	binary.LittleEndian.PutUint32(ssz[0:4], signedBeaconBlockMessageOffset)
-	binary.LittleEndian.PutUint64(ssz[signedBeaconBlockMessageOffset:signedBeaconBlockMessageOffset+slotSize], slot)
+func encodeTestSignedBeaconBlockWithAttestations(slot uint64, parentRoot [32]byte, attestations []*phase0.Attestation) []byte {
+	block := &phase0.SignedBeaconBlock{
+		Message: &phase0.BeaconBlock{
+			Slot:          phase0.Slot(slot),
+			ProposerIndex: 1,
+			ParentRoot:    phase0.Root(parentRoot),
+			StateRoot:     phase0.Root(testRoot(byte(slot))),
+			Body: &phase0.BeaconBlockBody{
+				ETH1Data: &phase0.ETH1Data{
+					BlockHash: make([]byte, 32),
+				},
+				ProposerSlashings: []*phase0.ProposerSlashing{},
+				AttesterSlashings: []*phase0.AttesterSlashing{},
+				Attestations:      attestations,
+				Deposits:          []*phase0.Deposit{},
+				VoluntaryExits:    []*phase0.SignedVoluntaryExit{},
+			},
+		},
+	}
+	ssz, err := block.MarshalSSZ()
+	if err != nil {
+		panic(err)
+	}
 	return ssz
+}
+
+func testAttestation(slot uint64, headRoot, targetRoot [32]byte) *phase0.Attestation {
+	bits := bitfield.NewBitlist(1)
+	bits.SetBitAt(0, true)
+	return &phase0.Attestation{
+		AggregationBits: bits,
+		Data: &phase0.AttestationData{
+			Slot:            phase0.Slot(slot),
+			BeaconBlockRoot: phase0.Root(headRoot),
+			Source:          &phase0.Checkpoint{},
+			Target: &phase0.Checkpoint{
+				Epoch: phase0.Epoch(slot / 32),
+				Root:  phase0.Root(targetRoot),
+			},
+		},
+	}
+}
+
+func testBlockRoot(t *testing.T, ssz []byte) [32]byte {
+	t.Helper()
+
+	info, err := parseBlockInfo(ssz, MainnetForkAtSlot)
+	require.NoError(t, err)
+	return info.Root
 }

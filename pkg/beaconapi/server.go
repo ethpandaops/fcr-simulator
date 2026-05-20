@@ -13,6 +13,7 @@ import (
 const (
 	contentTypeSSZ  = "application/octet-stream"
 	contentTypeJSON = "application/json"
+	planVersion     = 2
 
 	blocksPrefix = "/eth/v2/beacon/blocks/"
 	statesPrefix = "/eth/v2/debug/beacon/states/"
@@ -174,8 +175,9 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, struct {
+		Version uint64      `json:"version"`
 		Entries []PlanEntry `json:"entries"`
-	}{Entries: entries})
+	}{Version: planVersion, Entries: entries})
 }
 
 type blockIDKind int
