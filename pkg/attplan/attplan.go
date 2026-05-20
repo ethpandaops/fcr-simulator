@@ -13,6 +13,10 @@ const (
 	ModeNextNonMissed Mode = iota
 	// ModeStrictKMinus1 only uses the block at sim_slot + 1.
 	ModeStrictKMinus1
+	// ModeGreedyLookahead lets engines consume every non-missed block in the
+	// lookahead window. The single-source planner entry remains a representative
+	// first source for the existing HTTP schema.
+	ModeGreedyLookahead
 )
 
 // Entry is the per-sim-slot attestation source mapping.
@@ -26,16 +30,17 @@ type Entry struct {
 
 // Plan returns one Entry per sim_slot in [simStart, simEnd), in ascending order.
 //
-// blockExists is treated as false for missing keys. ModeNextNonMissed requires
-// lookaheadCap >= 1. ModeStrictKMinus1 ignores lookaheadCap.
+// blockExists is treated as false for missing keys. ModeNextNonMissed and
+// ModeGreedyLookahead require lookaheadCap >= 1. ModeStrictKMinus1 ignores
+// lookaheadCap.
 func Plan(blockExists map[uint64]bool, simStart, simEnd uint64, mode Mode, lookaheadCap uint64) ([]Entry, error) {
 	if simStart > simEnd {
 		return nil, fmt.Errorf("simStart %d is after simEnd %d", simStart, simEnd)
 	}
-	if mode == ModeNextNonMissed && lookaheadCap < 1 {
-		return nil, fmt.Errorf("lookaheadCap must be >= 1 for ModeNextNonMissed")
+	if (mode == ModeNextNonMissed || mode == ModeGreedyLookahead) && lookaheadCap < 1 {
+		return nil, fmt.Errorf("lookaheadCap must be >= 1 for mode %d", mode)
 	}
-	if mode != ModeNextNonMissed && mode != ModeStrictKMinus1 {
+	if mode != ModeNextNonMissed && mode != ModeStrictKMinus1 && mode != ModeGreedyLookahead {
 		return nil, fmt.Errorf("unsupported attestation source mode %d", mode)
 	}
 
@@ -43,7 +48,7 @@ func Plan(blockExists map[uint64]bool, simStart, simEnd uint64, mode Mode, looka
 	for simSlot := simStart; simSlot < simEnd; simSlot++ {
 		var source *uint64
 		switch mode {
-		case ModeNextNonMissed:
+		case ModeNextNonMissed, ModeGreedyLookahead:
 			source = nextNonMissedSource(blockExists, simSlot, lookaheadCap)
 		case ModeStrictKMinus1:
 			source = strictKMinus1Source(blockExists, simSlot)

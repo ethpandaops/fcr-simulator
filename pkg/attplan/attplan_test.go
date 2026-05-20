@@ -363,8 +363,20 @@ func TestB_CapParameterIgnored(t *testing.T) {
 	}
 }
 
+func TestGreedyLookahead_RepresentativeSource(t *testing.T) {
+	got, err := Plan(blockMap(100, 103, 104), 100, 103, ModeGreedyLookahead, 4)
+	require.NoError(t, err)
+	requirePlan(t, got, 100, []*uint64{source(103), source(103), source(103)})
+}
+
 func TestErr_Cap0_ModeA(t *testing.T) {
 	got, err := Plan(blockMap(100, 101), 100, 104, ModeNextNonMissed, 0)
+	require.Error(t, err)
+	require.Nil(t, got)
+}
+
+func TestErr_Cap0_GreedyLookahead(t *testing.T) {
+	got, err := Plan(blockMap(100, 101), 100, 104, ModeGreedyLookahead, 0)
 	require.Error(t, err)
 	require.Nil(t, got)
 }

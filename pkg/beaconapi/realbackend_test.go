@@ -10,6 +10,7 @@ import (
 
 	"github.com/ethpandaops/fcr-simulator/pkg/attplan"
 	"github.com/ethpandaops/fcr-simulator/pkg/beaconfetch"
+	"github.com/ethpandaops/fcr-simulator/pkg/blockarchive"
 	"github.com/ethpandaops/fcr-simulator/pkg/era"
 	"github.com/golang/snappy"
 	"github.com/stretchr/testify/require"
@@ -129,6 +130,24 @@ func TestRealBackendConfigurationErrors(t *testing.T) {
 	blockByRoot, err := backend.BlockSSZByRoot(testRoot(0x33))
 	require.Nil(t, blockByRoot)
 	require.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestRealBackendBlockSSZByRootFallsBackToBlockArchive(t *testing.T) {
+	root := testRoot(0x44)
+	rootText := rootHex(root)
+	cacheDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, rootText+".ssz"), []byte("archive-block"), 0o644))
+
+	archiveClient, err := blockarchive.New("http://archive.test", "mainnet", cacheDir)
+	require.NoError(t, err)
+
+	backend := NewRealBackend(RealBackendConfig{
+		CheckpointBlocksByRoot: map[[32]byte][]byte{},
+		BlockArchive:           archiveClient,
+	})
+	block, err := backend.BlockSSZByRoot(root)
+	require.NoError(t, err)
+	require.Equal(t, []byte("archive-block"), block)
 }
 
 func TestRealBackendUtilityEdgeCases(t *testing.T) {

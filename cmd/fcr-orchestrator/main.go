@@ -25,6 +25,7 @@ import (
 	"github.com/ethpandaops/fcr-simulator/pkg/attplan"
 	"github.com/ethpandaops/fcr-simulator/pkg/beaconapi"
 	"github.com/ethpandaops/fcr-simulator/pkg/beaconfetch"
+	"github.com/ethpandaops/fcr-simulator/pkg/blockarchive"
 	"github.com/ethpandaops/fcr-simulator/pkg/chunk"
 	"github.com/ethpandaops/fcr-simulator/pkg/era"
 	"github.com/ethpandaops/fcr-simulator/pkg/manifest"
@@ -87,6 +88,7 @@ type config struct {
 	AttestationSourceMode string
 	LookaheadCap          uint64
 	HTTPListen            string
+	BlockArchiveURL       string
 	KeepCache             bool
 	PrepOnly              bool
 }
@@ -170,9 +172,10 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 	fs.StringVar(&cfg.Output, "output", defaultOutput, "output path")
 	fs.StringVar(&cfg.OutputFormat, "output-format", defaultOutputFormat, "csv, jsonl, or both")
 	fs.Uint64Var(&cfg.ByzantineThreshold, "byzantine-threshold", defaultByzantineThreshold, "FCR byzantine threshold percent")
-	fs.StringVar(&cfg.AttestationSourceMode, "attestation-source-mode", defaultAttestationSourceMode, "next-non-missed or strict-source-block-k-minus-1")
+	fs.StringVar(&cfg.AttestationSourceMode, "attestation-source-mode", defaultAttestationSourceMode, "next-non-missed, strict-source-block-k-minus-1, or greedy-lookahead")
 	fs.Uint64Var(&cfg.LookaheadCap, "lookahead-cap", defaultLookaheadCap, "attestation lookahead cap")
 	fs.StringVar(&cfg.HTTPListen, "http-listen", defaultHTTPListen, "local HTTP listen address")
+	fs.StringVar(&cfg.BlockArchiveURL, "block-archive-url", "", "optional block-archiver URL for resolving attestations to orphan/non-canonical blocks")
 	fs.BoolVar(&cfg.KeepCache, "keep-cache", false, "keep intermediate cache after run")
 	fs.BoolVar(&cfg.PrepOnly, "prep-only", false, "download ERA files and checkpoint state then exit (no engine run)")
 	fs.BoolVar(&printVersion, "version", false, "print orchestrator version and exit")
@@ -218,6 +221,7 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 
 	cfg.BeaconNodeURL = strings.TrimRight(strings.TrimSpace(cfg.BeaconNodeURL), "/")
 	cfg.EraURL = strings.TrimRight(strings.TrimSpace(cfg.EraURL), "/")
+	cfg.BlockArchiveURL = strings.TrimRight(strings.TrimSpace(cfg.BlockArchiveURL), "/")
 	cfg.OutputFormat = strings.ToLower(strings.TrimSpace(cfg.OutputFormat))
 	cfg.AttestationSourceMode = strings.TrimSpace(cfg.AttestationSourceMode)
 	if cfg.AttestationSourceMode == "strict-source-block-k-minus-1" {
@@ -264,6 +268,11 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 	if err := validateHTTPURL(cfg.EraURL, "--era-url"); err != nil {
 		return err
 	}
+	if strings.TrimSpace(cfg.BlockArchiveURL) != "" {
+		if err := validateHTTPURL(cfg.BlockArchiveURL, "--block-archive-url"); err != nil {
+			return err
+		}
+	}
 	if strings.TrimSpace(cfg.CacheDir) == "" {
 		return fmt.Errorf("--cache-dir is required")
 	}
@@ -276,13 +285,13 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 		return fmt.Errorf("--output-format must be one of csv, jsonl, both")
 	}
 	switch cfg.AttestationSourceMode {
-	case "next-non-missed":
+	case "next-non-missed", "greedy-lookahead":
 		if cfg.LookaheadCap == 0 {
-			return fmt.Errorf("--lookahead-cap must be greater than zero for next-non-missed mode")
+			return fmt.Errorf("--lookahead-cap must be greater than zero for %s mode", cfg.AttestationSourceMode)
 		}
 	case "strict-source-block-k-minus-1":
 	default:
-		return fmt.Errorf("--attestation-source-mode must be next-non-missed or strict-source-block-k-minus-1")
+		return fmt.Errorf("--attestation-source-mode must be next-non-missed, strict-source-block-k-minus-1, or greedy-lookahead")
 	}
 	if strings.TrimSpace(cfg.HTTPListen) == "" {
 		return fmt.Errorf("--http-listen is required")
@@ -532,6 +541,18 @@ func startBeaconAPIServer(cfg config, eraReader *era.Reader, fetcher *beaconfetc
 		return nil, "", nil, err
 	}
 
+	var archiveClient *blockarchive.Client
+	if cfg.BlockArchiveURL != "" {
+		archiveClient, err = blockarchive.New(
+			cfg.BlockArchiveURL,
+			cfg.Network,
+			filepath.Join(cfg.CacheDir, "block-archive"),
+		)
+		if err != nil {
+			return nil, "", nil, err
+		}
+	}
+
 	backend := beaconapi.NewRealBackend(beaconapi.RealBackendConfig{
 		EraReader:              eraReader,
 		Fetcher:                fetcher,
@@ -540,6 +561,7 @@ func startBeaconAPIServer(cfg config, eraReader *era.Reader, fetcher *beaconfetc
 		Mode:                   mode,
 		LookaheadCap:           cfg.LookaheadCap,
 		CheckpointBlocksByRoot: checkpointBlocks,
+		BlockArchive:           archiveClient,
 	})
 
 	server := &http.Server{
@@ -756,6 +778,8 @@ func parseAttplanMode(mode string) (attplan.Mode, error) {
 		return attplan.ModeNextNonMissed, nil
 	case "strict-source-block-k-minus-1":
 		return attplan.ModeStrictKMinus1, nil
+	case "greedy-lookahead":
+		return attplan.ModeGreedyLookahead, nil
 	default:
 		return 0, fmt.Errorf("unsupported attestation source mode %q", mode)
 	}

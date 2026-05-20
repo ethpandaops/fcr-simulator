@@ -7,6 +7,7 @@ import (
 
 	"github.com/ethpandaops/fcr-simulator/pkg/attplan"
 	"github.com/ethpandaops/fcr-simulator/pkg/beaconfetch"
+	"github.com/ethpandaops/fcr-simulator/pkg/blockarchive"
 	"github.com/ethpandaops/fcr-simulator/pkg/era"
 )
 
@@ -23,6 +24,8 @@ type RealBackendConfig struct {
 	// CheckpointBlocksByRoot is built by the orchestrator during worker setup.
 	// The HTTP server only performs this lookup; it does not compute roots.
 	CheckpointBlocksByRoot map[[32]byte][]byte
+
+	BlockArchive *blockarchive.Client
 }
 
 type realBackend struct {
@@ -53,15 +56,23 @@ func (b *realBackend) BlockSSZBySlot(slot uint64) ([]byte, error) {
 }
 
 func (b *realBackend) BlockSSZByRoot(root [32]byte) ([]byte, error) {
-	if b.cfg.CheckpointBlocksByRoot == nil {
+	if b.cfg.CheckpointBlocksByRoot != nil {
+		if data, ok := b.cfg.CheckpointBlocksByRoot[root]; ok {
+			return cloneBytes(data), nil
+		}
+	}
+
+	if b.cfg.BlockArchive == nil {
 		return nil, ErrNotFound
 	}
 
-	data, ok := b.cfg.CheckpointBlocksByRoot[root]
-	if !ok {
+	data, err := b.cfg.BlockArchive.FetchBlockSSZByRoot(root)
+	if errors.Is(err, blockarchive.ErrNotFound) {
 		return nil, ErrNotFound
 	}
-
+	if err != nil {
+		return nil, err
+	}
 	return cloneBytes(data), nil
 }
 
