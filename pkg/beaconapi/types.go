@@ -35,6 +35,9 @@ type Backend interface {
 
 	// BuildPlan returns the attestation source plan for sim slots [from, to).
 	BuildPlan(from, to uint64) ([]PlanEntry, error)
+
+	// BuildSlot returns the executable instruction set for one sim slot.
+	BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstruction, error)
 }
 
 type GenesisInfo struct {
@@ -64,4 +67,30 @@ type PlanAttestationSource struct {
 	// MaxAttestationSlot is set for greedy-lookahead. Nil means the engine
 	// should preserve the old mode behavior and inject the source block as-is.
 	MaxAttestationSlot *uint64 `json:"max_attestation_slot"`
+}
+
+type SlotInstruction struct {
+	SimSlot      uint64            `json:"sim_slot"`
+	EvalSlot     uint64            `json:"eval_slot"`
+	ImportBlocks []PlanBlockImport `json:"import_blocks"`
+	Attestations []PlanAttestation `json:"attestations"`
+}
+
+type PlanAttestation struct {
+	AggregationBits string              `json:"aggregation_bits"`
+	CommitteeBits   *string             `json:"committee_bits,omitempty"`
+	Data            PlanAttestationData `json:"data"`
+}
+
+type PlanAttestationData struct {
+	Slot            uint64         `json:"slot"`
+	Index           uint64         `json:"index"`
+	BeaconBlockRoot string         `json:"beacon_block_root"`
+	Source          PlanCheckpoint `json:"source"`
+	Target          PlanCheckpoint `json:"target"`
+}
+
+type PlanCheckpoint struct {
+	Epoch uint64 `json:"epoch"`
+	Root  string `json:"root"`
 }

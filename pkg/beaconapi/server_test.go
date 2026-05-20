@@ -168,6 +168,64 @@ func TestHandlePlan_FromGreaterThanTo(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+func TestHandleSlot_Valid(t *testing.T) {
+	committeeBits := "0x01"
+	backend := &fakeBackend{
+		slotInstruction: SlotInstruction{
+			SimSlot:  101,
+			EvalSlot: 102,
+			ImportBlocks: []PlanBlockImport{
+				{Slot: 101, Root: rootHex(testRoot(0x11)), Canonical: true},
+			},
+			Attestations: []PlanAttestation{
+				{
+					AggregationBits: "0x03",
+					CommitteeBits:   &committeeBits,
+					Data: PlanAttestationData{
+						Slot:            100,
+						Index:           2,
+						BeaconBlockRoot: rootHex(testRoot(0x22)),
+						Source:          PlanCheckpoint{Epoch: 2, Root: rootHex(testRoot(0x33))},
+						Target:          PlanCheckpoint{Epoch: 3, Root: rootHex(testRoot(0x44))},
+					},
+				},
+			},
+		},
+	}
+
+	rec := doRequest(t, backend, "/fcr-sim/v1/slot/101?warmup_start_slot=100", "")
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, contentTypeJSON, rec.Header().Get("Content-Type"))
+	require.Equal(t, uint64(101), backend.slotSim)
+	require.Equal(t, uint64(100), backend.slotWarmupStart)
+
+	var got struct {
+		Version uint64          `json:"version"`
+		Slot    SlotInstruction `json:"slot"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Equal(t, uint64(3), got.Version)
+	require.Equal(t, backend.slotInstruction, got.Slot)
+}
+
+func TestHandleSlot_InvalidInputs(t *testing.T) {
+	tests := []string{
+		"/fcr-sim/v1/slot/not-a-slot?warmup_start_slot=100",
+		"/fcr-sim/v1/slot/101",
+		"/fcr-sim/v1/slot/101?warmup_start_slot=not-a-slot",
+		"/fcr-sim/v1/slot/100?warmup_start_slot=100",
+		"/fcr-sim/v1/slot/99?warmup_start_slot=100",
+	}
+
+	for _, target := range tests {
+		t.Run(target, func(t *testing.T) {
+			rec := doRequest(t, &fakeBackend{}, target, "")
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+		})
+	}
+}
+
 func TestAcceptHeaderMismatch(t *testing.T) {
 	rec := doRequest(t, &fakeBackend{}, "/eth/v2/beacon/blocks/100", contentTypeJSON)
 
@@ -194,6 +252,7 @@ func TestBackendErrorsReturn500(t *testing.T) {
 		"/eth/v2/debug/beacon/states/genesis",
 		"/eth/v2/beacon/genesis",
 		"/fcr-sim/v1/plan?from=100&to=101",
+		"/fcr-sim/v1/slot/101?warmup_start_slot=100",
 	}
 
 	for _, path := range tests {
@@ -294,6 +353,10 @@ type fakeBackend struct {
 	planFrom uint64
 	planTo   uint64
 
+	slotInstruction SlotInstruction
+	slotSim         uint64
+	slotWarmupStart uint64
+
 	forkAtSlot func(slot uint64) string
 
 	err error
@@ -363,6 +426,15 @@ func (b *fakeBackend) BuildPlan(from, to uint64) ([]PlanEntry, error) {
 	b.planFrom = from
 	b.planTo = to
 	return b.plan, nil
+}
+
+func (b *fakeBackend) BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstruction, error) {
+	if b.err != nil {
+		return SlotInstruction{}, b.err
+	}
+	b.slotSim = simSlot
+	b.slotWarmupStart = warmupStartSlot
+	return b.slotInstruction, nil
 }
 
 var errFakeBackend = errors.New("fake backend error")

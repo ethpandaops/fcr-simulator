@@ -14,11 +14,13 @@ const (
 	contentTypeSSZ  = "application/octet-stream"
 	contentTypeJSON = "application/json"
 	planVersion     = 2
+	slotVersion     = 3
 
 	blocksPrefix = "/eth/v2/beacon/blocks/"
 	statesPrefix = "/eth/v2/debug/beacon/states/"
 	genesisPath  = "/eth/v2/beacon/genesis"
 	planPath     = "/fcr-sim/v1/plan"
+	slotPrefix   = "/fcr-sim/v1/slot/"
 )
 
 // Server is the HTTP server.
@@ -52,6 +54,8 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleState(w, r)
 	case r.URL.Path == genesisPath:
 		s.handleGenesis(w, r)
+	case strings.HasPrefix(r.URL.Path, slotPrefix):
+		s.handleSlot(w, r)
 	case r.URL.Path == planPath:
 		s.handlePlan(w, r)
 	default:
@@ -178,6 +182,40 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		Version uint64      `json:"version"`
 		Entries []PlanEntry `json:"entries"`
 	}{Version: planVersion, Entries: entries})
+}
+
+func (s *Server) handleSlot(w http.ResponseWriter, r *http.Request) {
+	slotID := strings.TrimPrefix(r.URL.Path, slotPrefix)
+	if slotID == "" || strings.Contains(slotID, "/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	simSlot, ok := parseUint64ID(slotID)
+	if !ok {
+		http.Error(w, "invalid sim slot", http.StatusBadRequest)
+		return
+	}
+	warmupStartSlot, ok := parseRequiredUint64Query(r.URL.Query().Get("warmup_start_slot"))
+	if !ok {
+		http.Error(w, "warmup_start_slot query parameter is required and must be a uint64", http.StatusBadRequest)
+		return
+	}
+	if simSlot <= warmupStartSlot {
+		http.Error(w, "sim slot must be greater than warmup_start_slot", http.StatusBadRequest)
+		return
+	}
+
+	slot, err := s.backend.BuildSlot(simSlot, warmupStartSlot)
+	if err != nil {
+		writeBackendError(w, err)
+		return
+	}
+
+	writeJSON(w, struct {
+		Version uint64          `json:"version"`
+		Slot    SlotInstruction `json:"slot"`
+	}{Version: slotVersion, Slot: slot})
 }
 
 type blockIDKind int

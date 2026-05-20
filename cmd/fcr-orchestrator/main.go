@@ -44,6 +44,7 @@ const (
 	defaultAttestationSourceMode = "next-non-missed"
 	defaultLookaheadCap          = uint64(4)
 	defaultHTTPListen            = "127.0.0.1:0"
+	defaultDecodedBlockCacheSize = beaconapi.DefaultDecodedBlockCacheSize
 )
 
 var version = "dev"
@@ -89,6 +90,7 @@ type config struct {
 	LookaheadCap          uint64
 	HTTPListen            string
 	BlockArchiveURL       string
+	DecodedBlockCacheSize int
 	KeepCache             bool
 	PrepOnly              bool
 }
@@ -176,6 +178,7 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 	fs.Uint64Var(&cfg.LookaheadCap, "lookahead-cap", defaultLookaheadCap, "attestation lookahead cap")
 	fs.StringVar(&cfg.HTTPListen, "http-listen", defaultHTTPListen, "local HTTP listen address")
 	fs.StringVar(&cfg.BlockArchiveURL, "block-archive-url", "", "optional block-archiver URL for resolving attestations to orphan/non-canonical blocks")
+	fs.IntVar(&cfg.DecodedBlockCacheSize, "decoded-block-cache-size", defaultDecodedBlockCacheSize, "decoded block LRU entries for per-slot simulation planning (0 disables)")
 	fs.BoolVar(&cfg.KeepCache, "keep-cache", false, "keep intermediate cache after run")
 	fs.BoolVar(&cfg.PrepOnly, "prep-only", false, "download ERA files and checkpoint state then exit (no engine run)")
 	fs.BoolVar(&printVersion, "version", false, "print orchestrator version and exit")
@@ -295,6 +298,9 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 	}
 	if strings.TrimSpace(cfg.HTTPListen) == "" {
 		return fmt.Errorf("--http-listen is required")
+	}
+	if cfg.DecodedBlockCacheSize < 0 {
+		return fmt.Errorf("--decoded-block-cache-size must be >= 0")
 	}
 	return nil
 }
@@ -562,6 +568,7 @@ func startBeaconAPIServer(cfg config, eraReader *era.Reader, fetcher *beaconfetc
 		LookaheadCap:           cfg.LookaheadCap,
 		CheckpointBlocksByRoot: checkpointBlocks,
 		BlockArchive:           archiveClient,
+		DecodedBlockCacheSize:  cfg.DecodedBlockCacheSize,
 	})
 
 	server := &http.Server{

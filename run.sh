@@ -38,6 +38,7 @@ ENGINE_BINARY="${FCR_ENGINE_BINARY:-}"
 ORCHESTRATOR="./results/fcr-orchestrator"
 ATT_MODE="next-non-missed"
 LOOKAHEAD_CAP=4
+BLOCK_ARCHIVE_URL=""
 CSV_SCHEMA_HEADER="# fcr-simulator-csv-schema-version:3"
 
 while [[ $# -gt 0 ]]; do
@@ -55,6 +56,7 @@ while [[ $# -gt 0 ]]; do
         --warmup-epochs) WARMUP_EPOCHS="$2"; shift 2 ;;
         --attestation-source-mode) ATT_MODE="$2"; shift 2 ;;
         --lookahead-cap) LOOKAHEAD_CAP="$2"; shift 2 ;;
+        --block-archive-url) BLOCK_ARCHIVE_URL="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; usage ;;
     esac
 done
@@ -153,6 +155,7 @@ run_orchestrator() {
         --output-format both \
         --attestation-source-mode "$ATT_MODE" \
         --lookahead-cap "$LOOKAHEAD_CAP" \
+        ${BLOCK_ARCHIVE_URL:+--block-archive-url "$BLOCK_ARCHIVE_URL"} \
         --cache-dir "$CACHE_DIR" \
         "$@"
 }

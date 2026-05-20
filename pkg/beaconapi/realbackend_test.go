@@ -165,6 +165,102 @@ func TestRealBackendGreedyPlanSchedulesFutureSlotOrphanAtBlockSlot(t *testing.T)
 	require.Equal(t, uint64(103), entries[1].AttestationSources[0].Slot)
 }
 
+func TestRealBackendBuildSlotEmitsInlineAttestationsAndOrphans(t *testing.T) {
+	cacheDir := t.TempDir()
+
+	canonical101 := encodeTestSignedBeaconBlock(101)
+	canonical101Root := testBlockRoot(t, canonical101)
+	canonical102 := encodeTestSignedBeaconBlockWithAttestations(102, canonical101Root, []*phase0.Attestation{
+		testAttestation(101, canonical101Root, canonical101Root),
+	})
+	canonical102Root := testBlockRoot(t, canonical102)
+	orphan102 := encodeTestSignedBeaconBlockWithAttestations(102, canonical101Root, nil)
+	orphan102Root := testBlockRoot(t, orphan102)
+	orphanVote := testAttestation(102, orphan102Root, orphan102Root)
+	canonical103 := encodeTestSignedBeaconBlockWithAttestations(103, canonical102Root, []*phase0.Attestation{
+		orphanVote,
+	})
+	canonical103Root := testBlockRoot(t, canonical103)
+	canonical104 := encodeTestSignedBeaconBlockWithAttestations(104, canonical103Root, []*phase0.Attestation{
+		orphanVote,
+	})
+	writeTestEraFileWithBlocks(t, cacheDir, 1, canonical101, canonical102, canonical103, canonical104)
+
+	archiveDir := filepath.Join(cacheDir, "archive")
+	require.NoError(t, os.MkdirAll(archiveDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(archiveDir, rootHex(orphan102Root)+".ssz"), orphan102, 0o644))
+
+	reader, err := era.New(cacheDir)
+	require.NoError(t, err)
+	archiveClient, err := blockarchive.New("http://archive.test", "mainnet", archiveDir)
+	require.NoError(t, err)
+	backend := NewRealBackend(RealBackendConfig{
+		EraReader:    reader,
+		LookaheadCap: 2,
+		BlockArchive: archiveClient,
+	})
+
+	firstInstruction, err := backend.BuildSlot(101, 100)
+	require.NoError(t, err)
+	require.Len(t, firstInstruction.Attestations, 1)
+	require.Equal(t, uint64(101), firstInstruction.Attestations[0].Data.Slot)
+	require.Equal(t, formatRoot(canonical101Root), firstInstruction.Attestations[0].Data.BeaconBlockRoot)
+
+	instruction, err := backend.BuildSlot(102, 100)
+	require.NoError(t, err)
+	require.Equal(t, uint64(102), instruction.SimSlot)
+	require.Equal(t, uint64(103), instruction.EvalSlot)
+	require.Equal(t, []PlanBlockImport{
+		{Slot: 102, Root: formatRoot(canonical102Root), Canonical: true},
+		{Slot: 102, Root: formatRoot(orphan102Root), Canonical: false},
+	}, instruction.ImportBlocks)
+	require.Len(t, instruction.Attestations, 2)
+	for _, attestation := range instruction.Attestations {
+		require.Equal(t, uint64(102), attestation.Data.Slot)
+		require.Equal(t, formatRoot(orphan102Root), attestation.Data.BeaconBlockRoot)
+		require.Equal(t, formatRoot(orphan102Root), attestation.Data.Target.Root)
+		require.NotEmpty(t, attestation.AggregationBits)
+		require.Nil(t, attestation.CommitteeBits)
+	}
+}
+
+func TestRealBackendBuildSlotDropsPreWarmupOrphanParents(t *testing.T) {
+	cacheDir := t.TempDir()
+
+	orphanParent100 := encodeTestSignedBeaconBlockWithAttestations(100, [32]byte{}, nil)
+	orphanParent100Root := testBlockRoot(t, orphanParent100)
+	orphanHead101 := encodeTestSignedBeaconBlockWithAttestations(101, orphanParent100Root, nil)
+	orphanHead101Root := testBlockRoot(t, orphanHead101)
+	canonical101 := encodeTestSignedBeaconBlock(101)
+	canonical101Root := testBlockRoot(t, canonical101)
+	canonical102 := encodeTestSignedBeaconBlockWithAttestations(102, canonical101Root, []*phase0.Attestation{
+		testAttestation(101, orphanHead101Root, orphanHead101Root),
+	})
+	writeTestEraFileWithBlocks(t, cacheDir, 1, canonical101, canonical102)
+
+	archiveDir := filepath.Join(cacheDir, "archive")
+	require.NoError(t, os.MkdirAll(archiveDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(archiveDir, rootHex(orphanParent100Root)+".ssz"), orphanParent100, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(archiveDir, rootHex(orphanHead101Root)+".ssz"), orphanHead101, 0o644))
+
+	reader, err := era.New(cacheDir)
+	require.NoError(t, err)
+	archiveClient, err := blockarchive.New("http://archive.test", "mainnet", archiveDir)
+	require.NoError(t, err)
+	backend := NewRealBackend(RealBackendConfig{
+		EraReader:    reader,
+		LookaheadCap: 2,
+		BlockArchive: archiveClient,
+	})
+
+	instruction, err := backend.BuildSlot(101, 100)
+	require.NoError(t, err)
+	require.Equal(t, []PlanBlockImport{
+		{Slot: 101, Root: formatRoot(canonical101Root), Canonical: true},
+		{Slot: 101, Root: formatRoot(orphanHead101Root), Canonical: false},
+	}, instruction.ImportBlocks)
+}
+
 func TestRealBackendFetcherAndGenesisInfo(t *testing.T) {
 	cacheDir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "states"), 0o755))

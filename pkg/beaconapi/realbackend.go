@@ -12,9 +12,16 @@ import (
 	"github.com/ethpandaops/fcr-simulator/pkg/beaconfetch"
 	"github.com/ethpandaops/fcr-simulator/pkg/blockarchive"
 	"github.com/ethpandaops/fcr-simulator/pkg/era"
+	lru "github.com/hashicorp/golang-lru/v2"
 )
 
-const maxOrphanWalk = 16
+const (
+	maxOrphanWalk = 16
+
+	// DefaultDecodedBlockCacheSize is the orchestrator default for decoded
+	// blockInfo LRU caches used by per-slot simulation planning.
+	DefaultDecodedBlockCacheSize = 4096
+)
 
 type RealBackendConfig struct {
 	EraReader *era.Reader
@@ -31,17 +38,34 @@ type RealBackendConfig struct {
 	CheckpointBlocksByRoot map[[32]byte][]byte
 
 	BlockArchive *blockarchive.Client
+
+	// DecodedBlockCacheSize bounds decoded blockInfo caches. Zero disables
+	// decoded caching.
+	DecodedBlockCacheSize int
 }
 
 type realBackend struct {
-	cfg RealBackendConfig
+	cfg           RealBackendConfig
+	decodedBySlot *lru.Cache[uint64, blockInfo]
+	decodedByRoot *lru.Cache[[32]byte, blockInfo]
 }
 
 func NewRealBackend(cfg RealBackendConfig) Backend {
 	if cfg.ForkSchedule.SlotFork == nil {
 		cfg.ForkSchedule.SlotFork = MainnetForkAtSlot
 	}
-	return &realBackend{cfg: cfg}
+	cacheSize := cfg.DecodedBlockCacheSize
+
+	backend := &realBackend{cfg: cfg}
+	if cacheSize > 0 {
+		if cache, err := lru.New[uint64, blockInfo](cacheSize); err == nil {
+			backend.decodedBySlot = cache
+		}
+		if cache, err := lru.New[[32]byte, blockInfo](cacheSize); err == nil {
+			backend.decodedByRoot = cache
+		}
+	}
+	return backend
 }
 
 func (b *realBackend) BlockSSZBySlot(slot uint64) ([]byte, error) {
@@ -206,6 +230,67 @@ func (b *realBackend) BuildPlan(from, to uint64) ([]PlanEntry, error) {
 	return out, nil
 }
 
+func (b *realBackend) BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstruction, error) {
+	if b.cfg.EraReader == nil {
+		return SlotInstruction{}, fmt.Errorf("era reader is not configured")
+	}
+	if simSlot <= warmupStartSlot {
+		return SlotInstruction{}, fmt.Errorf("sim slot %d must be greater than warmup start slot %d", simSlot, warmupStartSlot)
+	}
+	if b.cfg.LookaheadCap < 1 {
+		return SlotInstruction{}, fmt.Errorf("lookaheadCap must be >= 1 for slot instructions")
+	}
+	minImportSlot, ok := checkedAdd(warmupStartSlot, 1)
+	if !ok {
+		return SlotInstruction{}, fmt.Errorf("warmup start slot %d cannot be incremented", warmupStartSlot)
+	}
+
+	loadEnd := saturatingAdd(simSlot, b.cfg.LookaheadCap)
+	canonicalBySlot, canonicalByRoot, err := b.loadCanonicalBlockInfos(minImportSlot, loadEnd)
+	if err != nil {
+		return SlotInstruction{}, err
+	}
+
+	state := &planBuildState{
+		backend:         b,
+		canonicalBySlot: canonicalBySlot,
+		canonicalByRoot: canonicalByRoot,
+		importedRoots:   make(map[[32]byte]bool),
+		scheduledRoots:  make(map[[32]byte]bool),
+		missingRoots:    make(map[[32]byte]bool),
+		ignoredRoots:    make(map[[32]byte]bool),
+		fetchedByRoot:   make(map[[32]byte]blockInfo),
+	}
+	for root := range b.cfg.CheckpointBlocksByRoot {
+		state.importedRoots[root] = true
+	}
+
+	instruction := SlotInstruction{
+		SimSlot:      simSlot,
+		EvalSlot:     saturatingAdd(simSlot, 1),
+		ImportBlocks: []PlanBlockImport{},
+		Attestations: []PlanAttestation{},
+	}
+
+	if info, ok := canonicalBySlot[simSlot]; ok {
+		instruction.ImportBlocks = append(instruction.ImportBlocks, blockImport(info, true))
+		state.importedRoots[info.Root] = true
+	}
+
+	slotAttestations := attestationsMadeInWindow(canonicalBySlot, simSlot, b.cfg.LookaheadCap)
+	orphanImports, err := state.orphanImportsForSlotAttestations(slotAttestations, simSlot, minImportSlot)
+	if err != nil {
+		return SlotInstruction{}, err
+	}
+	instruction.ImportBlocks = append(instruction.ImportBlocks, orphanImports...)
+
+	for _, attestation := range slotAttestations {
+		instruction.Attestations = append(instruction.Attestations, planAttestation(attestation))
+	}
+
+	return instruction, nil
+}
+
 func (b *realBackend) loadCanonicalBlockInfos(from, to uint64) (map[uint64]blockInfo, map[[32]byte]blockInfo, error) {
 	bySlot := make(map[uint64]blockInfo)
 	byRoot := make(map[[32]byte]blockInfo)
@@ -219,7 +304,7 @@ func (b *realBackend) loadCanonicalBlockInfos(from, to uint64) (map[uint64]block
 			return nil, nil, err
 		}
 		if ok {
-			info, err := parseBlockInfo(data, b.ConsensusVersionAtSlot)
+			info, err := b.decodeCanonicalBlockInfo(slot, data)
 			if err != nil {
 				return nil, nil, fmt.Errorf("parse canonical block at slot %d: %w", slot, err)
 			}
@@ -232,6 +317,46 @@ func (b *realBackend) loadCanonicalBlockInfos(from, to uint64) (map[uint64]block
 	}
 
 	return bySlot, byRoot, nil
+}
+
+func (b *realBackend) decodeCanonicalBlockInfo(slot uint64, data []byte) (blockInfo, error) {
+	if b.decodedBySlot != nil {
+		if info, ok := b.decodedBySlot.Get(slot); ok {
+			return info, nil
+		}
+	}
+
+	info, err := parseBlockInfo(data, b.ConsensusVersionAtSlot)
+	if err != nil {
+		return blockInfo{}, err
+	}
+	if b.decodedBySlot != nil {
+		b.decodedBySlot.Add(slot, info)
+	}
+	if b.decodedByRoot != nil {
+		b.decodedByRoot.Add(info.Root, info)
+	}
+	return info, nil
+}
+
+func (b *realBackend) decodeBlockInfoByRoot(root [32]byte, data []byte) (blockInfo, error) {
+	if b.decodedByRoot != nil {
+		if info, ok := b.decodedByRoot.Get(root); ok {
+			return info, nil
+		}
+	}
+
+	info, err := parseBlockInfo(data, b.ConsensusVersionAtSlot)
+	if err != nil {
+		return blockInfo{}, err
+	}
+	if info.Root != root {
+		return blockInfo{}, fmt.Errorf("block fetched for %s has root %s", formatRoot(root), formatRoot(info.Root))
+	}
+	if b.decodedByRoot != nil {
+		b.decodedByRoot.Add(root, info)
+	}
+	return info, nil
 }
 
 func planSourcesForSlot(blockExists map[uint64]bool, simSlot uint64, mode attplan.Mode, lookaheadCap uint64, evalSlot uint64) []PlanAttestationSource {
@@ -379,6 +504,115 @@ func (s *planBuildState) orphanImportsForSources(
 	return imports, nil
 }
 
+func attestationsMadeInWindow(canonicalBySlot map[uint64]blockInfo, madeSlot, lookaheadCap uint64) []attestationInfo {
+	if lookaheadCap == 0 || madeSlot == math.MaxUint64 {
+		return nil
+	}
+
+	end, ok := checkedAdd(madeSlot, lookaheadCap)
+	if !ok {
+		return nil
+	}
+
+	start := madeSlot + 1
+	out := make([]attestationInfo, 0)
+	for sourceSlot := start; ; sourceSlot++ {
+		if info, ok := canonicalBySlot[sourceSlot]; ok {
+			for _, attestation := range info.Attestations {
+				if attestation.Slot != madeSlot {
+					continue
+				}
+				// Preserve every aggregate for this attested slot. Multiple
+				// inclusion blocks can carry overlapping aggregates with the
+				// same attestation data/root, and fork choice de-duplicates at
+				// the validator vote level.
+				out = append(out, attestation)
+			}
+		}
+		if sourceSlot == end {
+			break
+		}
+	}
+	return out
+}
+
+func (s *planBuildState) orphanImportsForSlotAttestations(attestations []attestationInfo, simSlot, minImportSlot uint64) ([]PlanBlockImport, error) {
+	roots := make(map[[32]byte]bool)
+	for _, attestation := range attestations {
+		for _, root := range [][32]byte{attestation.TargetRoot, attestation.BeaconBlockRoot} {
+			if isZeroRoot(root) || s.rootKnown(root) || s.scheduledRoots[root] || s.missingRoots[root] || s.ignoredRoots[root] {
+				continue
+			}
+			roots[root] = true
+		}
+	}
+	if len(roots) == 0 {
+		return nil, nil
+	}
+
+	infos := make([]blockInfo, 0, len(roots))
+	for _, root := range sortedRootKeys(roots) {
+		if s.rootKnown(root) || s.scheduledRoots[root] || s.missingRoots[root] || s.ignoredRoots[root] {
+			continue
+		}
+		chain, err := s.resolveOrphanChain(root, simSlot)
+		if err != nil {
+			return nil, err
+		}
+		if len(chain) == 0 {
+			continue
+		}
+
+		// Stateless per-slot scheduling emits an orphan root only at its own
+		// block slot. Earlier roots in the chain are included only as parents
+		// needed to make that slot's orphan importable.
+		if chain[len(chain)-1].Root != root || chain[len(chain)-1].Slot != simSlot {
+			s.ignoredRoots[root] = true
+			continue
+		}
+
+		for _, info := range chain {
+			if info.Slot < minImportSlot {
+				s.ignoredRoots[info.Root] = true
+				continue
+			}
+			if info.Slot > simSlot || s.rootKnown(info.Root) || s.scheduledRoots[info.Root] {
+				continue
+			}
+			s.scheduledRoots[info.Root] = true
+			infos = append(infos, info)
+		}
+	}
+
+	sortBlockInfos(infos)
+
+	imports := make([]PlanBlockImport, 0, len(infos))
+	for _, info := range infos {
+		imports = append(imports, blockImport(info, false))
+	}
+	return imports, nil
+}
+
+func planAttestation(attestation attestationInfo) PlanAttestation {
+	return PlanAttestation{
+		AggregationBits: attestation.AggregationBits,
+		CommitteeBits:   attestation.CommitteeBits,
+		Data: PlanAttestationData{
+			Slot:            attestation.Slot,
+			Index:           attestation.Index,
+			BeaconBlockRoot: formatRoot(attestation.BeaconBlockRoot),
+			Source: PlanCheckpoint{
+				Epoch: attestation.SourceEpoch,
+				Root:  formatRoot(attestation.SourceRoot),
+			},
+			Target: PlanCheckpoint{
+				Epoch: attestation.TargetEpoch,
+				Root:  formatRoot(attestation.TargetRoot),
+			},
+		},
+	}
+}
+
 func sortBlockInfos(infos []blockInfo) {
 	sort.SliceStable(infos, func(i, j int) bool {
 		if infos[i].Slot != infos[j].Slot {
@@ -410,6 +644,13 @@ func (s *planBuildState) resolveOrphanChain(root [32]byte, evalSlot uint64) ([]b
 		if info.Slot > evalSlot {
 			break
 		}
+		canonical, err := s.isCanonicalBlockInfo(info)
+		if err != nil {
+			return nil, err
+		}
+		if canonical {
+			break
+		}
 
 		chain = append(chain, info)
 		current = info.ParentRoot
@@ -421,6 +662,31 @@ func (s *planBuildState) resolveOrphanChain(root [32]byte, evalSlot uint64) ([]b
 	return chain, nil
 }
 
+func (s *planBuildState) isCanonicalBlockInfo(info blockInfo) (bool, error) {
+	if canonical, ok := s.canonicalBySlot[info.Slot]; ok {
+		return canonical.Root == info.Root, nil
+	}
+	if s.backend.cfg.EraReader == nil {
+		return false, nil
+	}
+
+	data, ok, err := s.backend.cfg.EraReader.RawBlockSSZ(info.Slot)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+
+	canonical, err := s.backend.decodeCanonicalBlockInfo(info.Slot, data)
+	if err != nil {
+		return false, fmt.Errorf("parse canonical block at slot %d: %w", info.Slot, err)
+	}
+	s.canonicalBySlot[canonical.Slot] = canonical
+	s.canonicalByRoot[canonical.Root] = canonical
+	return canonical.Root == info.Root, nil
+}
+
 func (s *planBuildState) fetchBlockInfoByRoot(root [32]byte) (blockInfo, error) {
 	if info, ok := s.fetchedByRoot[root]; ok {
 		return info, nil
@@ -430,12 +696,9 @@ func (s *planBuildState) fetchBlockInfoByRoot(root [32]byte) (blockInfo, error) 
 	if err != nil {
 		return blockInfo{}, err
 	}
-	info, err := parseBlockInfo(data, s.backend.ConsensusVersionAtSlot)
+	info, err := s.backend.decodeBlockInfoByRoot(root, data)
 	if err != nil {
 		return blockInfo{}, fmt.Errorf("parse block %s from archive: %w", formatRoot(root), err)
-	}
-	if info.Root != root {
-		return blockInfo{}, fmt.Errorf("block fetched for %s has root %s", formatRoot(root), formatRoot(info.Root))
 	}
 
 	s.fetchedByRoot[root] = info

@@ -2,6 +2,7 @@ package beaconapi
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -27,8 +28,15 @@ type blockInfo struct {
 }
 
 type attestationInfo struct {
+	Root            [32]byte
+	AggregationBits string
+	CommitteeBits   *string
 	Slot            uint64
+	Index           uint64
 	BeaconBlockRoot [32]byte
+	SourceEpoch     uint64
+	SourceRoot      [32]byte
+	TargetEpoch     uint64
 	TargetRoot      [32]byte
 }
 
@@ -64,16 +72,36 @@ func parseBlockInfo(ssz []byte, forkAtSlot func(uint64) string) (blockInfo, erro
 
 	infos := make([]attestationInfo, 0, len(attestations))
 	for _, attestation := range attestations {
+		root, err := attestation.HashTreeRoot()
+		if err != nil {
+			return blockInfo{}, fmt.Errorf("calculate attestation root for block slot %d: %w", slot, err)
+		}
+		aggregationBits, err := attestation.AggregationBits()
+		if err != nil {
+			return blockInfo{}, fmt.Errorf("read attestation aggregation bits for block slot %d: %w", slot, err)
+		}
+		var committeeBits *string
+		if bits, err := attestation.CommitteeBits(); err == nil {
+			encoded := bytesHex(bits)
+			committeeBits = &encoded
+		}
 		data, err := attestation.Data()
 		if err != nil {
 			return blockInfo{}, fmt.Errorf("read attestation data for block slot %d: %w", slot, err)
 		}
-		if data == nil || data.Target == nil {
-			return blockInfo{}, fmt.Errorf("attestation in block slot %d has nil data or target", slot)
+		if data == nil || data.Source == nil || data.Target == nil {
+			return blockInfo{}, fmt.Errorf("attestation in block slot %d has nil data, source, or target", slot)
 		}
 		infos = append(infos, attestationInfo{
+			Root:            [32]byte(root),
+			AggregationBits: bytesHex(aggregationBits),
+			CommitteeBits:   committeeBits,
 			Slot:            uint64(data.Slot),
+			Index:           uint64(data.Index),
 			BeaconBlockRoot: [32]byte(data.BeaconBlockRoot),
+			SourceEpoch:     uint64(data.Source.Epoch),
+			SourceRoot:      [32]byte(data.Source.Root),
+			TargetEpoch:     uint64(data.Target.Epoch),
 			TargetRoot:      [32]byte(data.Target.Root),
 		})
 	}
@@ -146,4 +174,8 @@ func extractSlotFromSignedBeaconBlockSSZ(ssz []byte) (uint64, error) {
 	}
 
 	return binary.LittleEndian.Uint64(ssz[signedBeaconBlockMessageOffset : signedBeaconBlockMessageOffset+slotSize]), nil
+}
+
+func bytesHex(data []byte) string {
+	return "0x" + hex.EncodeToString(data)
 }
