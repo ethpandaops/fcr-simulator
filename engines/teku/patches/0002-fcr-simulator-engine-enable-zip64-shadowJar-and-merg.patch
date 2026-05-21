@@ -1,6 +1,6 @@
-From 48101e830fb7ece1ed622c08c88344dc825a3039 Mon Sep 17 00:00:00 2001
+From 7e7b2381742a1a11fc423a4c1124ab71a4882a6e Mon Sep 17 00:00:00 2001
 From: Codex <codex@example.invalid>
-Date: Thu, 14 May 2026 19:23:04 +1000
+Date: Thu, 21 May 2026 22:45:17 +1000
 Subject: [PATCH 2/2] fcr-simulator-engine: enable zip64 shadowJar and merge
  service files
 
@@ -9,7 +9,7 @@ Subject: [PATCH 2/2] fcr-simulator-engine: enable zip64 shadowJar and merge
  1 file changed, 7 insertions(+)
 
 diff --git a/fcr-simulator-engine/build.gradle b/fcr-simulator-engine/build.gradle
-index a7c3af3..61f108f 100644
+index a7c3af304e..61f108fd99 100644
 --- a/fcr-simulator-engine/build.gradle
 +++ b/fcr-simulator-engine/build.gradle
 @@ -66,4 +66,11 @@ shadowJar {
