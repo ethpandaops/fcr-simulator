@@ -12,6 +12,7 @@ import {
   type CheckpointWithPayloadStatus,
   type ForkChoiceStateGetter,
   type JustifiedBalancesGetter,
+  type ProtoBlock,
 } from "@lodestar/fork-choice";
 import {ForkSeq, GENESIS_SLOT} from "@lodestar/params";
 import {
@@ -23,6 +24,7 @@ import {
   BeaconStateView,
   DataAvailabilityStatus,
   ExecutionPayloadStatus,
+  G2_POINT_AT_INFINITY,
   type CachedBeaconStateAllForks,
   type EffectiveBalanceIncrements,
   type IBeaconStateView,
@@ -35,7 +37,7 @@ import {
   type RootHex,
   type SignedBeaconBlock,
 } from "@lodestar/types";
-import {toRootHex, type LogData, type Logger} from "@lodestar/utils";
+import {fromHex, toRootHex, type LogData, type Logger} from "@lodestar/utils";
 import {ForkName} from "@lodestar/params";
 import {request} from "undici";
 
@@ -61,8 +63,6 @@ interface CliConfig {
   warmupStartSlot: number;
   network: "mainnet";
   byzantineThreshold: number;
-  attestationSourceMode: string;
-  lookaheadCap: number;
   output: string;
 }
 
@@ -103,13 +103,17 @@ function parseArgs(argv: string[]): ParseResult {
     if (!Number.isInteger(n) || n < 0) throw new Error(`--${name} must be a non-negative integer`);
     return n;
   };
+  const optionalU = (name: string): number | undefined => {
+    const v = args.get(name);
+    if (v === undefined) return undefined;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 0) throw new Error(`--${name} must be a non-negative integer`);
+    return n;
+  };
 
   const network = required("network");
   if (network !== "mainnet") throw new Error(`unsupported network ${network}; only mainnet`);
-  const mode = required("attestation-source-mode");
-  if (mode !== "next-non-missed" && mode !== "strict-source-block-k-minus-1") {
-    throw new Error(`unsupported --attestation-source-mode ${mode}`);
-  }
+  optionalU("lookahead-cap");
 
   const startSlot = requiredU("start-slot");
   const endSlot = requiredU("end-slot");
@@ -125,9 +129,7 @@ function parseArgs(argv: string[]): ParseResult {
       endSlot,
       warmupStartSlot,
       network: "mainnet",
-      byzantineThreshold: requiredU("byzantine-threshold"),
-      attestationSourceMode: mode,
-      lookaheadCap: requiredU("lookahead-cap"),
+      byzantineThreshold: optionalU("byzantine-threshold") ?? 25,
       output: required("output"),
     },
   };
@@ -180,21 +182,151 @@ async function fetchJson<T>(url: string): Promise<T> {
   return (await res.body.json()) as T;
 }
 
-async function fetchPlan(baseUrl: string, from: number, to: number): Promise<Map<number, number | null>> {
-  const data = await fetchJson<{entries: Array<{sim_slot: number; source_block_slot: number | null}>}>(
-    `${baseUrl}/fcr-sim/v1/plan?from=${from}&to=${to}`,
+interface SlotInstruction {
+  simSlot: number;
+  evalSlot: number;
+  importBlocks: PlanBlockImport[];
+  attestations: PlanAttestation[];
+}
+
+interface PlanBlockImport {
+  slot: number;
+  rootHex: RootHex;
+  root: Uint8Array;
+  canonical: boolean;
+}
+
+interface PlanAttestation {
+  aggregationBits: Uint8Array;
+  committeeBits: Uint8Array | null;
+  data: PlanAttestationData;
+}
+
+interface PlanAttestationData {
+  slot: number;
+  index: number;
+  beaconBlockRoot: Uint8Array;
+  source: PlanCheckpoint;
+  target: PlanCheckpoint;
+}
+
+interface PlanCheckpoint {
+  epoch: number;
+  root: Uint8Array;
+}
+
+interface SlotResponseWire {
+  version?: number;
+  slot: SlotInstructionWire;
+}
+
+interface SlotInstructionWire {
+  sim_slot: number;
+  eval_slot: number;
+  import_blocks: PlanBlockImportWire[];
+  attestations: PlanAttestationWire[];
+}
+
+interface PlanBlockImportWire {
+  slot: number;
+  root: string;
+  canonical: boolean;
+}
+
+interface PlanAttestationWire {
+  aggregation_bits: string;
+  committee_bits?: string | null;
+  data: PlanAttestationDataWire;
+}
+
+interface PlanAttestationDataWire {
+  slot: number;
+  index: number;
+  beacon_block_root: string;
+  source: PlanCheckpointWire;
+  target: PlanCheckpointWire;
+}
+
+interface PlanCheckpointWire {
+  epoch: number;
+  root: string;
+}
+
+async function fetchSlotInstruction(baseUrl: string, simSlot: number, warmupStartSlot: number): Promise<SlotInstruction> {
+  const response = await fetchJson<SlotResponseWire>(
+    `${baseUrl}/fcr-sim/v1/slot/${simSlot}?warmup_start_slot=${warmupStartSlot}`,
   );
-  const map = new Map<number, number | null>();
-  for (const entry of data.entries) {
-    map.set(entry.sim_slot, entry.source_block_slot);
+  if (response.version !== 3) {
+    throw new Error(`unsupported slot instruction version ${response.version}; expected 3`);
   }
-  return map;
+
+  const slot = response.slot;
+  if (slot.sim_slot !== simSlot) {
+    throw new Error(`slot instruction response sim_slot mismatch: requested ${simSlot}, got ${slot.sim_slot}`);
+  }
+
+  return {
+    simSlot: slot.sim_slot,
+    evalSlot: slot.eval_slot,
+    importBlocks: slot.import_blocks.map((block) => {
+      const root = parseRootHex(block.root);
+      return {
+        slot: block.slot,
+        rootHex: toRootHex(root),
+        root,
+        canonical: block.canonical,
+      };
+    }),
+    attestations: slot.attestations.map(parsePlanAttestation),
+  };
+}
+
+function parsePlanAttestation(attestation: PlanAttestationWire): PlanAttestation {
+  return {
+    aggregationBits: parseHexBytes(attestation.aggregation_bits),
+    committeeBits: attestation.committee_bits == null ? null : parseHexBytes(attestation.committee_bits),
+    data: {
+      slot: attestation.data.slot,
+      index: attestation.data.index,
+      beaconBlockRoot: parseRootHex(attestation.data.beacon_block_root),
+      source: parsePlanCheckpoint(attestation.data.source),
+      target: parsePlanCheckpoint(attestation.data.target),
+    },
+  };
+}
+
+function parsePlanCheckpoint(checkpoint: PlanCheckpointWire): PlanCheckpoint {
+  return {
+    epoch: checkpoint.epoch,
+    root: parseRootHex(checkpoint.root),
+  };
+}
+
+function parseRootHex(value: string): Uint8Array {
+  const root = parseHexBytes(value);
+  if (root.length !== 32) {
+    throw new Error(`expected 32-byte root hex string, got ${root.length} bytes`);
+  }
+  return root;
+}
+
+function parseHexBytes(value: string): Uint8Array {
+  if (typeof value !== "string") {
+    throw new Error(`expected hex string, got ${typeof value}`);
+  }
+  const hex = value.startsWith("0x") ? value.slice(2) : value;
+  if (hex.length % 2 !== 0) {
+    throw new Error("expected even-length hex string");
+  }
+  if (!/^[0-9a-fA-F]*$/.test(hex)) {
+    throw new Error("invalid hex string");
+  }
+  return fromHex(hex);
 }
 
 interface BlockFetch {
   block: SignedBeaconBlock;
   fork: ForkName;
-  forkSeq: ForkSeq;
 }
 
 class BlockFetcher {
@@ -210,9 +342,8 @@ class BlockFetcher {
     try {
       const {body, consensusVersion} = await fetchSsz(`${this.baseUrl}/eth/v2/beacon/blocks/${slot}`);
       const fork = this.resolveForkAtSlot(slot, consensusVersion);
-      const forkSeq = this.config.getForkSeq(slot);
       const block = sszTypesFor(fork).SignedBeaconBlock.deserialize(body) as SignedBeaconBlock;
-      const out = {block, fork, forkSeq};
+      const out = {block, fork};
       this.cache.set(slot, out);
       return out;
     } catch (err) {
@@ -232,21 +363,21 @@ class BlockFetcher {
     }
   }
 
-  async fetchByRoot(root: Uint8Array): Promise<BlockFetch> {
+  async fetchByRoot(root: Uint8Array, slot: number): Promise<BlockFetch> {
     const url = `${this.baseUrl}/eth/v2/beacon/blocks/${toRootHex(root)}`;
     const {body, consensusVersion} = await fetchSsz(url);
-    let fork: ForkName;
-    if (consensusVersion && this.isForkName(consensusVersion)) {
-      fork = consensusVersion as ForkName;
-    } else {
-      // Fallback: deserialize as latest and re-read slot
-      // Try with a guess and then re-deserialize via correct fork
-      const tentative = ssz.deneb.SignedBeaconBlock.deserialize(body);
-      fork = this.config.getForkName(tentative.message.slot);
-    }
-    const forkSeq = ForkSeq[fork];
+    const fork = this.resolveForkAtSlot(slot, consensusVersion);
     const block = sszTypesFor(fork).SignedBeaconBlock.deserialize(body) as SignedBeaconBlock;
-    return {block, fork, forkSeq};
+    return {block, fork};
+  }
+
+  async fetchByRootOptional(root: Uint8Array, slot: number): Promise<BlockFetch | null> {
+    try {
+      return await this.fetchByRoot(root, slot);
+    } catch (err) {
+      if (err instanceof NotFoundError) return null;
+      throw err;
+    }
   }
 
   private resolveForkAtSlot(slot: number, consensusVersion: string | null): ForkName {
@@ -324,7 +455,13 @@ function toMiB(bytes: number): number {
 }
 
 async function main(): Promise<void> {
-  const parsed = parseArgs(process.argv.slice(2));
+  let parsed: ParseResult;
+  try {
+    parsed = parseArgs(process.argv.slice(2));
+  } catch (err) {
+    process.stderr.write(`configuration error: ${formatError(err)}\n`);
+    process.exit(1);
+  }
   if (parsed.kind === "manifest") {
     printManifest();
     process.exit(0);
@@ -352,7 +489,6 @@ interface BootstrapResult {
   beaconConfig: BeaconConfig;
   forkChoice: ForkChoice;
   fetcher: BlockFetcher;
-  plan: Map<number, number | null>;
   stateCache: StateCache;
   debug: DebugTracer;
   headStateRef: {state: CachedBeaconStateAllForks};
@@ -391,6 +527,11 @@ function trimMap<K, V>(map: Map<K, V>, limit: number): void {
 type StateCacheEntry = {
   slot: number;
   state: CachedBeaconStateAllForks;
+};
+
+type ImportedPostStateCacheEntry = StateCacheEntry & {
+  blockRootHex: RootHex;
+  stateRootHex: RootHex;
 };
 
 type CheckpointStateCacheEntry = {
@@ -465,6 +606,9 @@ class DebugTracer {
 
 class StateCache {
   private readonly stateByStateRoot = new Map<RootHex, StateCacheEntry>();
+  private readonly importedPostStateByBlockRoot = new Map<RootHex, ImportedPostStateCacheEntry>();
+  private readonly importedPostStateByStateRoot = new Map<RootHex, ImportedPostStateCacheEntry>();
+  private readonly importedBlockRootsByStateRoot = new Map<RootHex, Set<RootHex>>();
   private readonly stateByCheckpointKey = new Map<string, CheckpointStateCacheEntry>();
   private readonly evictedStateRoots = new Map<RootHex, {slot: number; evictedAtSlot: number}>();
   private readonly evictedCheckpoints = new Map<string, {epoch: number; evictedAtSlot: number}>();
@@ -476,9 +620,31 @@ class StateCache {
     this.evictedStateRoots.delete(rootHex);
   }
 
+  setImportedPostState(
+    blockRootHex: RootHex,
+    stateRootHex: RootHex,
+    slot: number,
+    state: CachedBeaconStateAllForks,
+  ): void {
+    const existing = this.importedPostStateByBlockRoot.get(blockRootHex);
+    if (existing) {
+      this.importedPostStateByBlockRoot.delete(blockRootHex);
+      this.removeImportedStateRootRef(existing);
+      this.repointImportedStateRoot(existing);
+    }
+
+    // Lighthouse-store substitute: retain imported post-states until fork-choice finalization prunes them away.
+    const entry = {blockRootHex, stateRootHex, slot, state};
+    this.importedPostStateByBlockRoot.set(blockRootHex, entry);
+    this.importedPostStateByStateRoot.set(stateRootHex, entry);
+    this.addImportedStateRootRef(entry);
+  }
+
   getStateRoot(rootHex: RootHex): CachedBeaconStateAllForks | null {
     const entry = this.stateByStateRoot.get(rootHex);
     if (entry) return entry.state;
+    const imported = this.importedPostStateByStateRoot.get(rootHex);
+    if (imported) return imported.state;
     const evicted = this.evictedStateRoots.get(rootHex);
     this.debug.cache("state_cache_miss", {
       kind: "state_root",
@@ -486,6 +652,20 @@ class StateCache {
       evictedSlot: evicted?.slot,
       evictedAtSlot: evicted?.evictedAtSlot,
       stateRoots: this.stateByStateRoot.size,
+      importedBlockStates: this.importedPostStateByBlockRoot.size,
+      checkpoints: this.stateByCheckpointKey.size,
+    });
+    return null;
+  }
+
+  getImportedBlockPostState(blockRootHex: RootHex): CachedBeaconStateAllForks | null {
+    const entry = this.importedPostStateByBlockRoot.get(blockRootHex);
+    if (entry) return entry.state;
+    this.debug.cache("state_cache_miss", {
+      kind: "imported_block",
+      blockRootHex,
+      stateRoots: this.stateByStateRoot.size,
+      importedBlockStates: this.importedPostStateByBlockRoot.size,
       checkpoints: this.stateByCheckpointKey.size,
     });
     return null;
@@ -516,6 +696,7 @@ class StateCache {
       evictedEpoch: evicted?.epoch,
       evictedAtSlot: evicted?.evictedAtSlot,
       stateRoots: this.stateByStateRoot.size,
+      importedBlockStates: this.importedPostStateByBlockRoot.size,
       checkpoints: this.stateByCheckpointKey.size,
     });
     return null;
@@ -534,6 +715,7 @@ class StateCache {
           currentSlot,
           minStateSlot,
           stateRoots: this.stateByStateRoot.size,
+          importedBlockStates: this.importedPostStateByBlockRoot.size,
           checkpoints: this.stateByCheckpointKey.size,
         });
       }
@@ -551,8 +733,65 @@ class StateCache {
           currentSlot,
           minCheckpointEpoch,
           stateRoots: this.stateByStateRoot.size,
+          importedBlockStates: this.importedPostStateByBlockRoot.size,
           checkpoints: this.stateByCheckpointKey.size,
         });
+      }
+    }
+  }
+
+  pruneFinalizedBlocks(prunedBlocks: ProtoBlock[], currentSlot: number): void {
+    for (const block of prunedBlocks) {
+      this.deleteImportedPostState(block.blockRoot, currentSlot);
+    }
+  }
+
+  private addImportedStateRootRef(entry: ImportedPostStateCacheEntry): void {
+    let blockRoots = this.importedBlockRootsByStateRoot.get(entry.stateRootHex);
+    if (!blockRoots) {
+      blockRoots = new Set();
+      this.importedBlockRootsByStateRoot.set(entry.stateRootHex, blockRoots);
+    }
+    blockRoots.add(entry.blockRootHex);
+  }
+
+  private removeImportedStateRootRef(entry: ImportedPostStateCacheEntry): void {
+    const blockRoots = this.importedBlockRootsByStateRoot.get(entry.stateRootHex);
+    if (!blockRoots) return;
+    blockRoots.delete(entry.blockRootHex);
+    if (blockRoots.size === 0) {
+      this.importedBlockRootsByStateRoot.delete(entry.stateRootHex);
+    }
+  }
+
+  private deleteImportedPostState(blockRootHex: RootHex, currentSlot: number): void {
+    const entry = this.importedPostStateByBlockRoot.get(blockRootHex);
+    if (!entry) return;
+
+    this.importedPostStateByBlockRoot.delete(blockRootHex);
+    this.removeImportedStateRootRef(entry);
+    this.repointImportedStateRoot(entry);
+
+    this.debug.cache("state_cache_evict", {
+      kind: "imported_block",
+      blockRootHex,
+      stateRootHex: entry.stateRootHex,
+      slot: entry.slot,
+      currentSlot,
+      stateRoots: this.stateByStateRoot.size,
+      importedBlockStates: this.importedPostStateByBlockRoot.size,
+      checkpoints: this.stateByCheckpointKey.size,
+    });
+  }
+
+  private repointImportedStateRoot(entry: ImportedPostStateCacheEntry): void {
+    if (this.importedPostStateByStateRoot.get(entry.stateRootHex) === entry) {
+      const replacementRoot = this.importedBlockRootsByStateRoot.get(entry.stateRootHex)?.values().next().value;
+      const replacement = replacementRoot ? this.importedPostStateByBlockRoot.get(replacementRoot) : undefined;
+      if (replacement) {
+        this.importedPostStateByStateRoot.set(entry.stateRootHex, replacement);
+      } else {
+        this.importedPostStateByStateRoot.delete(entry.stateRootHex);
       }
     }
   }
@@ -651,21 +890,14 @@ async function bootstrapEngine(cfg: CliConfig): Promise<BootstrapResult> {
   // Seed the checkpoint-state cache: the anchor state is the justified+finalized
   // checkpoint state at bootstrap.
   const anchor = bootstrapStateView.computeAnchorCheckpoint();
-  stateCache.setCheckpoint(anchor.checkpoint.epoch, toRootHex(anchor.checkpoint.root), PayloadStatus.FULL, cachedState);
-
-  // 5. Fetch plan
-  const plan = await fetchPlan(cfg.beaconNodeUrl, cfg.warmupStartSlot + 1, cfg.endSlot);
-  for (let s = cfg.warmupStartSlot + 1; s < cfg.endSlot; s++) {
-    if (!plan.has(s)) {
-      throw new Error(`attestation plan missing sim_slot ${s}`);
-    }
-  }
+  const anchorBlockRoot = toRootHex(anchor.checkpoint.root);
+  stateCache.setImportedPostState(anchorBlockRoot, anchorStateRoot, cachedState.slot, cachedState);
+  stateCache.setCheckpoint(anchor.checkpoint.epoch, anchorBlockRoot, PayloadStatus.FULL, cachedState);
 
   return {
     beaconConfig,
     forkChoice,
     fetcher,
-    plan,
     stateCache,
     debug,
     headStateRef,
@@ -747,7 +979,7 @@ function initializeForkChoiceFromAnchor(args: {
 async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void> {
   const writer = new JsonlWriter(cfg.output);
   const memory = new MemoryTracker();
-  const {forkChoice, fetcher, plan, stateCache, debug, headStateRef, headStateRootRef} = boot;
+  const {forkChoice, fetcher, stateCache, debug, headStateRef, headStateRootRef} = boot;
 
   try {
     let slot = cfg.warmupStartSlot + 1;
@@ -758,55 +990,29 @@ async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void>
       debug.setPhase("pre_slot_update", slot, slot);
       forkChoice.updateTime(slot);
 
-      const blockFetch = await fetcher.fetchAtSlot(slot);
-      const hasBlock = blockFetch !== null;
-      let blockRootHex: string | null = null;
-      if (blockFetch) {
-        try {
-          const postState = processBlock(headStateRef.state, blockFetch);
-          const postStateRoot = toRootHex(blockFetch.block.message.stateRoot);
-          stateCache.setStateRoot(postStateRoot, slot, postState);
-          // Apply block to fork choice
-          const protoBlock = forkChoice.onBlock(
-            blockFetch.block.message,
-            new BeaconStateView(postState),
-            0,
-            slot,
-            ExecutionStatus.Valid,
-            DataAvailabilityStatus.Available,
-          );
-          blockRootHex = protoBlock.blockRoot;
-          headStateRef.state = postState;
-          headStateRootRef.rootHex = postStateRoot;
+      const instruction = await fetchSlotInstruction(cfg.beaconNodeUrl, slot, cfg.warmupStartSlot);
+      const {hasBlock, blockRootHex} = await importPlannedBlocks(slot, instruction.importBlocks, {
+        forkChoice,
+        fetcher,
+        stateCache,
+        headStateRef,
+        headStateRootRef,
+      });
 
-          // If this block is an epoch boundary, cache it as a potential checkpoint
-          // state under FULL payload status to satisfy FCR lookups.
-          if (slot % 32 === 0) {
-            const epoch = computeEpochAtSlot(slot);
-            stateCache.setCheckpoint(epoch, protoBlock.blockRoot, PayloadStatus.FULL, postState);
-          }
-        } catch (err) {
-          throw new Error(`failed to process block at slot ${slot}: ${formatError(err)}`);
-        }
-      }
+      const numAttestationsInjected = injectPlannedAttestations(
+        forkChoice,
+        headStateRef.state,
+        instruction.attestations,
+        slot + 1,
+      );
 
-      const sourceSlot = plan.get(slot) ?? null;
-      let numAttestationsInjected = 0;
-      if (sourceSlot !== null && sourceSlot !== undefined) {
-        const sourceBlock = await fetcher.fetchAtSlot(sourceSlot);
-        if (!sourceBlock) {
-          throw new Error(`plan referenced missing source block at slot ${sourceSlot}`);
-        }
-        numAttestationsInjected = injectAttestationsFromSource(forkChoice, headStateRef.state, sourceBlock, slot + 1);
-      }
-
-      // Recompute head + run FCR at slot+1
+      // Recompute head + run FCR at the instruction eval slot.
+      debug.setPhase("post_attestation_update", slot, instruction.evalSlot);
       const fcrStart = hrtime.bigint();
-      debug.setPhase("post_attestation_update", slot, slot + 1);
-      forkChoice.updateTime(slot + 1);
-      debug.setPhase("record_head", slot, slot + 1);
+      forkChoice.updateTime(instruction.evalSlot);
       const head = forkChoice.updateHead();
       const fcrEvalUs = microsSince(fcrStart);
+      debug.setPhase("record_head", slot, instruction.evalSlot);
 
       if (isRecording) {
         writer.write(buildRecord({
@@ -815,7 +1021,6 @@ async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void>
           hasBlock,
           blockRootHex,
           headRoot: head.blockRoot,
-          sourceBlockSlot: sourceSlot,
           numAttestationsInjected,
           fcrEvalUs,
         }));
@@ -823,7 +1028,8 @@ async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void>
 
       const finalized = forkChoice.getFinalizedCheckpoint();
       if (finalized.rootHex !== lastPrunedFinalizedRoot) {
-        forkChoice.prune(finalized.rootHex);
+        const prunedBlocks = forkChoice.prune(finalized.rootHex);
+        stateCache.pruneFinalizedBlocks(prunedBlocks, slot);
         lastPrunedFinalizedRoot = finalized.rootHex;
       }
       debug.setPhase("prune", slot);
@@ -840,6 +1046,158 @@ async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void>
   }
 }
 
+interface ImportPlannedBlocksContext {
+  forkChoice: ForkChoice;
+  fetcher: BlockFetcher;
+  stateCache: StateCache;
+  headStateRef: {state: CachedBeaconStateAllForks};
+  headStateRootRef: {rootHex: RootHex};
+}
+
+async function importPlannedBlocks(
+  simSlot: number,
+  imports: PlanBlockImport[],
+  ctx: ImportPlannedBlocksContext,
+): Promise<{hasBlock: boolean; blockRootHex: string | null}> {
+  const canonicalRoot = imports.find((planned) => planned.canonical && planned.slot === simSlot)?.rootHex ?? null;
+
+  for (const planned of imports) {
+    const blockFetch = await fetchPlannedBlock(planned, ctx.fetcher);
+    if (!blockFetch) continue;
+
+    verifyPlannedBlock(blockFetch, planned);
+
+    if (ctx.forkChoice.hasBlockHexUnsafe(planned.rootHex)) {
+      warn(
+        `planned block root=${planned.rootHex} slot=${planned.slot} already known; skipping duplicate import`,
+      );
+      continue;
+    }
+
+    const parentPostState = planned.canonical
+      ? ctx.headStateRef.state
+      : resolveOrphanParentPostState(planned, blockFetch, ctx);
+    if (!parentPostState) continue;
+
+    try {
+      const postState = processBlock(parentPostState, blockFetch);
+      const postStateRoot = toRootHex(blockFetch.block.message.stateRoot);
+      stateCacheImport(
+        ctx,
+        blockFetch,
+        postState,
+        postStateRoot,
+        simSlot,
+        planned.canonical && planned.slot === simSlot,
+      );
+    } catch (err) {
+      if (planned.canonical) {
+        throw new Error(`failed to process canonical block at slot ${planned.slot}: ${formatError(err)}`);
+      }
+      warn(
+        `planned non-canonical block import failed root=${planned.rootHex} slot=${planned.slot} error=${formatError(err)}`,
+      );
+    }
+  }
+
+  return {hasBlock: canonicalRoot !== null, blockRootHex: canonicalRoot};
+}
+
+async function fetchPlannedBlock(planned: PlanBlockImport, fetcher: BlockFetcher): Promise<BlockFetch | null> {
+  if (planned.canonical) {
+    const block = await fetcher.fetchAtSlot(planned.slot);
+    if (!block) {
+      throw new Error(`planned canonical block at slot ${planned.slot} was not found`);
+    }
+    return block;
+  }
+
+  const block = await fetcher.fetchByRootOptional(planned.root, planned.slot);
+  if (!block) {
+    warn(`planned non-canonical block was not found; skipping root=${planned.rootHex} slot=${planned.slot}`);
+  }
+  return block;
+}
+
+function verifyPlannedBlock(blockFetch: BlockFetch, planned: PlanBlockImport): void {
+  const blockRootHex = toRootHex(sszTypesFor(blockFetch.fork).BeaconBlock.hashTreeRoot(blockFetch.block.message));
+  if (blockRootHex !== planned.rootHex) {
+    throw new Error(
+      `planned block root mismatch for slot ${planned.slot}: plan ${planned.rootHex}, fetched ${blockRootHex}`,
+    );
+  }
+  if (blockFetch.block.message.slot !== planned.slot) {
+    throw new Error(
+      `planned block slot mismatch for root ${planned.rootHex}: plan ${planned.slot}, fetched ${blockFetch.block.message.slot}`,
+    );
+  }
+}
+
+function resolveOrphanParentPostState(
+  planned: PlanBlockImport,
+  blockFetch: BlockFetch,
+  ctx: ImportPlannedBlocksContext,
+): CachedBeaconStateAllForks | null {
+  const parentRootHex = toRootHex(blockFetch.block.message.parentRoot);
+  const parentProto = ctx.forkChoice.getBlockHexDefaultStatus(parentRootHex);
+  if (!parentProto) {
+    warn(
+      `planned non-canonical block missing parent proto; skipping root=${planned.rootHex} slot=${planned.slot} parent=${parentRootHex}`,
+    );
+    return null;
+  }
+
+  const parentPostState =
+    ctx.stateCache.getImportedBlockPostState(parentRootHex) ??
+    (ctx.forkChoice.getHead().blockRoot === parentRootHex ? ctx.headStateRef.state : null) ??
+    ctx.stateCache.getStateRoot(parentProto.stateRoot);
+  if (!parentPostState) {
+    warn(
+      `planned non-canonical block missing parent post-state; skipping root=${planned.rootHex} slot=${planned.slot} parent=${parentRootHex} parent_state_root=${parentProto.stateRoot}`,
+    );
+    return null;
+  }
+
+  return parentPostState;
+}
+
+function stateCacheImport(
+  ctx: ImportPlannedBlocksContext,
+  blockFetch: BlockFetch,
+  postState: CachedBeaconStateAllForks,
+  postStateRoot: RootHex,
+  simSlot: number,
+  advancesHead: boolean,
+): void {
+  const blockSlot = blockFetch.block.message.slot;
+  ctx.stateCache.setStateRoot(postStateRoot, blockSlot, postState);
+  const protoBlock = ctx.forkChoice.onBlock(
+    blockFetch.block.message,
+    new BeaconStateView(postState),
+    0,
+    simSlot,
+    ExecutionStatus.Valid,
+    DataAvailabilityStatus.Available,
+  );
+  ctx.stateCache.setImportedPostState(protoBlock.blockRoot, postStateRoot, blockSlot, postState);
+
+  // If this block is an epoch boundary, cache it as a potential checkpoint
+  // state under FULL payload status to satisfy FCR lookups.
+  if (blockSlot % 32 === 0) {
+    const epoch = computeEpochAtSlot(blockSlot);
+    ctx.stateCache.setCheckpoint(epoch, protoBlock.blockRoot, PayloadStatus.FULL, postState);
+  }
+
+  if (advancesHead) {
+    ctx.headStateRef.state = postState;
+    ctx.headStateRootRef.rootHex = postStateRoot;
+  }
+}
+
+function warn(message: string): void {
+  process.stderr.write(`[fcr-lodestar] ${message}\n`);
+}
+
 function processBlock(
   preState: CachedBeaconStateAllForks,
   blockFetch: BlockFetch,
@@ -853,29 +1211,30 @@ function processBlock(
   });
 }
 
-function injectAttestationsFromSource(
+function injectPlannedAttestations(
   forkChoice: ForkChoice,
   headState: CachedBeaconStateAllForks,
-  sourceBlock: BlockFetch,
+  attestations: PlanAttestation[],
   injectSlot: number,
 ): number {
-  const attestations = sourceBlock.block.message.body.attestations as Attestation[];
   if (attestations.length === 0) return 0;
 
   let injected = 0;
-  for (const attestation of attestations) {
+  for (const planned of attestations) {
+    const fork = headState.config.getForkName(planned.data.slot);
+    const forkSeq = headState.config.getForkSeq(planned.data.slot);
+    const attestation = buildPlannedAttestation(planned, forkSeq);
+
     let indexed: IndexedAttestation;
     try {
-      indexed = headState.epochCtx.getIndexedAttestation(sourceBlock.forkSeq, attestation);
+      indexed = headState.epochCtx.getIndexedAttestation(forkSeq, attestation);
     } catch {
-      // Source block's epoch shuffling not available in head state's epoch context
+      // Planned attestation's epoch shuffling not available in head state's epoch context
       // (e.g. attestation references a far-future or far-past epoch). Skip and warn.
       continue;
     }
     if (indexed.attestingIndices.length === 0) continue;
-    const attDataRoot = toRootHex(
-      sszTypesFor(sourceBlock.fork).AttestationData.hashTreeRoot(attestation.data),
-    );
+    const attDataRoot = toRootHex(sszTypesFor(fork).AttestationData.hashTreeRoot(attestation.data));
     try {
       injectAttestationAtSlot(forkChoice, indexed, attDataRoot, injectSlot);
       injected++;
@@ -884,6 +1243,40 @@ function injectAttestationsFromSource(
     }
   }
   return injected;
+}
+
+function buildPlannedAttestation(planned: PlanAttestation, forkSeq: ForkSeq): Attestation {
+  const data = {
+    slot: planned.data.slot,
+    index: planned.data.index,
+    beaconBlockRoot: planned.data.beaconBlockRoot,
+    source: {
+      epoch: planned.data.source.epoch,
+      root: planned.data.source.root,
+    },
+    target: {
+      epoch: planned.data.target.epoch,
+      root: planned.data.target.root,
+    },
+  };
+
+  if (forkSeq >= ForkSeq.electra) {
+    if (planned.committeeBits === null) {
+      throw new Error("electra attestation is missing committee_bits");
+    }
+    return {
+      aggregationBits: ssz.electra.AggregationBits.deserialize(planned.aggregationBits),
+      data,
+      signature: G2_POINT_AT_INFINITY,
+      committeeBits: ssz.electra.CommitteeBits.deserialize(planned.committeeBits),
+    } as Attestation;
+  }
+
+  return {
+    aggregationBits: ssz.phase0.CommitteeBits.deserialize(planned.aggregationBits),
+    data,
+    signature: G2_POINT_AT_INFINITY,
+  } as Attestation;
 }
 
 type ForkChoiceWithInternals = ForkChoice & {
@@ -986,28 +1379,25 @@ interface BuildRecordArgs {
   hasBlock: boolean;
   blockRootHex: string | null;
   headRoot: string;
-  sourceBlockSlot: number | null | undefined;
   numAttestationsInjected: number;
   fcrEvalUs: number;
 }
 
 function buildRecord(args: BuildRecordArgs): Record<string, unknown> {
-  const {forkChoice, slot, hasBlock, blockRootHex, headRoot, sourceBlockSlot, numAttestationsInjected, fcrEvalUs} = args;
+  const {forkChoice, slot, hasBlock, blockRootHex, headRoot, numAttestationsInjected, fcrEvalUs} = args;
   const confirmedRoot = forkChoice.getConfirmedRoot();
   const confirmedBlock = forkChoice.getBlockHexDefaultStatus(confirmedRoot);
   const confirmedSlot = confirmedBlock?.slot ?? 0;
-  const confirmedRootOut = isZeroRoot(confirmedRoot) ? ZERO_ROOT_HEX : confirmedRoot;
-  const effectiveConfirmedRoot = confirmedBlock ? confirmedRoot : ZERO_ROOT_HEX;
   const finalized = forkChoice.getFinalizedCheckpoint();
   const justified = forkChoice.getJustifiedCheckpoint();
 
-  const fastConfirmed = effectiveConfirmedRoot !== ZERO_ROOT_HEX && confirmedSlot === slot;
+  const fastConfirmed = !isZeroRoot(confirmedRoot) && confirmedSlot === slot;
   const evalSlot = slot + 1;
   const delay = evalSlot >= confirmedSlot ? evalSlot - confirmedSlot : 0;
   const strictOneSlotConfirmed =
     hasBlock &&
-    effectiveConfirmedRoot !== ZERO_ROOT_HEX &&
-    blockRootHex === effectiveConfirmedRoot &&
+    !isZeroRoot(confirmedRoot) &&
+    blockRootHex === confirmedRoot &&
     confirmedSlot === slot &&
     delay === 1;
 
@@ -1017,14 +1407,14 @@ function buildRecord(args: BuildRecordArgs): Record<string, unknown> {
     has_block: hasBlock,
     block_root: blockRootHex,
     head_root: headRoot,
-    confirmed_root: confirmedRootOut === ZERO_ROOT_HEX ? ZERO_ROOT_HEX : effectiveConfirmedRoot,
+    confirmed_root: isZeroRoot(confirmedRoot) ? ZERO_ROOT_HEX : confirmedRoot,
     confirmed_slot: confirmedSlot,
     confirmation_delay_slots: delay,
     fast_confirmed: fastConfirmed,
     strict_one_slot_confirmed: strictOneSlotConfirmed,
     finalized_epoch: finalized.epoch,
     justified_epoch: justified.epoch,
-    source_block_slot: sourceBlockSlot ?? null,
+    source_block_slot: null,
     num_attestations_injected: numAttestationsInjected,
     is_epoch_boundary: slot % 32 === 0,
     is_missed_slot: !hasBlock,
