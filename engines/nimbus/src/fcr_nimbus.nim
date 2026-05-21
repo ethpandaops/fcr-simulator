@@ -648,18 +648,54 @@ proc decodeElectraCommitteeBits(bytes: seq[byte]):
   except CatchableError as e:
     err("failed to decode electra committee_bits: " & e.msg)
 
+proc logFailedAttestationInjection(self: Engine, simSlot: Slot,
+    data: AttestationData, reason: string) =
+  let
+    targetRoot = data.target.root
+    headRoot = data.beacon_block_root
+    targetInFc = self.attPool[].forkChoice.backend.contains(targetRoot)
+    headInFc = self.attPool[].forkChoice.backend.contains(headRoot)
+    finalized = self.attPool[].forkChoice.checkpoints.finalized
+  stderr.writeLine "[fcr-nimbus] failed to inject attestation for sim_slot " &
+    $simSlot.uint64 & " attestation_slot " & $data.slot.uint64 &
+    " error " & reason &
+    " target_root 0x" & targetRoot.data.toHex() &
+    " target_in_fc " & $targetInFc &
+    " head_root 0x" & headRoot.data.toHex() &
+    " head_in_fc " & $headInFc &
+    " finalized_epoch " & $finalized.epoch.uint64 &
+    " finalized_root 0x" & finalized.root.data.toHex()
+
 proc injectForkChoiceAttestation(self: Engine, simSlot: Slot,
     data: AttestationData, attestingIndices: seq[ValidatorIndex]):
     bool =
   let
+    targetRoot = data.target.root
+    headRoot = data.beacon_block_root
+    targetInFc = self.attPool[].forkChoice.backend.contains(targetRoot)
+    headInFc = self.attPool[].forkChoice.backend.contains(headRoot)
     injectSlot = simSlot + 1
     wallTime = injectSlot.start_beacon_time(self.dag.timeParams)
+
+  # Lighthouse accepts zero-head attestations without applying them to fork
+  # choice; do the same instead of letting Nimbus record a zero latest vote.
+  if headRoot.isZero:
+    return true
+
+  if not targetInFc or not headInFc:
+    let reason =
+      if not targetInFc:
+        "InvalidAttestation(UnknownTargetRoot)"
+      else:
+        "InvalidAttestation(UnknownHeadBlock)"
+    self.logFailedAttestationInjection(simSlot, data, reason)
+    return false
+
+  let
     res = self.attPool[].forkChoice.on_attestation(
       self.dag, data.slot, data.beacon_block_root, attestingIndices, wallTime)
   if res.isErr:
-    stderr.writeLine "[fcr-nimbus] failed to inject attestation for sim_slot " &
-      $simSlot.uint64 & " attestation_slot " & $data.slot.uint64 &
-      " root 0x" & data.beacon_block_root.data.toHex() & ": " & $res.error
+    self.logFailedAttestationInjection(simSlot, data, $res.error)
     return false
   true
 
