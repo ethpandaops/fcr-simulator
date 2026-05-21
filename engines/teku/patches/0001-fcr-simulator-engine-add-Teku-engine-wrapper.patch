@@ -1,21 +1,23 @@
-From fd821fbe5f3317479dfcd4b6442dbef30f590624 Mon Sep 17 00:00:00 2001
+From 37abfead8271630039c3d37d7dbe0c413d6e06a2 Mon Sep 17 00:00:00 2001
 From: Codex <codex@example.invalid>
-Date: Fri, 15 May 2026 20:22:43 +1000
-Subject: [PATCH] fcr-simulator-engine: add Teku engine wrapper
+Date: Thu, 21 May 2026 22:45:17 +1000
+Subject: [PATCH 1/2] fcr-simulator-engine: add Teku engine wrapper (FCR v2
+ per-slot interface)
 
 ---
  fcr-simulator-engine/build.gradle             |  69 +++
- .../forkchoice/FcrForkChoiceAccess.java       |  59 +++
- .../forkchoice/fcr/Config.java                |  94 ++++
- .../forkchoice/fcr/Engine.java                | 430 ++++++++++++++++++
- .../forkchoice/fcr/HttpClient.java            | 107 +++++
- .../statetransition/forkchoice/fcr/Main.java  | 111 +++++
- .../forkchoice/fcr/OutputWriter.java          |  65 +++
- .../forkchoice/fcr/PlanFetcher.java           |  55 +++
- .../forkchoice/fcr/SlotResult.java            |  55 +++
+ .../forkchoice/FcrForkChoiceAccess.java       |  59 ++
+ .../forkchoice/fcr/Config.java                |  85 +++
+ .../forkchoice/fcr/Engine.java                | 575 ++++++++++++++++++
+ .../forkchoice/fcr/HttpClient.java            | 102 ++++
+ .../statetransition/forkchoice/fcr/Main.java  | 111 ++++
+ .../forkchoice/fcr/OutputWriter.java          |  65 ++
+ .../forkchoice/fcr/SlotInstruction.java       |  75 +++
+ .../fcr/SlotInstructionFetcher.java           | 171 ++++++
+ .../forkchoice/fcr/SlotResult.java            |  55 ++
  .../src/main/resources/log4j2-fcr.xml         |  13 +
  settings.gradle                               |   1 +
- 11 files changed, 1059 insertions(+)
+ 12 files changed, 1381 insertions(+)
  create mode 100644 fcr-simulator-engine/build.gradle
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
@@ -23,7 +25,8 @@ Subject: [PATCH] fcr-simulator-engine: add Teku engine wrapper
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java
- create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/PlanFetcher.java
+ create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java
+ create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstructionFetcher.java
  create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotResult.java
  create mode 100644 fcr-simulator-engine/src/main/resources/log4j2-fcr.xml
 
@@ -169,10 +172,10 @@ index 0000000000..e4727352a6
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
 new file mode 100644
-index 0000000000..43ebedc15e
+index 0000000000..1fa59249d3
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,85 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -199,8 +202,6 @@ index 0000000000..43ebedc15e
 +    long warmupStartSlot,
 +    String network,
 +    long byzantineThreshold,
-+    String attestationSourceMode,
-+    long lookaheadCap,
 +    Path output) {
 +
 +  static Config parse(final String[] args) {
@@ -227,8 +228,6 @@ index 0000000000..43ebedc15e
 +            parseLong(required(values, "warmup-start-slot"), "warmup-start-slot"),
 +            required(values, "network"),
 +            parseLong(values.getOrDefault("byzantine-threshold", "25"), "byzantine-threshold"),
-+            required(values, "attestation-source-mode"),
-+            parseLong(required(values, "lookahead-cap"), "lookahead-cap"),
 +            Path.of(required(values, "output")));
 +    cfg.validate();
 +    return cfg;
@@ -237,11 +236,6 @@ index 0000000000..43ebedc15e
 +  private void validate() {
 +    if (!network.equals("mainnet")) {
 +      throw new IllegalArgumentException("--network=" + network + " is not supported");
-+    }
-+    if (!attestationSourceMode.equals("next-non-missed")
-+        && !attestationSourceMode.equals("strict-source-block-k-minus-1")) {
-+      throw new IllegalArgumentException(
-+          "--attestation-source-mode=" + attestationSourceMode + " is not supported");
 +    }
 +    if (warmupStartSlot > startSlot) {
 +      throw new IllegalArgumentException("--warmup-start-slot must be <= --start-slot");
@@ -269,10 +263,10 @@ index 0000000000..43ebedc15e
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
 new file mode 100644
-index 0000000000..361421b4f2
+index 0000000000..62bbdc7255
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
-@@ -0,0 +1,430 @@
+@@ -0,0 +1,575 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -295,10 +289,13 @@ index 0000000000..361421b4f2
 +import com.google.common.io.RecursiveDeleteOption;
 +
 +import tech.pegasys.teku.bls.BLSConstants;
++import tech.pegasys.teku.bls.BLSSignature;
 +import tech.pegasys.teku.bls.BLSSignatureVerifier;
 +import tech.pegasys.teku.infrastructure.async.SafeFuture;
 +import tech.pegasys.teku.infrastructure.async.eventthread.InlineEventThread;
 +import tech.pegasys.teku.infrastructure.metrics.StubMetricsSystem;
++import tech.pegasys.teku.infrastructure.ssz.collections.SszBitlist;
++import tech.pegasys.teku.infrastructure.ssz.collections.SszBitvector;
 +import tech.pegasys.teku.infrastructure.unsigned.UInt64;
 +import tech.pegasys.teku.kzg.KZG;
 +import tech.pegasys.teku.spec.Spec;
@@ -309,8 +306,11 @@ index 0000000000..361421b4f2
 +import tech.pegasys.teku.spec.datastructures.blocks.SignedBlockAndState;
 +import tech.pegasys.teku.spec.datastructures.execution.ExecutionPayloadContext;
 +import tech.pegasys.teku.spec.datastructures.operations.Attestation;
++import tech.pegasys.teku.spec.datastructures.operations.AttestationData;
++import tech.pegasys.teku.spec.datastructures.operations.AttestationSchema;
 +import tech.pegasys.teku.spec.datastructures.operations.IndexedAttestation;
 +import tech.pegasys.teku.spec.datastructures.state.AnchorPoint;
++import tech.pegasys.teku.spec.datastructures.state.Checkpoint;
 +import tech.pegasys.teku.spec.datastructures.state.beaconstate.BeaconState;
 +import tech.pegasys.teku.spec.executionlayer.ExecutionLayerChannelStub;
 +import tech.pegasys.teku.spec.executionlayer.ForkChoiceState;
@@ -338,6 +338,7 @@ index 0000000000..361421b4f2
 +import java.nio.file.Files;
 +import java.nio.file.Path;
 +import java.util.ArrayList;
++import java.util.HashMap;
 +import java.util.List;
 +import java.util.Map;
 +import java.util.Optional;
@@ -349,33 +350,35 @@ index 0000000000..361421b4f2
 +  private final Config cfg;
 +  private final Spec spec;
 +  private final HttpClient httpClient;
++  private final SlotInstructionFetcher slotInstructionFetcher;
 +  private final Path dataDir;
 +  private final StorageSystem storageSystem;
 +  private final RecentChainData recentChainData;
 +  private final ForkChoice forkChoice;
 +  private final ExecutionLayerChannelStub executionLayer;
-+  private final Map<UInt64, Optional<UInt64>> plan;
++  private final Map<UInt64, Optional<SignedBeaconBlock>> canonicalBlockCache;
 +  private final OutputWriter outputWriter;
 +
 +  private Engine(
 +      final Config cfg,
 +      final Spec spec,
 +      final HttpClient httpClient,
++      final SlotInstructionFetcher slotInstructionFetcher,
 +      final Path dataDir,
 +      final StorageSystem storageSystem,
 +      final ForkChoice forkChoice,
 +      final ExecutionLayerChannelStub executionLayer,
-+      final Map<UInt64, Optional<UInt64>> plan,
 +      final OutputWriter outputWriter) {
 +    this.cfg = cfg;
 +    this.spec = spec;
 +    this.httpClient = httpClient;
++    this.slotInstructionFetcher = slotInstructionFetcher;
 +    this.dataDir = dataDir;
 +    this.storageSystem = storageSystem;
 +    this.recentChainData = storageSystem.recentChainData();
 +    this.forkChoice = forkChoice;
 +    this.executionLayer = executionLayer;
-+    this.plan = plan;
++    this.canonicalBlockCache = new HashMap<>();
 +    this.outputWriter = outputWriter;
 +  }
 +
@@ -438,29 +441,23 @@ index 0000000000..361421b4f2
 +    recentChainData.initializeFromAnchorPoint(
 +        anchorPoint, spec.computeTimeAtSlot(anchorState, anchorState.getSlot()));
 +
-+    final PlanFetcher planFetcher = new PlanFetcher(httpClient);
-+    final Map<UInt64, Optional<UInt64>> plan =
-+        planFetcher.fetch(UInt64.valueOf(cfg.warmupStartSlot() + 1), UInt64.valueOf(cfg.endSlot()));
-+    validatePlan(plan, cfg);
 +    System.err.println(
 +        "engine bootstrap done: warmup_start_slot="
 +            + cfg.warmupStartSlot()
 +            + " start_slot="
 +            + cfg.startSlot()
 +            + " end_slot="
-+            + cfg.endSlot()
-+            + " plan_entries="
-+            + plan.size());
++            + cfg.endSlot());
 +
 +    return new Engine(
 +        cfg,
 +        spec,
 +        httpClient,
++        new SlotInstructionFetcher(httpClient),
 +        dataDir,
 +        storageSystem,
 +        forkChoice,
 +        executionLayer,
-+        plan,
 +        new OutputWriter(cfg.output()));
 +  }
 +
@@ -504,39 +501,154 @@ index 0000000000..361421b4f2
 +    final UInt64 slot = UInt64.valueOf(simSlot);
 +    final boolean isRecording = simSlot >= cfg.startSlot();
 +    advanceToSlot(slot);
-+    final Optional<SignedBeaconBlock> maybeBlock =
-+        httpClient.getBlock(slot).map(spec::deserializeSignedBeaconBlock);
-+    final boolean hasBlock = maybeBlock.isPresent();
-+    final Bytes32 blockRoot = maybeBlock.map(SignedBeaconBlock::getRoot).orElse(null);
-+
-+    if (maybeBlock.isPresent()) {
-+      final BlockImportResult result =
-+          forkChoice
-+              .onBlock(
-+                  maybeBlock.get(), Optional.empty(), BlockBroadcastValidator.NOOP, executionLayer)
-+              .join();
-+      if (!result.isSuccessful()) {
-+        throw new IllegalStateException(
-+            "block import failed at slot " + simSlot + ": " + result.getFailureReason());
-+      }
++    final SlotInstruction instruction =
++        slotInstructionFetcher.fetch(slot, UInt64.valueOf(cfg.warmupStartSlot()));
++    if (!instruction.simSlot().equals(slot)) {
++      throw new IOException(
++          "slot instruction sim_slot mismatch: requested "
++              + slot
++              + ", got "
++              + instruction.simSlot());
 +    }
 +
-+    final Optional<UInt64> sourceSlot = plan.get(slot);
-+    final int numInjected = injectSourceAttestations(sourceSlot);
++    final ImportedBlockInfo importedBlockInfo =
++        importPlannedBlocks(slot, instruction.importBlocks());
++    final int numInjected = injectAttestations(slot, instruction.attestations());
 +
-+    final UInt64 evalSlot = UInt64.valueOf(simSlot + 1);
++    final UInt64 evalSlot = instruction.evalSlot();
 +    advanceToSlot(evalSlot);
 +    final long t0 = System.nanoTime();
 +    FcrForkChoiceAccess.processHead(forkChoice, evalSlot).join();
 +    final long durationUs = (System.nanoTime() - t0) / 1_000;
 +
 +    if (simSlot % 32 == 0) {
-+      printSlotDiagnostic(slot, isRecording, hasBlock);
++      printSlotDiagnostic(slot, isRecording, importedBlockInfo.hasBlock());
 +    }
 +
 +    if (isRecording) {
 +      outputWriter.write(
-+          buildSlotResult(slot, hasBlock, blockRoot, sourceSlot, numInjected, durationUs));
++          buildSlotResult(
++              slot,
++              importedBlockInfo.hasBlock(),
++              importedBlockInfo.blockRoot(),
++              Optional.empty(),
++              numInjected,
++              durationUs));
++    }
++  }
++
++  private ImportedBlockInfo importPlannedBlocks(
++      final UInt64 simSlot, final List<SlotInstruction.BlockImport> importBlocks)
++      throws IOException, InterruptedException {
++    Bytes32 canonicalRoot = null;
++    for (final SlotInstruction.BlockImport importBlock : importBlocks) {
++      if (importBlock.canonical() && importBlock.slot().equals(simSlot)) {
++        canonicalRoot = importBlock.root();
++        break;
++      }
++    }
++
++    for (final SlotInstruction.BlockImport importBlock : importBlocks) {
++      final Optional<SignedBeaconBlock> maybeBlock = fetchPlannedBlock(importBlock);
++      if (maybeBlock.isEmpty()) {
++        continue;
++      }
++      final SignedBeaconBlock block = maybeBlock.orElseThrow();
++      verifyPlannedBlock(importBlock, block);
++
++      if (recentChainData.containsBlock(importBlock.root())) {
++        System.err.println(
++            "planned block was already known; skipping duplicate import: slot="
++                + importBlock.slot()
++                + " root="
++                + importBlock.root()
++                + " canonical="
++                + importBlock.canonical());
++        continue;
++      }
++
++      final BlockImportResult result =
++          forkChoice
++              .onBlock(block, Optional.empty(), BlockBroadcastValidator.NOOP, executionLayer)
++              .join();
++      if (result.isSuccessful()) {
++        continue;
++      }
++      if (importBlock.canonical()) {
++        throw new IllegalStateException(
++            "failed to process canonical block at "
++                + simSlot
++                + ": "
++                + result.getFailureReason());
++      }
++      System.err.println(
++          "planned non-canonical block import failed: slot="
++              + importBlock.slot()
++              + " root="
++              + importBlock.root()
++              + " reason="
++              + result.getFailureReason());
++    }
++
++    return new ImportedBlockInfo(canonicalRoot != null, canonicalRoot);
++  }
++
++  private Optional<SignedBeaconBlock> fetchPlannedBlock(
++      final SlotInstruction.BlockImport importBlock) throws IOException, InterruptedException {
++    if (importBlock.canonical()) {
++      final Optional<SignedBeaconBlock> block = getBlockAtSlot(importBlock.slot());
++      if (block.isEmpty()) {
++        throw new IOException(
++            "planned canonical block at slot " + importBlock.slot() + " was not found");
++      }
++      return block;
++    }
++
++    final Optional<SignedBeaconBlock> block =
++        httpClient.getBlockByRoot(importBlock.root()).map(spec::deserializeSignedBeaconBlock);
++    if (block.isEmpty()) {
++      System.err.println(
++          "planned non-canonical block was not found; skipping: slot="
++              + importBlock.slot()
++              + " root="
++              + importBlock.root());
++    }
++    return block;
++  }
++
++  private Optional<SignedBeaconBlock> getBlockAtSlot(final UInt64 slot)
++      throws IOException, InterruptedException {
++    final Optional<SignedBeaconBlock> cached = canonicalBlockCache.get(slot);
++    if (cached != null) {
++      return cached;
++    }
++    final Optional<SignedBeaconBlock> block =
++        httpClient.getBlock(slot).map(spec::deserializeSignedBeaconBlock);
++    canonicalBlockCache.put(slot, block);
++    return block;
++  }
++
++  private static void verifyPlannedBlock(
++      final SlotInstruction.BlockImport importBlock, final SignedBeaconBlock block)
++      throws IOException {
++    final Bytes32 blockRoot = block.getRoot();
++    if (!blockRoot.equals(importBlock.root())) {
++      throw new IOException(
++          "planned block root mismatch for slot "
++              + importBlock.slot()
++              + ": plan "
++              + importBlock.root()
++              + ", fetched "
++              + blockRoot);
++    }
++    if (!block.getSlot().equals(importBlock.slot())) {
++      throw new IOException(
++          "planned block slot mismatch for root "
++              + importBlock.root()
++              + ": plan "
++              + importBlock.slot()
++              + ", fetched "
++              + block.getSlot());
 +    }
 +  }
 +
@@ -565,20 +677,20 @@ index 0000000000..361421b4f2
 +            + confirmedSlot);
 +  }
 +
-+  private int injectSourceAttestations(final Optional<UInt64> sourceSlot)
-+      throws IOException, InterruptedException {
-+    if (sourceSlot.isEmpty()) {
++  private int injectAttestations(
++      final UInt64 simSlot, final List<SlotInstruction.PlannedAttestation> attestations) {
++    if (attestations.isEmpty()) {
 +      return 0;
 +    }
-+    final SignedBeaconBlock sourceBlock =
-+        spec.deserializeSignedBeaconBlock(httpClient.getBlockRequired(sourceSlot.get()));
++
 +    final Bytes32 headRoot = recentChainData.getChainHead().orElseThrow().getRoot();
 +    final BeaconState headState = recentChainData.retrieveBlockState(headRoot).join().orElseThrow();
 +    final List<ValidatableAttestation> validatableAttestations = new ArrayList<>();
-+    for (Attestation attestation : sourceBlock.getMessage().getBody().getAttestations()) {
++    for (final SlotInstruction.PlannedAttestation plannedAttestation : attestations) {
++      final Attestation attestation = buildAttestation(plannedAttestation);
 +      try {
 +        final IndexedAttestation indexedAttestation =
-+            spec.atSlot(sourceBlock.getSlot())
++            spec.atSlot(plannedAttestation.data().slot())
 +                .getAttestationUtil()
 +                .getIndexedAttestation(headState, attestation);
 +        final ValidatableAttestation validatableAttestation =
@@ -586,17 +698,51 @@ index 0000000000..361421b4f2
 +        validatableAttestation.setIndexedAttestation(indexedAttestation);
 +        validatableAttestations.add(validatableAttestation);
 +      } catch (final Throwable error) {
-+        System.err.println(
-+            "failed to get indexed attestation: " + error.getMessage());
++        System.err.println("failed to get indexed attestation: " + error.getMessage());
 +      }
 +    }
++
 +    return FcrForkChoiceAccess.applyIndexedAttestations(
 +        forkChoice,
 +        recentChainData,
 +        validatableAttestations,
 +        (attestation, error) ->
-+            System.err.println(
-+                "failed to apply indexed attestation: " + error.getMessage()));
++            System.err.println("failed to apply indexed attestation: " + error.getMessage()));
++  }
++
++  private Attestation buildAttestation(
++      final SlotInstruction.PlannedAttestation plannedAttestation) {
++    final SlotInstruction.AttestationData plannedData = plannedAttestation.data();
++    final AttestationSchema<Attestation> schema =
++        spec.atSlot(plannedData.slot()).getSchemaDefinitions().getAttestationSchema();
++    final AttestationData data =
++        new AttestationData(
++            plannedData.slot(),
++            plannedData.index(),
++            plannedData.beaconBlockRoot(),
++            checkpoint(plannedData.source()),
++            checkpoint(plannedData.target()));
++    final SszBitlist aggregationBits =
++        schema.getAggregationBitsSchema().fromBytes(plannedAttestation.aggregationBits());
++    if (schema.requiresCommitteeBits()) {
++      final SszBitvector committeeBits =
++          schema
++              .getCommitteeBitsSchema()
++              .orElseThrow()
++              .fromBytes(
++                  plannedAttestation
++                      .committeeBits()
++                      .orElseThrow(
++                          () ->
++                              new IllegalStateException(
++                                  "electra attestation is missing committee_bits")));
++      return schema.create(aggregationBits, data, BLSSignature.infinity(), () -> committeeBits);
++    }
++    return schema.create(aggregationBits, data, BLSSignature.infinity());
++  }
++
++  private static Checkpoint checkpoint(final SlotInstruction.Checkpoint checkpoint) {
++    return new Checkpoint(checkpoint.epoch(), checkpoint.root());
 +  }
 +
 +  private SlotResult buildSlotResult(
@@ -641,14 +787,7 @@ index 0000000000..361421b4f2
 +        durationUs);
 +  }
 +
-+  private static void validatePlan(final Map<UInt64, Optional<UInt64>> plan, final Config cfg) {
-+    for (long slot = cfg.warmupStartSlot() + 1; slot < cfg.endSlot(); slot++) {
-+      final UInt64 key = UInt64.valueOf(slot);
-+      if (!plan.containsKey(key)) {
-+        throw new IllegalStateException("attestation plan missing slot " + slot);
-+      }
-+    }
-+  }
++  private record ImportedBlockInfo(boolean hasBlock, Bytes32 blockRoot) {}
 +
 +  private static class AlwaysValidTransitionBlockValidator extends MergeTransitionBlockValidator {
 +    AlwaysValidTransitionBlockValidator(final Spec spec, final RecentChainData recentChainData) {
@@ -705,10 +844,10 @@ index 0000000000..361421b4f2
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java
 new file mode 100644
-index 0000000000..f7a5e011d4
+index 0000000000..b279bdaaa0
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,102 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -740,11 +879,11 @@ index 0000000000..f7a5e011d4
 +import org.apache.tuweni.bytes.Bytes;
 +
 +public class HttpClient {
-+  private final URI baseUri;
++  private final String baseUrl;
 +  private final java.net.http.HttpClient client;
 +
 +  public HttpClient(final String beaconNodeUrl) {
-+    this.baseUri = URI.create(stripTrailingSlash(beaconNodeUrl));
++    this.baseUrl = stripTrailingSlash(beaconNodeUrl);
 +    this.client =
 +        java.net.http.HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
 +  }
@@ -760,11 +899,6 @@ index 0000000000..f7a5e011d4
 +  public Optional<Bytes> getBlockByRoot(final Bytes32 root)
 +      throws IOException, InterruptedException {
 +    return getBytes("/eth/v2/beacon/blocks/" + root.toHexString(), true);
-+  }
-+
-+  public Bytes getBlockRequired(final UInt64 slot) throws IOException, InterruptedException {
-+    return getBlock(slot)
-+        .orElseThrow(() -> new IOException("missing required block at slot " + slot));
 +  }
 +
 +  public byte[] getJson(final String path) throws IOException, InterruptedException {
@@ -806,7 +940,7 @@ index 0000000000..f7a5e011d4
 +  }
 +
 +  private URI resolve(final String path) {
-+    return baseUri.resolve(path.startsWith("/") ? path : "/" + path);
++    return URI.create(baseUrl + (path.startsWith("/") ? path : "/" + path));
 +  }
 +
 +  private static String stripTrailingSlash(final String value) {
@@ -1004,12 +1138,93 @@ index 0000000000..289f1329fd
 +    writer.close();
 +  }
 +}
-diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/PlanFetcher.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/PlanFetcher.java
+diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java
 new file mode 100644
-index 0000000000..0f797cd983
+index 0000000000..cb4852725e
 --- /dev/null
-+++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/PlanFetcher.java
-@@ -0,0 +1,55 @@
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java
+@@ -0,0 +1,75 @@
++/*
++ * Copyright Consensys Software Inc., 2025
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
++ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations under the License.
++ */
++
++package tech.pegasys.teku.statetransition.forkchoice.fcr;
++
++import tech.pegasys.teku.infrastructure.unsigned.UInt64;
++
++import java.util.List;
++import java.util.Objects;
++import java.util.Optional;
++
++import org.apache.tuweni.bytes.Bytes;
++import org.apache.tuweni.bytes.Bytes32;
++
++public record SlotInstruction(
++    UInt64 simSlot,
++    UInt64 evalSlot,
++    List<BlockImport> importBlocks,
++    List<PlannedAttestation> attestations) {
++
++  public SlotInstruction {
++    Objects.requireNonNull(simSlot);
++    Objects.requireNonNull(evalSlot);
++    importBlocks = List.copyOf(importBlocks);
++    attestations = List.copyOf(attestations);
++  }
++
++  public record BlockImport(UInt64 slot, Bytes32 root, boolean canonical) {
++    public BlockImport {
++      Objects.requireNonNull(slot);
++      Objects.requireNonNull(root);
++    }
++  }
++
++  public record PlannedAttestation(
++      Bytes aggregationBits, Optional<Bytes> committeeBits, AttestationData data) {
++    public PlannedAttestation {
++      Objects.requireNonNull(aggregationBits);
++      committeeBits = Objects.requireNonNull(committeeBits);
++      Objects.requireNonNull(data);
++    }
++  }
++
++  public record AttestationData(
++      UInt64 slot,
++      UInt64 index,
++      Bytes32 beaconBlockRoot,
++      Checkpoint source,
++      Checkpoint target) {
++    public AttestationData {
++      Objects.requireNonNull(slot);
++      Objects.requireNonNull(index);
++      Objects.requireNonNull(beaconBlockRoot);
++      Objects.requireNonNull(source);
++      Objects.requireNonNull(target);
++    }
++  }
++
++  public record Checkpoint(UInt64 epoch, Bytes32 root) {
++    public Checkpoint {
++      Objects.requireNonNull(epoch);
++      Objects.requireNonNull(root);
++    }
++  }
++}
+diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstructionFetcher.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstructionFetcher.java
+new file mode 100644
+index 0000000000..1f856dcdab
+--- /dev/null
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstructionFetcher.java
+@@ -0,0 +1,171 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -1028,41 +1243,157 @@ index 0000000000..0f797cd983
 +import tech.pegasys.teku.infrastructure.unsigned.UInt64;
 +
 +import java.io.IOException;
-+import java.util.HashMap;
-+import java.util.Map;
++import java.util.ArrayList;
++import java.util.List;
 +import java.util.Optional;
 +
 +import com.fasterxml.jackson.databind.JsonNode;
 +import com.fasterxml.jackson.databind.ObjectMapper;
++import org.apache.tuweni.bytes.Bytes;
++import org.apache.tuweni.bytes.Bytes32;
 +
-+public class PlanFetcher {
++public class SlotInstructionFetcher {
 +  private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 +
 +  private final HttpClient httpClient;
 +
-+  public PlanFetcher(final HttpClient httpClient) {
++  public SlotInstructionFetcher(final HttpClient httpClient) {
 +    this.httpClient = httpClient;
 +  }
 +
-+  public Map<UInt64, Optional<UInt64>> fetch(final UInt64 from, final UInt64 to)
++  public SlotInstruction fetch(final UInt64 simSlot, final UInt64 warmupStartSlot)
 +      throws IOException, InterruptedException {
 +    final String path =
-+        "/fcr-sim/v1/plan?from="
-+            + HttpClient.queryParam(from)
-+            + "&to="
-+            + HttpClient.queryParam(to);
++        "/fcr-sim/v1/slot/"
++            + HttpClient.queryParam(simSlot)
++            + "?warmup_start_slot="
++            + HttpClient.queryParam(warmupStartSlot);
 +    final JsonNode root = OBJECT_MAPPER.readTree(httpClient.getJson(path));
-+    final Map<UInt64, Optional<UInt64>> plan = new HashMap<>();
-+    for (JsonNode entry : root.required("entries")) {
-+      final UInt64 simSlot = UInt64.valueOf(entry.required("sim_slot").asLong());
-+      final JsonNode source = entry.get("source_block_slot");
-+      plan.put(
-+          simSlot,
-+          source == null || source.isNull()
-+              ? Optional.empty()
-+              : Optional.of(UInt64.valueOf(source.asLong())));
++    final JsonNode version = root.get("version");
++    if (version == null || version.isNull()) {
++      throw new IOException("slot instruction response is missing version");
 +    }
-+    return plan;
++    if (!version.isIntegralNumber() || version.asLong() != 3) {
++      throw new IOException(
++          "unsupported slot instruction version " + version.asText() + "; expected 3");
++    }
++
++    final JsonNode slot = required(root, "slot");
++    final UInt64 responseSimSlot = parseUInt64(required(slot, "sim_slot"), "slot.sim_slot");
++    if (!responseSimSlot.equals(simSlot)) {
++      throw new IOException(
++          "slot instruction response sim_slot mismatch: requested "
++              + simSlot
++              + ", got "
++              + responseSimSlot);
++    }
++
++    return new SlotInstruction(
++        responseSimSlot,
++        parseUInt64(required(slot, "eval_slot"), "slot.eval_slot"),
++        parseImportBlocks(required(slot, "import_blocks")),
++        parseAttestations(required(slot, "attestations")));
++  }
++
++  private static List<SlotInstruction.BlockImport> parseImportBlocks(final JsonNode blocks)
++      throws IOException {
++    if (!blocks.isArray()) {
++      throw new IOException("slot.import_blocks must be an array");
++    }
++    final List<SlotInstruction.BlockImport> result = new ArrayList<>();
++    for (final JsonNode block : blocks) {
++      result.add(
++          new SlotInstruction.BlockImport(
++              parseUInt64(required(block, "slot"), "import_blocks[].slot"),
++              parseRoot(required(block, "root"), "import_blocks[].root"),
++              parseBoolean(required(block, "canonical"), "import_blocks[].canonical")));
++    }
++    return result;
++  }
++
++  private static List<SlotInstruction.PlannedAttestation> parseAttestations(
++      final JsonNode attestations) throws IOException {
++    if (!attestations.isArray()) {
++      throw new IOException("slot.attestations must be an array");
++    }
++    final List<SlotInstruction.PlannedAttestation> result = new ArrayList<>();
++    for (final JsonNode attestation : attestations) {
++      result.add(
++          new SlotInstruction.PlannedAttestation(
++              parseBytes(
++                  required(attestation, "aggregation_bits"), "attestations[].aggregation_bits"),
++              parseOptionalBytes(
++                  attestation.get("committee_bits"), "attestations[].committee_bits"),
++              parseAttestationData(required(attestation, "data"))));
++    }
++    return result;
++  }
++
++  private static SlotInstruction.AttestationData parseAttestationData(final JsonNode data)
++      throws IOException {
++    return new SlotInstruction.AttestationData(
++        parseUInt64(required(data, "slot"), "attestations[].data.slot"),
++        parseUInt64(required(data, "index"), "attestations[].data.index"),
++        parseRoot(required(data, "beacon_block_root"), "attestations[].data.beacon_block_root"),
++        parseCheckpoint(required(data, "source"), "attestations[].data.source"),
++        parseCheckpoint(required(data, "target"), "attestations[].data.target"));
++  }
++
++  private static SlotInstruction.Checkpoint parseCheckpoint(
++      final JsonNode checkpoint, final String name) throws IOException {
++    return new SlotInstruction.Checkpoint(
++        parseUInt64(required(checkpoint, "epoch"), name + ".epoch"),
++        parseRoot(required(checkpoint, "root"), name + ".root"));
++  }
++
++  private static JsonNode required(final JsonNode node, final String field) throws IOException {
++    final JsonNode value = node.get(field);
++    if (value == null || value.isNull()) {
++      throw new IOException("slot instruction response is missing " + field);
++    }
++    return value;
++  }
++
++  private static UInt64 parseUInt64(final JsonNode node, final String name) throws IOException {
++    if (!node.isIntegralNumber()) {
++      throw new IOException("invalid uint64 for " + name + ": " + node.asText());
++    }
++    try {
++      return UInt64.valueOf(node.asText());
++    } catch (final IllegalArgumentException e) {
++      throw new IOException("invalid uint64 for " + name + ": " + node.asText(), e);
++    }
++  }
++
++  private static boolean parseBoolean(final JsonNode node, final String name) throws IOException {
++    if (!node.isBoolean()) {
++      throw new IOException("invalid boolean for " + name + ": " + node.asText());
++    }
++    return node.asBoolean();
++  }
++
++  private static Bytes32 parseRoot(final JsonNode node, final String name) throws IOException {
++    try {
++      return Bytes32.fromHexStringStrict(node.asText());
++    } catch (final IllegalArgumentException e) {
++      throw new IOException("invalid root for " + name + ": " + node.asText(), e);
++    }
++  }
++
++  private static Bytes parseBytes(final JsonNode node, final String name) throws IOException {
++    try {
++      return Bytes.fromHexString(node.asText());
++    } catch (final IllegalArgumentException e) {
++      throw new IOException("invalid bytes for " + name + ": " + node.asText(), e);
++    }
++  }
++
++  private static Optional<Bytes> parseOptionalBytes(final JsonNode node, final String name)
++      throws IOException {
++    if (node == null || node.isNull()) {
++      return Optional.empty();
++    }
++    return Optional.of(parseBytes(node, name));
 +  }
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotResult.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotResult.java
