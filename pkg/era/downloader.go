@@ -314,7 +314,7 @@ func (d *Downloader) s3FilenameForEra(ctx context.Context, eraNumber uint64) (st
 }
 
 // MirrorToS3 mirrors every era in [startEra, endEra] from the public archive to S3.
-func (d *Downloader) MirrorToS3(ctx context.Context, startEra, endEra uint64) (MirrorStats, error) {
+func (d *Downloader) MirrorToS3(ctx context.Context, startEra, endEra uint64, parallel int) (MirrorStats, error) {
 	var stats MirrorStats
 	if d == nil {
 		return stats, fmt.Errorf("nil ERA downloader")
@@ -325,49 +325,127 @@ func (d *Downloader) MirrorToS3(ctx context.Context, startEra, endEra uint64) (M
 	if startEra > endEra {
 		return stats, fmt.Errorf("start era %d is after end era %d", startEra, endEra)
 	}
+	if parallel <= 0 {
+		return stats, fmt.Errorf("parallel must be greater than zero")
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan uint64)
+	var (
+		statsMu  sync.Mutex
+		errOnce  sync.Once
+		firstErr error
+		wg       sync.WaitGroup
+	)
+
+	increment := func(update func(*MirrorStats)) {
+		statsMu.Lock()
+		defer statsMu.Unlock()
+		update(&stats)
+	}
+	setErr := func(err error) {
+		if err == nil {
+			return
+		}
+		errOnce.Do(func() {
+			firstErr = err
+			cancel()
+		})
+	}
+
+	worker := func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case eraNumber, ok := <-jobs:
+				if !ok {
+					return
+				}
+				if err := d.mirrorEraToS3(ctx, eraNumber, increment); err != nil {
+					setErr(err)
+					return
+				}
+			}
+		}
+	}
+
+	for i := 0; i < parallel; i++ {
+		wg.Add(1)
+		go worker()
+	}
 
 	for eraNumber := startEra; ; eraNumber++ {
-		stats.Scanned++
-
-		filename, err := d.filenameForEra(eraNumber)
-		if err != nil {
-			return stats, err
-		}
-		key := eraObjectKey(d.network, filename)
-		exists, err := d.s3Store.ObjectExists(ctx, key)
-		if err != nil {
-			return stats, err
-		}
-		if exists {
-			stats.Skipped++
-			if eraNumber == endEra {
-				break
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			statsMu.Lock()
+			defer statsMu.Unlock()
+			if firstErr != nil {
+				return stats, firstErr
 			}
-			continue
+			return stats, ctx.Err()
+		case jobs <- eraNumber:
 		}
-
-		cachePath := filepath.Join(d.cacheDir, filename)
-		if _, err := os.Stat(cachePath); err != nil {
-			if !os.IsNotExist(err) {
-				return stats, fmt.Errorf("stat ERA cache file %q: %w", cachePath, err)
-			}
-			url := fmt.Sprintf("%s/%s", d.baseURL, filename)
-			if err := d.tryDownloadHTTP(ctx, url, filename, false); err != nil {
-				return stats, err
-			}
-			stats.Downloaded++
-		}
-		if err := d.s3Store.UploadFile(ctx, key, cachePath); err != nil {
-			return stats, err
-		}
-		stats.Uploaded++
-
 		if eraNumber == endEra {
 			break
 		}
 	}
+	close(jobs)
+	wg.Wait()
 
-	return stats, nil
+	statsMu.Lock()
+	defer statsMu.Unlock()
+	return stats, firstErr
+}
+
+func (d *Downloader) mirrorEraToS3(ctx context.Context, eraNumber uint64, increment func(func(*MirrorStats))) error {
+	increment(func(stats *MirrorStats) {
+		stats.Scanned++
+	})
+
+	filename, err := d.filenameForEra(eraNumber)
+	if err != nil {
+		return err
+	}
+	key := eraObjectKey(d.network, filename)
+	exists, err := d.s3Store.ObjectExists(ctx, key)
+	if err != nil {
+		return err
+	}
+	if exists {
+		increment(func(stats *MirrorStats) {
+			stats.Skipped++
+		})
+		return nil
+	}
+
+	cachePath := filepath.Join(d.cacheDir, filename)
+	if _, err := os.Stat(cachePath); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("stat ERA cache file %q: %w", cachePath, err)
+		}
+		url := fmt.Sprintf("%s/%s", d.baseURL, filename)
+		if err := d.tryDownloadHTTP(ctx, url, filename, false); err != nil {
+			return err
+		}
+		increment(func(stats *MirrorStats) {
+			stats.Downloaded++
+		})
+	}
+	if err := d.s3Store.UploadFile(ctx, key, cachePath); err != nil {
+		return err
+	}
+	increment(func(stats *MirrorStats) {
+		stats.Uploaded++
+	})
+	if err := os.Remove(cachePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove mirrored ERA cache file %q: %w", cachePath, err)
+	}
+	return nil
 }
 
 func eraObjectPrefix(network string, eraNumber uint64) string {

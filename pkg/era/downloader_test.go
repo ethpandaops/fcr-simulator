@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -125,13 +126,14 @@ func TestDownloaderMirrorToS3SkipsExistingAndUploadsMissing(t *testing.T) {
 		}),
 	}
 
-	stats, err := downloader.MirrorToS3(context.Background(), 1, 2)
+	stats, err := downloader.MirrorToS3(context.Background(), 1, 2, 1)
 	require.NoError(t, err)
 	require.Equal(t, MirrorStats{Scanned: 2, Skipped: 1, Downloaded: 1, Uploaded: 1}, stats)
 	require.Equal(t, []byte("already-present"), store.objects["era/mainnet/mainnet-00001-aaaa.era"])
 	require.Equal(t, []byte("era-two"), store.objects["era/mainnet/mainnet-00002-bbbb.era"])
 	require.Equal(t, []string{"era/mainnet/mainnet-00001-aaaa.era", "era/mainnet/mainnet-00002-bbbb.era"}, store.exists)
 	require.Equal(t, []string{"era/mainnet/mainnet-00002-bbbb.era"}, store.uploads)
+	require.NoFileExists(t, filepath.Join(downloader.CacheDir(), "mainnet-00002-bbbb.era"))
 }
 
 func TestDownloaderMissingEraInIndex(t *testing.T) {
@@ -211,6 +213,7 @@ func readCachedFile(t *testing.T, dir, name string) []byte {
 }
 
 type fakeEraS3Store struct {
+	mu        sync.Mutex
 	objects   map[string][]byte
 	lists     []string
 	downloads []string
@@ -231,8 +234,11 @@ func (s *fakeEraS3Store) Download(_ context.Context, _ string) ([]byte, bool, er
 }
 
 func (s *fakeEraS3Store) DownloadFile(_ context.Context, key, target string) (bool, error) {
+	s.mu.Lock()
 	s.downloads = append(s.downloads, key)
 	data, ok := s.objects[key]
+	data = append([]byte(nil), data...)
+	s.mu.Unlock()
 	if !ok {
 		return false, nil
 	}
@@ -244,22 +250,28 @@ func (s *fakeEraS3Store) Upload(_ context.Context, _ string, _ []byte) error {
 }
 
 func (s *fakeEraS3Store) UploadFile(_ context.Context, key, source string) error {
-	s.uploads = append(s.uploads, key)
 	data, err := os.ReadFile(source)
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.uploads = append(s.uploads, key)
 	s.objects[key] = append([]byte(nil), data...)
 	return nil
 }
 
 func (s *fakeEraS3Store) ObjectExists(_ context.Context, key string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.exists = append(s.exists, key)
 	_, ok := s.objects[key]
 	return ok, nil
 }
 
 func (s *fakeEraS3Store) ListObjects(_ context.Context, prefix string) ([]s3cache.Object, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.lists = append(s.lists, prefix)
 	var objects []s3cache.Object
 	for key, data := range s.objects {

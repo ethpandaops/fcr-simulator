@@ -377,7 +377,7 @@ func runEraMirrorCommand(ctx context.Context, args []string, stdout, stderr io.W
 
 	fmt.Fprintf(stdout, "mirroring ERA files for slots %d through %d into s3://%s/era/%s/ (eras %d through %d)\n",
 		startSlot, endSlot, cfg.S3Bucket, cfg.Network, startEra, endEra)
-	stats, err := downloader.MirrorToS3(ctx, startEra, endEra)
+	stats, err := downloader.MirrorToS3(ctx, startEra, endEra, cfg.Parallel)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
