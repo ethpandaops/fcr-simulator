@@ -12,6 +12,7 @@ import {
   type CheckpointWithPayloadStatus,
   type ForkChoiceStateGetter,
   type JustifiedBalancesGetter,
+  type ProtoBlock,
 } from "@lodestar/fork-choice";
 import {ForkSeq, GENESIS_SLOT} from "@lodestar/params";
 import {
@@ -528,6 +529,11 @@ type StateCacheEntry = {
   state: CachedBeaconStateAllForks;
 };
 
+type ImportedPostStateCacheEntry = StateCacheEntry & {
+  blockRootHex: RootHex;
+  stateRootHex: RootHex;
+};
+
 type CheckpointStateCacheEntry = {
   epoch: number;
   state: CachedBeaconStateAllForks;
@@ -600,8 +606,9 @@ class DebugTracer {
 
 class StateCache {
   private readonly stateByStateRoot = new Map<RootHex, StateCacheEntry>();
-  private readonly importedPostStateByBlockRoot = new Map<RootHex, StateCacheEntry>();
-  private readonly importedPostStateByStateRoot = new Map<RootHex, StateCacheEntry>();
+  private readonly importedPostStateByBlockRoot = new Map<RootHex, ImportedPostStateCacheEntry>();
+  private readonly importedPostStateByStateRoot = new Map<RootHex, ImportedPostStateCacheEntry>();
+  private readonly importedBlockRootsByStateRoot = new Map<RootHex, Set<RootHex>>();
   private readonly stateByCheckpointKey = new Map<string, CheckpointStateCacheEntry>();
   private readonly evictedStateRoots = new Map<RootHex, {slot: number; evictedAtSlot: number}>();
   private readonly evictedCheckpoints = new Map<string, {epoch: number; evictedAtSlot: number}>();
@@ -619,10 +626,18 @@ class StateCache {
     slot: number,
     state: CachedBeaconStateAllForks,
   ): void {
-    // Bounded Lighthouse-store substitute: only post-states imported in this process plus the bootstrap anchor can be recovered.
-    const entry = {slot, state};
+    const existing = this.importedPostStateByBlockRoot.get(blockRootHex);
+    if (existing) {
+      this.importedPostStateByBlockRoot.delete(blockRootHex);
+      this.removeImportedStateRootRef(existing);
+      this.repointImportedStateRoot(existing);
+    }
+
+    // Lighthouse-store substitute: retain imported post-states until fork-choice finalization prunes them away.
+    const entry = {blockRootHex, stateRootHex, slot, state};
     this.importedPostStateByBlockRoot.set(blockRootHex, entry);
     this.importedPostStateByStateRoot.set(stateRootHex, entry);
+    this.addImportedStateRootRef(entry);
   }
 
   getStateRoot(rootHex: RootHex): CachedBeaconStateAllForks | null {
@@ -721,6 +736,62 @@ class StateCache {
           importedBlockStates: this.importedPostStateByBlockRoot.size,
           checkpoints: this.stateByCheckpointKey.size,
         });
+      }
+    }
+  }
+
+  pruneFinalizedBlocks(prunedBlocks: ProtoBlock[], currentSlot: number): void {
+    for (const block of prunedBlocks) {
+      this.deleteImportedPostState(block.blockRoot, currentSlot);
+    }
+  }
+
+  private addImportedStateRootRef(entry: ImportedPostStateCacheEntry): void {
+    let blockRoots = this.importedBlockRootsByStateRoot.get(entry.stateRootHex);
+    if (!blockRoots) {
+      blockRoots = new Set();
+      this.importedBlockRootsByStateRoot.set(entry.stateRootHex, blockRoots);
+    }
+    blockRoots.add(entry.blockRootHex);
+  }
+
+  private removeImportedStateRootRef(entry: ImportedPostStateCacheEntry): void {
+    const blockRoots = this.importedBlockRootsByStateRoot.get(entry.stateRootHex);
+    if (!blockRoots) return;
+    blockRoots.delete(entry.blockRootHex);
+    if (blockRoots.size === 0) {
+      this.importedBlockRootsByStateRoot.delete(entry.stateRootHex);
+    }
+  }
+
+  private deleteImportedPostState(blockRootHex: RootHex, currentSlot: number): void {
+    const entry = this.importedPostStateByBlockRoot.get(blockRootHex);
+    if (!entry) return;
+
+    this.importedPostStateByBlockRoot.delete(blockRootHex);
+    this.removeImportedStateRootRef(entry);
+    this.repointImportedStateRoot(entry);
+
+    this.debug.cache("state_cache_evict", {
+      kind: "imported_block",
+      blockRootHex,
+      stateRootHex: entry.stateRootHex,
+      slot: entry.slot,
+      currentSlot,
+      stateRoots: this.stateByStateRoot.size,
+      importedBlockStates: this.importedPostStateByBlockRoot.size,
+      checkpoints: this.stateByCheckpointKey.size,
+    });
+  }
+
+  private repointImportedStateRoot(entry: ImportedPostStateCacheEntry): void {
+    if (this.importedPostStateByStateRoot.get(entry.stateRootHex) === entry) {
+      const replacementRoot = this.importedBlockRootsByStateRoot.get(entry.stateRootHex)?.values().next().value;
+      const replacement = replacementRoot ? this.importedPostStateByBlockRoot.get(replacementRoot) : undefined;
+      if (replacement) {
+        this.importedPostStateByStateRoot.set(entry.stateRootHex, replacement);
+      } else {
+        this.importedPostStateByStateRoot.delete(entry.stateRootHex);
       }
     }
   }
@@ -957,7 +1028,8 @@ async function runSlotLoop(cfg: CliConfig, boot: BootstrapResult): Promise<void>
 
       const finalized = forkChoice.getFinalizedCheckpoint();
       if (finalized.rootHex !== lastPrunedFinalizedRoot) {
-        forkChoice.prune(finalized.rootHex);
+        const prunedBlocks = forkChoice.prune(finalized.rootHex);
+        stateCache.pruneFinalizedBlocks(prunedBlocks, slot);
         lastPrunedFinalizedRoot = finalized.rootHex;
       }
       debug.setPhase("prune", slot);
