@@ -39,6 +39,12 @@ type RealBackendConfig struct {
 
 	BlockArchive *blockarchive.Client
 
+	// ArchiveCacheOnly makes orphan-block resolution read the local block-archive
+	// disk cache only, never contacting the archive over HTTP. The serving hot
+	// loop sets this so a slow or unavailable archive can never stall or fail a
+	// simulation; the prep pass warms the cache up front via WarmBlockArchiveCache.
+	ArchiveCacheOnly bool
+
 	// DecodedBlockCacheSize bounds decoded blockInfo caches. Zero disables
 	// decoded caching.
 	DecodedBlockCacheSize int
@@ -289,6 +295,76 @@ func (b *realBackend) BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstructio
 	}
 
 	return instruction, nil
+}
+
+// WarmBlockArchiveCache resolves and disk-caches every orphan block that the
+// per-slot hot loop could request for the given sim-slot ranges. This is the
+// only place the block archive is contacted over HTTP; the serving backend runs
+// with ArchiveCacheOnly so it reads exclusively from the cache this warms. Each
+// range is [from, to) in slots, matching one worker's import window.
+func WarmBlockArchiveCache(cfg RealBackendConfig, ranges [][2]uint64) error {
+	cfg.ArchiveCacheOnly = false
+	backend, ok := NewRealBackend(cfg).(*realBackend)
+	if !ok {
+		return fmt.Errorf("warm block archive cache: unexpected backend type")
+	}
+	for _, r := range ranges {
+		if err := backend.warmArchiveCache(r[0], r[1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *realBackend) warmArchiveCache(from, to uint64) error {
+	if b.cfg.BlockArchive == nil {
+		return nil
+	}
+	if b.cfg.EraReader == nil {
+		return fmt.Errorf("era reader is not configured")
+	}
+	if from >= to {
+		return nil
+	}
+
+	loadEnd := saturatingAdd(to, b.cfg.LookaheadCap)
+	canonicalBySlot, canonicalByRoot, err := b.loadCanonicalBlockInfos(from, loadEnd)
+	if err != nil {
+		return err
+	}
+
+	state := &planBuildState{
+		backend:         b,
+		canonicalBySlot: canonicalBySlot,
+		canonicalByRoot: canonicalByRoot,
+		importedRoots:   make(map[[32]byte]bool),
+		scheduledRoots:  make(map[[32]byte]bool),
+		missingRoots:    make(map[[32]byte]bool),
+		ignoredRoots:    make(map[[32]byte]bool),
+		fetchedByRoot:   make(map[[32]byte]blockInfo),
+	}
+	for root := range b.cfg.CheckpointBlocksByRoot {
+		state.importedRoots[root] = true
+	}
+
+	roots := make(map[[32]byte]bool)
+	for _, info := range canonicalBySlot {
+		for _, attestation := range info.Attestations {
+			for _, root := range [][32]byte{attestation.TargetRoot, attestation.BeaconBlockRoot} {
+				if isZeroRoot(root) || state.rootKnown(root) {
+					continue
+				}
+				roots[root] = true
+			}
+		}
+	}
+
+	for _, root := range sortedRootKeys(roots) {
+		if _, err := state.resolveOrphanChain(root, loadEnd); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *realBackend) loadCanonicalBlockInfos(from, to uint64) (map[uint64]blockInfo, map[[32]byte]blockInfo, error) {
@@ -715,7 +791,13 @@ func (b *realBackend) fetchBlockSSZByRootForPlan(root [32]byte) ([]byte, error) 
 		return nil, ErrNotFound
 	}
 
-	data, err := b.cfg.BlockArchive.FetchBlockSSZByRoot(root)
+	var data []byte
+	var err error
+	if b.cfg.ArchiveCacheOnly {
+		data, err = b.cfg.BlockArchive.ReadCachedSSZByRoot(root)
+	} else {
+		data, err = b.cfg.BlockArchive.FetchBlockSSZByRoot(root)
+	}
 	if errors.Is(err, blockarchive.ErrNotFound) {
 		return nil, ErrNotFound
 	}

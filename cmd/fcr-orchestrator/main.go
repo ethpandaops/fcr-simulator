@@ -358,7 +358,9 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 	}
 
 	if cfg.PrepOnly {
-		_ = eraReader
+		if err := warmBlockArchiveCache(cfg, eraReader, workerInfos, checkpointBlocks, stdout); err != nil {
+			return 1, fmt.Errorf("warm block archive cache: %w", err)
+		}
 		fmt.Fprintf(stdout, "prep complete: %d checkpoint state(s) cached for %d worker(s)\n",
 			len(checkpointStates), len(workerInfos))
 		return 0, nil
@@ -541,22 +543,73 @@ func prepareWorkers(cfg config, fetcher *beaconfetch.Fetcher, chunks []chunk.Chu
 	return infos, checkpointStates, checkpointBlocks, nil
 }
 
+func newArchiveClient(cfg config) (*blockarchive.Client, error) {
+	if cfg.BlockArchiveURL == "" {
+		return nil, nil
+	}
+	return blockarchive.New(
+		cfg.BlockArchiveURL,
+		cfg.Network,
+		filepath.Join(cfg.CacheDir, "block-archive"),
+	)
+}
+
+// warmBlockArchiveCache front-loads every orphan block the engine workers will
+// request into the local disk cache, so the serving hot loop never contacts the
+// block archive over HTTP (where a slow or timing-out origin would stall or fail
+// a running simulation). No-op when no archive is configured.
+func warmBlockArchiveCache(cfg config, eraReader *era.Reader, workerInfos []workerInfo, checkpointBlocks map[[32]byte][]byte, stdout io.Writer) error {
+	archiveClient, err := newArchiveClient(cfg)
+	if err != nil {
+		return err
+	}
+	if archiveClient == nil {
+		return nil
+	}
+
+	mode, err := parseAttplanMode(cfg.AttestationSourceMode)
+	if err != nil {
+		return err
+	}
+
+	ranges := make([][2]uint64, 0, len(workerInfos))
+	for _, info := range workerInfos {
+		if info.Skipped {
+			continue
+		}
+		from := info.ActualWarmupStartSlot + 1
+		to := info.Chunk.EndSlot
+		if from >= to {
+			continue
+		}
+		ranges = append(ranges, [2]uint64{from, to})
+	}
+	if len(ranges) == 0 {
+		return nil
+	}
+
+	fmt.Fprintf(stdout, "warming block-archive cache for %d worker range(s)\n", len(ranges))
+	return beaconapi.WarmBlockArchiveCache(beaconapi.RealBackendConfig{
+		EraReader:              eraReader,
+		GenesisInfo:            mainnetGenesisInfo(),
+		ForkSchedule:           beaconapi.ForkSchedule{SlotFork: beaconapi.MainnetForkAtSlot},
+		Mode:                   mode,
+		LookaheadCap:           cfg.LookaheadCap,
+		CheckpointBlocksByRoot: checkpointBlocks,
+		BlockArchive:           archiveClient,
+		DecodedBlockCacheSize:  cfg.DecodedBlockCacheSize,
+	}, ranges)
+}
+
 func startBeaconAPIServer(cfg config, eraReader *era.Reader, fetcher *beaconfetch.Fetcher, checkpointBlocks map[[32]byte][]byte) (*http.Server, string, func(), error) {
 	mode, err := parseAttplanMode(cfg.AttestationSourceMode)
 	if err != nil {
 		return nil, "", nil, err
 	}
 
-	var archiveClient *blockarchive.Client
-	if cfg.BlockArchiveURL != "" {
-		archiveClient, err = blockarchive.New(
-			cfg.BlockArchiveURL,
-			cfg.Network,
-			filepath.Join(cfg.CacheDir, "block-archive"),
-		)
-		if err != nil {
-			return nil, "", nil, err
-		}
+	archiveClient, err := newArchiveClient(cfg)
+	if err != nil {
+		return nil, "", nil, err
 	}
 
 	backend := beaconapi.NewRealBackend(beaconapi.RealBackendConfig{
@@ -568,6 +621,7 @@ func startBeaconAPIServer(cfg config, eraReader *era.Reader, fetcher *beaconfetc
 		LookaheadCap:           cfg.LookaheadCap,
 		CheckpointBlocksByRoot: checkpointBlocks,
 		BlockArchive:           archiveClient,
+		ArchiveCacheOnly:       true,
 		DecodedBlockCacheSize:  cfg.DecodedBlockCacheSize,
 	})
 

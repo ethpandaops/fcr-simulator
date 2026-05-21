@@ -83,6 +83,24 @@ func (c *Client) FetchBlockSSZByRoot(root [32]byte) ([]byte, error) {
 	return cloneBytes(bytes), nil
 }
 
+// ReadCachedSSZByRoot returns a previously-cached block without contacting the
+// archive. Returns ErrNotFound when the block is absent from the local disk
+// cache. The serving hot loop uses this so a slow or unavailable archive can
+// never stall a simulation; the prep pass is responsible for warming the cache.
+func (c *Client) ReadCachedSSZByRoot(root [32]byte) ([]byte, error) {
+	if c == nil {
+		return nil, ErrNotFound
+	}
+	bytes, ok, err := c.readCached(root)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return cloneBytes(bytes), nil
+}
+
 func (c *Client) lookupSlot(root [32]byte, rootText string) (uint64, error) {
 	indexURL, err := url.Parse(c.baseURL + "/api/v1/index")
 	if err != nil {
