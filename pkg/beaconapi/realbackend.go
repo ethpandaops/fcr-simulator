@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync"
 
 	"github.com/ethpandaops/fcr-simulator/pkg/attplan"
 	"github.com/ethpandaops/fcr-simulator/pkg/beaconfetch"
@@ -17,6 +18,8 @@ import (
 
 const (
 	maxOrphanWalk = 16
+
+	canonicalLoadChunkSize = 256
 
 	// DefaultDecodedBlockCacheSize is the orchestrator default for decoded
 	// blockInfo LRU caches used by per-slot simulation planning.
@@ -51,9 +54,10 @@ type RealBackendConfig struct {
 }
 
 type realBackend struct {
-	cfg           RealBackendConfig
-	decodedBySlot *lru.Cache[uint64, blockInfo]
-	decodedByRoot *lru.Cache[[32]byte, blockInfo]
+	cfg            RealBackendConfig
+	canonicalIndex *canonicalBlockIndex
+	decodedBySlot  *lru.Cache[uint64, blockInfo]
+	decodedByRoot  *lru.Cache[[32]byte, blockInfo]
 }
 
 func NewRealBackend(cfg RealBackendConfig) Backend {
@@ -63,6 +67,7 @@ func NewRealBackend(cfg RealBackendConfig) Backend {
 	cacheSize := cfg.DecodedBlockCacheSize
 
 	backend := &realBackend{cfg: cfg}
+	backend.canonicalIndex = newCanonicalBlockIndex(backend)
 	if cacheSize > 0 {
 		if cache, err := lru.New[uint64, blockInfo](cacheSize); err == nil {
 			backend.decodedBySlot = cache
@@ -170,14 +175,13 @@ func (b *realBackend) BuildPlan(from, to uint64) ([]PlanEntry, error) {
 	}
 
 	state := &planBuildState{
-		backend:         b,
-		canonicalBySlot: canonicalBySlot,
-		canonicalByRoot: canonicalByRoot,
-		importedRoots:   make(map[[32]byte]bool),
-		scheduledRoots:  make(map[[32]byte]bool),
-		missingRoots:    make(map[[32]byte]bool),
-		ignoredRoots:    make(map[[32]byte]bool),
-		fetchedByRoot:   make(map[[32]byte]blockInfo),
+		backend:        b,
+		canonical:      &canonicalBlockMap{bySlot: canonicalBySlot, byRoot: canonicalByRoot},
+		importedRoots:  make(map[[32]byte]bool),
+		scheduledRoots: make(map[[32]byte]bool),
+		missingRoots:   make(map[[32]byte]bool),
+		ignoredRoots:   make(map[[32]byte]bool),
+		fetchedByRoot:  make(map[[32]byte]blockInfo),
 	}
 	for root := range b.cfg.CheckpointBlocksByRoot {
 		state.importedRoots[root] = true
@@ -252,20 +256,19 @@ func (b *realBackend) BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstructio
 	}
 
 	loadEnd := saturatingAdd(simSlot, b.cfg.LookaheadCap)
-	canonicalBySlot, canonicalByRoot, err := b.loadCanonicalBlockInfos(minImportSlot, loadEnd)
-	if err != nil {
+	if err := b.canonicalIndex.ensureRange(minImportSlot, loadEnd); err != nil {
 		return SlotInstruction{}, err
 	}
+	canonical := b.canonicalIndex.view(minImportSlot, loadEnd)
 
 	state := &planBuildState{
-		backend:         b,
-		canonicalBySlot: canonicalBySlot,
-		canonicalByRoot: canonicalByRoot,
-		importedRoots:   make(map[[32]byte]bool),
-		scheduledRoots:  make(map[[32]byte]bool),
-		missingRoots:    make(map[[32]byte]bool),
-		ignoredRoots:    make(map[[32]byte]bool),
-		fetchedByRoot:   make(map[[32]byte]blockInfo),
+		backend:        b,
+		canonical:      canonical,
+		importedRoots:  make(map[[32]byte]bool),
+		scheduledRoots: make(map[[32]byte]bool),
+		missingRoots:   make(map[[32]byte]bool),
+		ignoredRoots:   make(map[[32]byte]bool),
+		fetchedByRoot:  make(map[[32]byte]blockInfo),
 	}
 	for root := range b.cfg.CheckpointBlocksByRoot {
 		state.importedRoots[root] = true
@@ -278,12 +281,12 @@ func (b *realBackend) BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstructio
 		Attestations: []PlanAttestation{},
 	}
 
-	if info, ok := canonicalBySlot[simSlot]; ok {
+	if info, ok := canonical.infoBySlot(simSlot); ok {
 		instruction.ImportBlocks = append(instruction.ImportBlocks, blockImport(info, true))
 		state.importedRoots[info.Root] = true
 	}
 
-	slotAttestations := attestationsMadeInWindow(canonicalBySlot, simSlot, b.cfg.LookaheadCap)
+	slotAttestations := attestationsMadeInWindow(canonical, simSlot, b.cfg.LookaheadCap)
 	orphanImports, err := state.orphanImportsForSlotAttestations(slotAttestations, simSlot, minImportSlot)
 	if err != nil {
 		return SlotInstruction{}, err
@@ -334,14 +337,13 @@ func (b *realBackend) warmArchiveCache(from, to uint64) error {
 	}
 
 	state := &planBuildState{
-		backend:         b,
-		canonicalBySlot: canonicalBySlot,
-		canonicalByRoot: canonicalByRoot,
-		importedRoots:   make(map[[32]byte]bool),
-		scheduledRoots:  make(map[[32]byte]bool),
-		missingRoots:    make(map[[32]byte]bool),
-		ignoredRoots:    make(map[[32]byte]bool),
-		fetchedByRoot:   make(map[[32]byte]blockInfo),
+		backend:        b,
+		canonical:      &canonicalBlockMap{bySlot: canonicalBySlot, byRoot: canonicalByRoot},
+		importedRoots:  make(map[[32]byte]bool),
+		scheduledRoots: make(map[[32]byte]bool),
+		missingRoots:   make(map[[32]byte]bool),
+		ignoredRoots:   make(map[[32]byte]bool),
+		fetchedByRoot:  make(map[[32]byte]blockInfo),
 	}
 	for root := range b.cfg.CheckpointBlocksByRoot {
 		state.importedRoots[root] = true
@@ -367,32 +369,248 @@ func (b *realBackend) warmArchiveCache(from, to uint64) error {
 	return nil
 }
 
-func (b *realBackend) loadCanonicalBlockInfos(from, to uint64) (map[uint64]blockInfo, map[[32]byte]blockInfo, error) {
-	bySlot := make(map[uint64]blockInfo)
-	byRoot := make(map[[32]byte]blockInfo)
+type slotRange struct {
+	from uint64
+	to   uint64
+}
+
+type canonicalBlockIndex struct {
+	backend *realBackend
+
+	mu      sync.RWMutex
+	cond    *sync.Cond
+	loaded  []slotRange
+	loading []slotRange
+	bySlot  map[uint64]blockInfo
+	byRoot  map[[32]byte]blockInfo
+}
+
+func newCanonicalBlockIndex(backend *realBackend) *canonicalBlockIndex {
+	index := &canonicalBlockIndex{
+		backend: backend,
+		bySlot:  make(map[uint64]blockInfo),
+		byRoot:  make(map[[32]byte]blockInfo),
+	}
+	index.cond = sync.NewCond(&index.mu)
+	return index
+}
+
+func (i *canonicalBlockIndex) ensureRange(from, to uint64) error {
 	if from > to {
-		return bySlot, byRoot, nil
+		return nil
 	}
 
-	for slot := from; ; slot++ {
-		data, ok, err := b.cfg.EraReader.RawBlockSSZ(slot)
+	for {
+		i.mu.Lock()
+		gap, wait, ok := i.nextGapLocked(from, to)
+		if !ok {
+			i.mu.Unlock()
+			return nil
+		}
+		if wait {
+			i.cond.Wait()
+			i.mu.Unlock()
+			continue
+		}
+		i.loading = insertSlotRange(i.loading, gap)
+		i.mu.Unlock()
+
+		infos, err := i.loadRange(gap)
+
+		i.mu.Lock()
+		i.loading = removeSlotRange(i.loading, gap)
+		if err == nil {
+			for _, info := range infos {
+				i.bySlot[info.Slot] = info
+				i.byRoot[info.Root] = info
+			}
+			i.loaded = addSlotRange(i.loaded, gap)
+		}
+		i.cond.Broadcast()
+		i.mu.Unlock()
 		if err != nil {
-			return nil, nil, err
+			return err
+		}
+	}
+}
+
+func (i *canonicalBlockIndex) loadRange(r slotRange) ([]blockInfo, error) {
+	infos := make([]blockInfo, 0)
+	for slot := r.from; ; slot++ {
+		data, ok, err := i.backend.cfg.EraReader.RawBlockSSZ(slot)
+		if err != nil {
+			return nil, err
 		}
 		if ok {
-			info, err := b.decodeCanonicalBlockInfo(slot, data)
+			info, err := i.backend.decodeCanonicalBlockInfo(slot, data)
 			if err != nil {
-				return nil, nil, fmt.Errorf("parse canonical block at slot %d: %w", slot, err)
+				return nil, fmt.Errorf("parse canonical block at slot %d: %w", slot, err)
 			}
-			bySlot[slot] = info
-			byRoot[info.Root] = info
+			infos = append(infos, info)
 		}
-		if slot == to || slot == math.MaxUint64 {
+		if slot == r.to || slot == math.MaxUint64 {
 			break
 		}
 	}
+	return infos, nil
+}
 
+func (i *canonicalBlockIndex) nextGapLocked(from, to uint64) (slotRange, bool, bool) {
+	for slot := from; ; {
+		if r, ok := rangeContainingSlot(i.loaded, slot); ok {
+			if r.to == math.MaxUint64 {
+				return slotRange{}, false, false
+			}
+			slot = r.to + 1
+			if slot > to {
+				return slotRange{}, false, false
+			}
+			continue
+		}
+		if _, ok := rangeContainingSlot(i.loading, slot); ok {
+			return slotRange{}, true, true
+		}
+
+		gap := slotRange{from: slot, to: to}
+		for _, r := range append(append([]slotRange{}, i.loaded...), i.loading...) {
+			if r.from > slot && r.from-1 < gap.to {
+				gap.to = r.from - 1
+			}
+		}
+		if maxTo, ok := checkedAdd(slot, canonicalLoadChunkSize-1); ok && maxTo < gap.to {
+			gap.to = maxTo
+		}
+		return gap, false, true
+	}
+}
+
+func (i *canonicalBlockIndex) infoBySlot(slot uint64) (blockInfo, bool) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	info, ok := i.bySlot[slot]
+	return info, ok
+}
+
+func (i *canonicalBlockIndex) infoByRoot(root [32]byte) (blockInfo, bool) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	info, ok := i.byRoot[root]
+	return info, ok
+}
+
+func (i *canonicalBlockIndex) snapshotRange(from, to uint64) (map[uint64]blockInfo, map[[32]byte]blockInfo) {
+	bySlot := make(map[uint64]blockInfo)
+	byRoot := make(map[[32]byte]blockInfo)
+
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	for slot, info := range i.bySlot {
+		if slot < from || slot > to {
+			continue
+		}
+		bySlot[slot] = info
+		byRoot[info.Root] = info
+	}
+	return bySlot, byRoot
+}
+
+func (i *canonicalBlockIndex) view(from, to uint64) *canonicalBlockView {
+	return &canonicalBlockView{index: i, from: from, to: to}
+}
+
+func rangeContainingSlot(ranges []slotRange, slot uint64) (slotRange, bool) {
+	for _, r := range ranges {
+		if slot < r.from {
+			return slotRange{}, false
+		}
+		if slot <= r.to {
+			return r, true
+		}
+	}
+	return slotRange{}, false
+}
+
+func addSlotRange(ranges []slotRange, next slotRange) []slotRange {
+	out := make([]slotRange, 0, len(ranges)+1)
+	inserted := false
+	for _, current := range ranges {
+		if rangeBefore(current, next) {
+			out = append(out, current)
+			continue
+		}
+		if rangeBefore(next, current) {
+			if !inserted {
+				out = append(out, next)
+				inserted = true
+			}
+			out = append(out, current)
+			continue
+		}
+		if current.from < next.from {
+			next.from = current.from
+		}
+		if current.to > next.to {
+			next.to = current.to
+		}
+	}
+	if !inserted {
+		out = append(out, next)
+	}
+	return out
+}
+
+func insertSlotRange(ranges []slotRange, next slotRange) []slotRange {
+	out := make([]slotRange, 0, len(ranges)+1)
+	inserted := false
+	for _, current := range ranges {
+		if !inserted && next.from < current.from {
+			out = append(out, next)
+			inserted = true
+		}
+		out = append(out, current)
+	}
+	if !inserted {
+		out = append(out, next)
+	}
+	return out
+}
+
+func removeSlotRange(ranges []slotRange, target slotRange) []slotRange {
+	out := ranges[:0]
+	for _, r := range ranges {
+		if r == target {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func rangeBefore(left, right slotRange) bool {
+	if left.to == math.MaxUint64 {
+		return false
+	}
+	return left.to+1 < right.from
+}
+
+func (b *realBackend) loadCanonicalBlockInfos(from, to uint64) (map[uint64]blockInfo, map[[32]byte]blockInfo, error) {
+	if from > to {
+		return make(map[uint64]blockInfo), make(map[[32]byte]blockInfo), nil
+	}
+
+	if err := b.canonicalIndex.ensureRange(from, to); err != nil {
+		return nil, nil, err
+	}
+	bySlot, byRoot := b.canonicalIndex.snapshotRange(from, to)
 	return bySlot, byRoot, nil
+}
+
+func (b *realBackend) canonicalInfoAtSlot(slot uint64) (blockInfo, bool, error) {
+	if err := b.canonicalIndex.ensureRange(slot, slot); err != nil {
+		return blockInfo{}, false, err
+	}
+	info, ok := b.canonicalIndex.infoBySlot(slot)
+	return info, ok, nil
 }
 
 func (b *realBackend) decodeCanonicalBlockInfo(slot uint64, data []byte) (blockInfo, error) {
@@ -490,15 +708,84 @@ func firstNonMissedSource(blockExists map[uint64]bool, simSlot, lookaheadCap uin
 	return 0, false
 }
 
+type canonicalBlocks interface {
+	infoBySlot(slot uint64) (blockInfo, bool)
+	rootKnown(root [32]byte) bool
+	add(info blockInfo)
+}
+
+type canonicalBlockMap struct {
+	bySlot map[uint64]blockInfo
+	byRoot map[[32]byte]blockInfo
+}
+
+func (m *canonicalBlockMap) infoBySlot(slot uint64) (blockInfo, bool) {
+	info, ok := m.bySlot[slot]
+	return info, ok
+}
+
+func (m *canonicalBlockMap) rootKnown(root [32]byte) bool {
+	_, ok := m.byRoot[root]
+	return ok
+}
+
+func (m *canonicalBlockMap) add(info blockInfo) {
+	m.bySlot[info.Slot] = info
+	m.byRoot[info.Root] = info
+}
+
+type canonicalBlockView struct {
+	index *canonicalBlockIndex
+	from  uint64
+	to    uint64
+
+	extraBySlot map[uint64]blockInfo
+	extraByRoot map[[32]byte]blockInfo
+}
+
+func (v *canonicalBlockView) infoBySlot(slot uint64) (blockInfo, bool) {
+	if slot >= v.from && slot <= v.to {
+		if info, ok := v.index.infoBySlot(slot); ok {
+			return info, true
+		}
+	}
+	if v.extraBySlot != nil {
+		info, ok := v.extraBySlot[slot]
+		return info, ok
+	}
+	return blockInfo{}, false
+}
+
+func (v *canonicalBlockView) rootKnown(root [32]byte) bool {
+	if v.extraByRoot != nil {
+		if _, ok := v.extraByRoot[root]; ok {
+			return true
+		}
+	}
+	info, ok := v.index.infoByRoot(root)
+	if !ok {
+		return false
+	}
+	return info.Slot >= v.from && info.Slot <= v.to
+}
+
+func (v *canonicalBlockView) add(info blockInfo) {
+	if v.extraBySlot == nil {
+		v.extraBySlot = make(map[uint64]blockInfo)
+		v.extraByRoot = make(map[[32]byte]blockInfo)
+	}
+	v.extraBySlot[info.Slot] = info
+	v.extraByRoot[info.Root] = info
+}
+
 type planBuildState struct {
-	backend         *realBackend
-	canonicalBySlot map[uint64]blockInfo
-	canonicalByRoot map[[32]byte]blockInfo
-	importedRoots   map[[32]byte]bool
-	scheduledRoots  map[[32]byte]bool
-	missingRoots    map[[32]byte]bool
-	ignoredRoots    map[[32]byte]bool
-	fetchedByRoot   map[[32]byte]blockInfo
+	backend        *realBackend
+	canonical      canonicalBlocks
+	importedRoots  map[[32]byte]bool
+	scheduledRoots map[[32]byte]bool
+	missingRoots   map[[32]byte]bool
+	ignoredRoots   map[[32]byte]bool
+	fetchedByRoot  map[[32]byte]blockInfo
 }
 
 func (s *planBuildState) orphanImportsForSources(
@@ -515,7 +802,7 @@ func (s *planBuildState) orphanImportsForSources(
 
 	roots := make(map[[32]byte]bool)
 	for _, source := range sources {
-		info, ok := s.canonicalBySlot[source.Slot]
+		info, ok := s.canonical.infoBySlot(source.Slot)
 		if !ok {
 			return nil, fmt.Errorf("attestation source slot %d is not a canonical block", source.Slot)
 		}
@@ -580,7 +867,7 @@ func (s *planBuildState) orphanImportsForSources(
 	return imports, nil
 }
 
-func attestationsMadeInWindow(canonicalBySlot map[uint64]blockInfo, madeSlot, lookaheadCap uint64) []attestationInfo {
+func attestationsMadeInWindow(canonical canonicalBlocks, madeSlot, lookaheadCap uint64) []attestationInfo {
 	if lookaheadCap == 0 || madeSlot == math.MaxUint64 {
 		return nil
 	}
@@ -593,7 +880,7 @@ func attestationsMadeInWindow(canonicalBySlot map[uint64]blockInfo, madeSlot, lo
 	start := madeSlot + 1
 	out := make([]attestationInfo, 0)
 	for sourceSlot := start; ; sourceSlot++ {
-		if info, ok := canonicalBySlot[sourceSlot]; ok {
+		if info, ok := canonical.infoBySlot(sourceSlot); ok {
 			for _, attestation := range info.Attestations {
 				if attestation.Slot != madeSlot {
 					continue
@@ -739,27 +1026,21 @@ func (s *planBuildState) resolveOrphanChain(root [32]byte, evalSlot uint64) ([]b
 }
 
 func (s *planBuildState) isCanonicalBlockInfo(info blockInfo) (bool, error) {
-	if canonical, ok := s.canonicalBySlot[info.Slot]; ok {
+	if canonical, ok := s.canonical.infoBySlot(info.Slot); ok {
 		return canonical.Root == info.Root, nil
 	}
 	if s.backend.cfg.EraReader == nil {
 		return false, nil
 	}
 
-	data, ok, err := s.backend.cfg.EraReader.RawBlockSSZ(info.Slot)
+	canonical, ok, err := s.backend.canonicalInfoAtSlot(info.Slot)
 	if err != nil {
 		return false, err
 	}
 	if !ok {
 		return false, nil
 	}
-
-	canonical, err := s.backend.decodeCanonicalBlockInfo(info.Slot, data)
-	if err != nil {
-		return false, fmt.Errorf("parse canonical block at slot %d: %w", info.Slot, err)
-	}
-	s.canonicalBySlot[canonical.Slot] = canonical
-	s.canonicalByRoot[canonical.Root] = canonical
+	s.canonical.add(canonical)
 	return canonical.Root == info.Root, nil
 }
 
@@ -811,8 +1092,7 @@ func (s *planBuildState) rootKnown(root [32]byte) bool {
 	if s.importedRoots[root] {
 		return true
 	}
-	_, ok := s.canonicalByRoot[root]
-	return ok
+	return s.canonical.rootKnown(root)
 }
 
 func blockImport(info blockInfo, canonical bool) PlanBlockImport {

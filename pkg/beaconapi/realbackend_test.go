@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/attestantio/go-eth2-client/spec/phase0"
@@ -259,6 +261,122 @@ func TestRealBackendBuildSlotDropsPreWarmupOrphanParents(t *testing.T) {
 		{Slot: 101, Root: formatRoot(canonical101Root), Canonical: true},
 		{Slot: 101, Root: formatRoot(orphanHead101Root), Canonical: false},
 	}, instruction.ImportBlocks)
+}
+
+func TestRealBackendBuildSlotWarmupScopeUnaffectedByIndexWarmth(t *testing.T) {
+	cacheDir := t.TempDir()
+
+	orphanParent100 := encodeTestSignedBeaconBlockWithAttestations(100, [32]byte{}, nil)
+	orphanParent100Root := testBlockRoot(t, orphanParent100)
+	orphanHead101 := encodeTestSignedBeaconBlockWithAttestations(101, orphanParent100Root, nil)
+	orphanHead101Root := testBlockRoot(t, orphanHead101)
+	canonical101 := encodeTestSignedBeaconBlock(101)
+	canonical101Root := testBlockRoot(t, canonical101)
+	canonical102 := encodeTestSignedBeaconBlockWithAttestations(102, canonical101Root, []*phase0.Attestation{
+		testAttestation(101, orphanHead101Root, orphanHead101Root),
+	})
+	writeTestEraFileWithBlocks(t, cacheDir, 1, canonical101, canonical102)
+
+	archiveDir := filepath.Join(cacheDir, "archive")
+	require.NoError(t, os.MkdirAll(archiveDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(archiveDir, rootHex(orphanParent100Root)+".ssz"), orphanParent100, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(archiveDir, rootHex(orphanHead101Root)+".ssz"), orphanHead101, 0o644))
+
+	newBackend := func(t *testing.T) Backend {
+		t.Helper()
+		reader, err := era.New(cacheDir)
+		require.NoError(t, err)
+		archiveClient, err := blockarchive.New("http://archive.test", "mainnet", archiveDir)
+		require.NoError(t, err)
+		return NewRealBackend(RealBackendConfig{
+			EraReader:    reader,
+			LookaheadCap: 2,
+			BlockArchive: archiveClient,
+		})
+	}
+
+	warmed := newBackend(t)
+	warmedWithEarlierWarmup, err := warmed.BuildSlot(101, 99)
+	require.NoError(t, err)
+	require.Contains(t, warmedWithEarlierWarmup.ImportBlocks, PlanBlockImport{Slot: 100, Root: formatRoot(orphanParent100Root), Canonical: false})
+
+	got, err := warmed.BuildSlot(101, 100)
+	require.NoError(t, err)
+	want, err := newBackend(t).BuildSlot(101, 100)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+	require.Equal(t, []PlanBlockImport{
+		{Slot: 101, Root: formatRoot(canonical101Root), Canonical: true},
+		{Slot: 101, Root: formatRoot(orphanHead101Root), Canonical: false},
+	}, got.ImportBlocks)
+}
+
+func TestRealBackendBuildSlotConcurrentMatchesFreshResults(t *testing.T) {
+	cacheDir := t.TempDir()
+
+	canonical101 := encodeTestSignedBeaconBlock(101)
+	canonical101Root := testBlockRoot(t, canonical101)
+	canonical102 := encodeTestSignedBeaconBlockWithAttestations(102, canonical101Root, []*phase0.Attestation{
+		testAttestation(101, canonical101Root, canonical101Root),
+	})
+	canonical102Root := testBlockRoot(t, canonical102)
+	orphan102 := encodeTestSignedBeaconBlockWithAttestations(102, canonical101Root, nil)
+	orphan102Root := testBlockRoot(t, orphan102)
+	orphanVote := testAttestation(102, orphan102Root, orphan102Root)
+	canonical103 := encodeTestSignedBeaconBlockWithAttestations(103, canonical102Root, []*phase0.Attestation{orphanVote})
+	canonical103Root := testBlockRoot(t, canonical103)
+	canonical104 := encodeTestSignedBeaconBlockWithAttestations(104, canonical103Root, []*phase0.Attestation{orphanVote})
+	writeTestEraFileWithBlocks(t, cacheDir, 1, canonical101, canonical102, canonical103, canonical104)
+
+	archiveDir := filepath.Join(cacheDir, "archive")
+	require.NoError(t, os.MkdirAll(archiveDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(archiveDir, rootHex(orphan102Root)+".ssz"), orphan102, 0o644))
+
+	newBackend := func(t *testing.T) Backend {
+		t.Helper()
+		reader, err := era.New(cacheDir)
+		require.NoError(t, err)
+		archiveClient, err := blockarchive.New("http://archive.test", "mainnet", archiveDir)
+		require.NoError(t, err)
+		return NewRealBackend(RealBackendConfig{
+			EraReader:    reader,
+			LookaheadCap: 2,
+			BlockArchive: archiveClient,
+		})
+	}
+
+	slots := []uint64{101, 102, 103}
+	expected := make(map[uint64]SlotInstruction, len(slots))
+	for _, slot := range slots {
+		instruction, err := newBackend(t).BuildSlot(slot, 100)
+		require.NoError(t, err)
+		expected[slot] = instruction
+	}
+
+	shared := newBackend(t)
+	var wg sync.WaitGroup
+	errs := make(chan error, len(slots)*8)
+	for i := 0; i < 8; i++ {
+		for _, slot := range slots {
+			wg.Add(1)
+			go func(slot uint64) {
+				defer wg.Done()
+				got, err := shared.BuildSlot(slot, 100)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if !reflect.DeepEqual(got, expected[slot]) {
+					errs <- fmt.Errorf("slot %d instruction mismatch", slot)
+				}
+			}(slot)
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
 }
 
 func TestRealBackendFetcherAndGenesisInfo(t *testing.T) {

@@ -22,3 +22,6 @@ attestation-timing/
 
 # Go test outputs
 *.test
+
+# Local cluster deploy scratch (manifests/scripts for analytics runs)
+deploy/
