@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -30,6 +31,7 @@ import (
 	"github.com/ethpandaops/fcr-simulator/pkg/era"
 	"github.com/ethpandaops/fcr-simulator/pkg/manifest"
 	"github.com/ethpandaops/fcr-simulator/pkg/merge"
+	"github.com/ethpandaops/fcr-simulator/pkg/s3cache"
 	"github.com/ethpandaops/fcr-simulator/pkg/schema"
 )
 
@@ -45,6 +47,7 @@ const (
 	defaultLookaheadCap          = uint64(4)
 	defaultHTTPListen            = "127.0.0.1:0"
 	defaultDecodedBlockCacheSize = beaconapi.DefaultDecodedBlockCacheSize
+	defaultS3PathStyle           = true
 )
 
 var version = "dev"
@@ -91,8 +94,24 @@ type config struct {
 	HTTPListen            string
 	BlockArchiveURL       string
 	DecodedBlockCacheSize int
+	S3Endpoint            string
+	S3Bucket              string
+	S3PathStyle           bool
 	KeepCache             bool
 	PrepOnly              bool
+}
+
+type eraMirrorConfig struct {
+	Network      string
+	StartEpoch   uint64
+	EndEpoch     uint64
+	WarmupEpochs uint64
+	Parallel     int
+	EraURL       string
+	CacheDir     string
+	S3Endpoint   string
+	S3Bucket     string
+	S3PathStyle  bool
 }
 
 type engineBinarySource int
@@ -130,6 +149,10 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "era-mirror" {
+		return runEraMirrorCommand(ctx, args[1:], stdout, stderr)
+	}
+
 	cfg, printVersion, err := parseConfig(args, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -179,6 +202,9 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 	fs.StringVar(&cfg.HTTPListen, "http-listen", defaultHTTPListen, "local HTTP listen address")
 	fs.StringVar(&cfg.BlockArchiveURL, "block-archive-url", "", "optional block-archiver URL for resolving attestations to orphan/non-canonical blocks")
 	fs.IntVar(&cfg.DecodedBlockCacheSize, "decoded-block-cache-size", defaultDecodedBlockCacheSize, "decoded block LRU entries for per-slot simulation planning (0 disables)")
+	fs.StringVar(&cfg.S3Endpoint, "s3-endpoint", os.Getenv("S3_ENDPOINT"), "optional S3-compatible cache endpoint (env: S3_ENDPOINT)")
+	fs.StringVar(&cfg.S3Bucket, "s3-bucket", os.Getenv("S3_BUCKET"), "optional S3-compatible cache bucket (env: S3_BUCKET)")
+	fs.BoolVar(&cfg.S3PathStyle, "s3-path-style", defaultS3PathStyle, "use S3 path-style addressing")
 	fs.BoolVar(&cfg.KeepCache, "keep-cache", false, "keep intermediate cache after run")
 	fs.BoolVar(&cfg.PrepOnly, "prep-only", false, "download ERA files and checkpoint state then exit (no engine run)")
 	fs.BoolVar(&printVersion, "version", false, "print orchestrator version and exit")
@@ -225,6 +251,8 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 	cfg.BeaconNodeURL = strings.TrimRight(strings.TrimSpace(cfg.BeaconNodeURL), "/")
 	cfg.EraURL = strings.TrimRight(strings.TrimSpace(cfg.EraURL), "/")
 	cfg.BlockArchiveURL = strings.TrimRight(strings.TrimSpace(cfg.BlockArchiveURL), "/")
+	cfg.S3Endpoint = strings.TrimRight(strings.TrimSpace(cfg.S3Endpoint), "/")
+	cfg.S3Bucket = strings.TrimSpace(cfg.S3Bucket)
 	cfg.OutputFormat = strings.ToLower(strings.TrimSpace(cfg.OutputFormat))
 	cfg.AttestationSourceMode = strings.TrimSpace(cfg.AttestationSourceMode)
 	if cfg.AttestationSourceMode == "strict-source-block-k-minus-1" {
@@ -302,12 +330,148 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 	if cfg.DecodedBlockCacheSize < 0 {
 		return fmt.Errorf("--decoded-block-cache-size must be >= 0")
 	}
+	if err := validateS3Settings(cfg.S3Endpoint, cfg.S3Bucket, false); err != nil {
+		return err
+	}
 	return nil
+}
+
+func runEraMirrorCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	cfg, err := parseEraMirrorConfig(args, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
+		fmt.Fprintf(stderr, "create cache directory %q: %v\n", cfg.CacheDir, err)
+		return 1
+	}
+
+	s3Store, err := newS3Store(cfg.S3Endpoint, cfg.S3Bucket, cfg.S3PathStyle)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if s3Store == nil {
+		fmt.Fprintln(stderr, "S3 cache is required for era-mirror")
+		return 1
+	}
+
+	chunks := chunk.Split(cfg.StartEpoch, cfg.EndEpoch, cfg.WarmupEpochs, cfg.Parallel)
+	activeChunks := filterActiveChunks(chunks)
+	if len(activeChunks) == 0 {
+		fmt.Fprintln(stderr, "no non-empty chunks generated")
+		return 1
+	}
+
+	startSlot := minWarmupSlot(activeChunks)
+	endSlot := maxEndSlot(activeChunks)
+	startEra, endEra := eraRangeForSlots(startSlot, endSlot)
+
+	downloader, err := era.NewDownloaderWithS3(cfg.EraURL, cfg.CacheDir, cfg.Network, s3Store)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	fmt.Fprintf(stdout, "mirroring ERA files for slots %d through %d into s3://%s/era/%s/ (eras %d through %d)\n",
+		startSlot, endSlot, cfg.S3Bucket, cfg.Network, startEra, endEra)
+	stats, err := downloader.MirrorToS3(ctx, startEra, endEra)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "ERA mirror complete: scanned=%d skipped=%d downloaded=%d uploaded=%d\n",
+		stats.Scanned, stats.Skipped, stats.Downloaded, stats.Uploaded)
+	return 0
+}
+
+func parseEraMirrorConfig(args []string, output io.Writer) (eraMirrorConfig, error) {
+	var cfg eraMirrorConfig
+	var startEpoch requiredUint64Flag
+	var endEpoch requiredUint64Flag
+
+	fs := flag.NewFlagSet("fcr-orchestrator era-mirror", flag.ContinueOnError)
+	fs.SetOutput(output)
+	fs.StringVar(&cfg.Network, "network", "mainnet", "network name (V1 supports mainnet)")
+	fs.Var(&startEpoch, "start-epoch", "first epoch, inclusive")
+	fs.Var(&endEpoch, "end-epoch", "end epoch, exclusive")
+	fs.Uint64Var(&cfg.WarmupEpochs, "warmup-epochs", defaultWarmupEpochs, "warmup epochs per worker")
+	fs.IntVar(&cfg.Parallel, "parallel", defaultParallel, "number of workers")
+	fs.StringVar(&cfg.EraURL, "era-url", defaultEraURL, "ERA file base URL")
+	fs.StringVar(&cfg.CacheDir, "cache-dir", defaultCacheDir, "cache directory")
+	fs.StringVar(&cfg.S3Endpoint, "s3-endpoint", os.Getenv("S3_ENDPOINT"), "S3-compatible cache endpoint (env: S3_ENDPOINT)")
+	fs.StringVar(&cfg.S3Bucket, "s3-bucket", os.Getenv("S3_BUCKET"), "S3-compatible cache bucket (env: S3_BUCKET)")
+	fs.BoolVar(&cfg.S3PathStyle, "s3-path-style", defaultS3PathStyle, "use S3 path-style addressing")
+
+	if err := fs.Parse(args); err != nil {
+		return eraMirrorConfig{}, err
+	}
+	if fs.NArg() != 0 {
+		return eraMirrorConfig{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(fs.Args(), " "))
+	}
+
+	cfg.StartEpoch = startEpoch.value
+	cfg.EndEpoch = endEpoch.value
+	if err := validateEraMirrorConfig(&cfg, startEpoch.set, endEpoch.set); err != nil {
+		return eraMirrorConfig{}, err
+	}
+
+	expandedCacheDir, err := expandPath(cfg.CacheDir)
+	if err != nil {
+		return eraMirrorConfig{}, err
+	}
+	cfg.CacheDir = expandedCacheDir
+	cfg.Network = strings.TrimSpace(cfg.Network)
+	cfg.EraURL = strings.TrimRight(strings.TrimSpace(cfg.EraURL), "/")
+	cfg.S3Endpoint = strings.TrimRight(strings.TrimSpace(cfg.S3Endpoint), "/")
+	cfg.S3Bucket = strings.TrimSpace(cfg.S3Bucket)
+	return cfg, nil
+}
+
+func validateEraMirrorConfig(cfg *eraMirrorConfig, startSet, endSet bool) error {
+	if strings.TrimSpace(cfg.Network) == "" {
+		return fmt.Errorf("--network is required")
+	}
+	if strings.TrimSpace(cfg.Network) != "mainnet" {
+		return fmt.Errorf("--network=%q is not supported in V1; supported value is %q", cfg.Network, "mainnet")
+	}
+	if !startSet {
+		return fmt.Errorf("--start-epoch is required")
+	}
+	if !endSet {
+		return fmt.Errorf("--end-epoch is required")
+	}
+	if cfg.StartEpoch >= cfg.EndEpoch {
+		return fmt.Errorf("--start-epoch (%d) must be less than --end-epoch (%d)", cfg.StartEpoch, cfg.EndEpoch)
+	}
+	if cfg.Parallel <= 0 {
+		return fmt.Errorf("--parallel must be greater than zero")
+	}
+	if strings.TrimSpace(cfg.EraURL) == "" {
+		return fmt.Errorf("--era-url is required")
+	}
+	if err := validateHTTPURL(cfg.EraURL, "--era-url"); err != nil {
+		return err
+	}
+	if strings.TrimSpace(cfg.CacheDir) == "" {
+		return fmt.Errorf("--cache-dir is required")
+	}
+	return validateS3Settings(cfg.S3Endpoint, cfg.S3Bucket, true)
 }
 
 func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 	if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
 		return 1, fmt.Errorf("create cache directory %q: %w", cfg.CacheDir, err)
+	}
+
+	s3Store, err := newS3Store(cfg.S3Endpoint, cfg.S3Bucket, cfg.S3PathStyle)
+	if err != nil {
+		return 1, err
+	}
+	if s3Store != nil {
+		fmt.Fprintf(stdout, "S3 cache enabled: bucket %s at %s\n", cfg.S3Bucket, cfg.S3Endpoint)
 	}
 
 	fmt.Fprintf(stdout, "capturing engine manifest from %s\n", cfg.EngineBinary)
@@ -329,11 +493,11 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 	}
 
 	fmt.Fprintf(stdout, "pre-downloading ERA files for slots %d through %d\n", minWarmupSlot(activeChunks), maxEndSlot(activeChunks))
-	downloader, err := era.NewDownloader(cfg.EraURL, cfg.CacheDir)
+	downloader, err := era.NewDownloaderWithS3(cfg.EraURL, cfg.CacheDir, cfg.Network, s3Store)
 	if err != nil {
 		return 1, err
 	}
-	if err := downloader.PreDownload(minWarmupSlot(activeChunks), maxEndSlot(activeChunks)); err != nil {
+	if err := downloader.PreDownloadContext(ctx, minWarmupSlot(activeChunks), maxEndSlot(activeChunks)); err != nil {
 		return 1, fmt.Errorf("pre-download ERA files: %w", err)
 	}
 
@@ -342,7 +506,7 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 		return 1, err
 	}
 
-	fetcher, err := beaconfetch.New(cfg.BeaconNodeURL, cfg.CacheDir)
+	fetcher, err := beaconfetch.NewWithS3(cfg.BeaconNodeURL, cfg.CacheDir, cfg.Network, s3Store)
 	if err != nil {
 		return 1, err
 	}
@@ -909,6 +1073,76 @@ func validateHTTPURL(value, name string) error {
 		return fmt.Errorf("%s must include a host", name)
 	}
 	return nil
+}
+
+func newS3Store(endpoint, bucket string, pathStyle bool) (s3cache.Store, error) {
+	if strings.TrimSpace(endpoint) == "" && strings.TrimSpace(bucket) == "" {
+		return nil, nil
+	}
+	return s3cache.New(s3cache.Config{
+		Endpoint:        endpoint,
+		Bucket:          bucket,
+		AccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
+		SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+		PathStyle:       pathStyle,
+	})
+}
+
+func validateS3Settings(endpoint, bucket string, required bool) error {
+	endpoint = strings.TrimSpace(endpoint)
+	bucket = strings.TrimSpace(bucket)
+	if !required && endpoint == "" && bucket == "" {
+		return nil
+	}
+	if endpoint == "" {
+		return fmt.Errorf("--s3-endpoint is required when S3 cache is configured")
+	}
+	if bucket == "" {
+		return fmt.Errorf("--s3-bucket is required when S3 cache is configured")
+	}
+	if strings.TrimSpace(os.Getenv("AWS_ACCESS_KEY_ID")) == "" {
+		return fmt.Errorf("AWS_ACCESS_KEY_ID is required when S3 cache is configured")
+	}
+	if strings.TrimSpace(os.Getenv("AWS_SECRET_ACCESS_KEY")) == "" {
+		return fmt.Errorf("AWS_SECRET_ACCESS_KEY is required when S3 cache is configured")
+	}
+	if err := validateS3Endpoint(endpoint); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateS3Endpoint(value string) error {
+	value = strings.TrimSpace(value)
+	if !strings.Contains(value, "://") {
+		value = "http://" + value
+	}
+
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("--s3-endpoint is not a valid URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("--s3-endpoint must use http or https")
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("--s3-endpoint must include a host")
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return fmt.Errorf("--s3-endpoint must not include a path")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("--s3-endpoint must not include query or fragment")
+	}
+	return nil
+}
+
+func eraRangeForSlots(startSlot, endSlot uint64) (uint64, uint64) {
+	endWithLookahead := endSlot + 32
+	if endSlot > math.MaxUint64-32 {
+		endWithLookahead = math.MaxUint64
+	}
+	return era.EraNumberForSlot(startSlot), era.EraNumberForSlot(endWithLookahead)
 }
 
 func flagWasSet(fs *flag.FlagSet, name string) bool {

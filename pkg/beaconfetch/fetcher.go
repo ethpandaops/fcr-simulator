@@ -1,6 +1,7 @@
 package beaconfetch
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/ethpandaops/fcr-simulator/pkg/s3cache"
 )
 
 const (
@@ -28,16 +31,27 @@ type Fetcher struct {
 	beaconNodeURL string
 	cacheDir      string
 	client        *http.Client
+	network       string
+	s3Store       s3cache.Store
 }
 
 // New returns a Fetcher that reads and writes SSZ cache files under cacheDir.
 func New(beaconNodeURL, cacheDir string) (*Fetcher, error) {
+	return NewWithS3(beaconNodeURL, cacheDir, "", nil)
+}
+
+// NewWithS3 returns a Fetcher that can use an S3-compatible cache for states.
+func NewWithS3(beaconNodeURL, cacheDir, network string, s3Store s3cache.Store) (*Fetcher, error) {
 	beaconNodeURL = strings.TrimRight(strings.TrimSpace(beaconNodeURL), "/")
 	if beaconNodeURL == "" {
 		return nil, fmt.Errorf("beacon node URL is required")
 	}
 	if cacheDir == "" {
 		return nil, fmt.Errorf("cache directory is required")
+	}
+	network = strings.TrimSpace(network)
+	if s3Store != nil && network == "" {
+		return nil, fmt.Errorf("network is required when checkpoint state S3 cache is configured")
 	}
 
 	if err := os.MkdirAll(filepath.Join(cacheDir, "states"), 0o755); err != nil {
@@ -53,6 +67,8 @@ func New(beaconNodeURL, cacheDir string) (*Fetcher, error) {
 		client: &http.Client{
 			Timeout: httpTimeout,
 		},
+		network: network,
+		s3Store: s3Store,
 	}, nil
 }
 
@@ -63,6 +79,9 @@ func (f *Fetcher) FetchStateSSZAtSlot(slot uint64) ([]byte, error) {
 	cachePath := filepath.Join(f.cacheDir, "states", fmt.Sprintf("state-%d.ssz", slot))
 	url := fmt.Sprintf("%s/eth/v2/debug/beacon/states/%d", f.beaconNodeURL, slot)
 
+	if f.s3Store != nil {
+		return f.cachedOrS3OrFetch(cachePath, checkpointStateObjectKey(f.network, slot), url, acceptSSZ)
+	}
 	return f.cachedOrFetch(cachePath, url, acceptSSZ)
 }
 
@@ -72,6 +91,9 @@ func (f *Fetcher) FetchGenesisStateSSZ() ([]byte, error) {
 	cachePath := filepath.Join(f.cacheDir, "states", "state-genesis.ssz")
 	url := fmt.Sprintf("%s/eth/v2/debug/beacon/states/genesis", f.beaconNodeURL)
 
+	if f.s3Store != nil {
+		return f.cachedOrS3OrFetch(cachePath, checkpointGenesisStateObjectKey(f.network), url, acceptSSZ)
+	}
 	return f.cachedOrFetch(cachePath, url, acceptSSZ)
 }
 
@@ -176,6 +198,44 @@ func (f *Fetcher) cachedOrFetch(cachePath, url, accept string) ([]byte, error) {
 	return data, nil
 }
 
+func (f *Fetcher) cachedOrS3OrFetch(cachePath, objectKey, url, accept string) ([]byte, error) {
+	data, ok, err := f.s3Store.Download(context.Background(), objectKey)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		if err := writeFileAtomic(cachePath, data); err != nil {
+			return nil, fmt.Errorf("failed to write cache file %q: %w", cachePath, err)
+		}
+		return data, nil
+	}
+
+	data, err = os.ReadFile(cachePath)
+	if err == nil {
+		if err := f.s3Store.Upload(context.Background(), objectKey, data); err != nil {
+			return nil, err
+		}
+		return data, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("failed to read cache file %q: %w", cachePath, err)
+	}
+
+	data, err = f.fetch(url, accept)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := writeFileAtomic(cachePath, data); err != nil {
+		return nil, fmt.Errorf("failed to write cache file %q: %w", cachePath, err)
+	}
+	if err := f.s3Store.Upload(context.Background(), objectKey, data); err != nil {
+		return nil, err
+	}
+
+	return data, nil
+}
+
 func (f *Fetcher) fetch(url, accept string) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -263,4 +323,12 @@ func parseRoot(value string) ([32]byte, error) {
 	var root [32]byte
 	copy(root[:], decoded)
 	return root, nil
+}
+
+func checkpointStateObjectKey(network string, slot uint64) string {
+	return fmt.Sprintf("checkpoint-state/%s/%d.ssz", network, slot)
+}
+
+func checkpointGenesisStateObjectKey(network string) string {
+	return fmt.Sprintf("checkpoint-state/%s/genesis.ssz", network)
 }

@@ -1,17 +1,21 @@
 package era
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ethpandaops/fcr-simulator/pkg/s3cache"
 )
 
 const (
@@ -28,6 +32,8 @@ type Downloader struct {
 	baseURL  string
 	cacheDir string
 	client   *http.Client
+	network  string
+	s3Store  s3cache.Store
 
 	mu           sync.Mutex
 	indexLoaded  bool
@@ -39,11 +45,28 @@ type eraFilename struct {
 	filename string
 }
 
+// MirrorStats summarizes an ERA mirror run.
+type MirrorStats struct {
+	Scanned    int
+	Skipped    int
+	Downloaded int
+	Uploaded   int
+}
+
 // NewDownloader returns a downloader writing to cacheDir/era/.
 func NewDownloader(baseURL, cacheDir string) (*Downloader, error) {
+	return NewDownloaderWithS3(baseURL, cacheDir, "", nil)
+}
+
+// NewDownloaderWithS3 returns a downloader that can use an S3-compatible cache.
+func NewDownloaderWithS3(baseURL, cacheDir, network string, s3Store s3cache.Store) (*Downloader, error) {
 	eraDir := filepath.Join(cacheDir, "era")
 	if err := os.MkdirAll(eraDir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create ERA cache directory %q: %w", eraDir, err)
+	}
+	network = strings.TrimSpace(network)
+	if s3Store != nil && network == "" {
+		return nil, fmt.Errorf("network is required when ERA S3 cache is configured")
 	}
 
 	return &Downloader{
@@ -52,6 +75,8 @@ func NewDownloader(baseURL, cacheDir string) (*Downloader, error) {
 		client: &http.Client{
 			Timeout: downloaderHTTPTimeout,
 		},
+		network: network,
+		s3Store: s3Store,
 	}, nil
 }
 
@@ -60,6 +85,11 @@ func NewDownloader(baseURL, cacheDir string) (*Downloader, error) {
 // Files already present in the cache are skipped. Each missing file is retried
 // up to defaultMaxRetries times with capped linear backoff.
 func (d *Downloader) PreDownload(startSlot, endSlot uint64) error {
+	return d.PreDownloadContext(context.Background(), startSlot, endSlot)
+}
+
+// PreDownloadContext fetches every era covering [startSlot, endSlot+32].
+func (d *Downloader) PreDownloadContext(ctx context.Context, startSlot, endSlot uint64) error {
 	if d == nil {
 		return fmt.Errorf("nil ERA downloader")
 	}
@@ -89,7 +119,7 @@ func (d *Downloader) PreDownload(startSlot, endSlot uint64) error {
 	}
 
 	for _, eraNumber := range needed {
-		if err := d.downloadEraWithRetries(eraNumber, defaultMaxRetries); err != nil {
+		if err := d.downloadEraWithRetries(ctx, eraNumber, defaultMaxRetries); err != nil {
 			return err
 		}
 	}
@@ -178,11 +208,21 @@ func (d *Downloader) filenameForEra(eraNumber uint64) (string, error) {
 	return "", fmt.Errorf("ERA file not found for era number %d", eraNumber)
 }
 
-func (d *Downloader) downloadEraWithRetries(eraNumber uint64, maxRetries uint32) error {
+func (d *Downloader) downloadEraWithRetries(ctx context.Context, eraNumber uint64, maxRetries uint32) error {
 	if maxRetries == 0 {
 		return fmt.Errorf("max retries must be greater than zero")
 	}
 
+	if ok, err := d.tryDownloadEraFromS3(ctx, eraNumber); err != nil {
+		return err
+	} else if ok {
+		return nil
+	}
+
+	return d.downloadEraFromHTTPWithRetries(ctx, eraNumber, maxRetries, d.s3Store != nil)
+}
+
+func (d *Downloader) downloadEraFromHTTPWithRetries(ctx context.Context, eraNumber uint64, maxRetries uint32, uploadToS3 bool) error {
 	filename, err := d.filenameForEra(eraNumber)
 	if err != nil {
 		return err
@@ -191,7 +231,7 @@ func (d *Downloader) downloadEraWithRetries(eraNumber uint64, maxRetries uint32)
 
 	var lastErr error
 	for attempt := uint32(1); attempt <= maxRetries; attempt++ {
-		if err := d.tryDownload(url, filename); err != nil {
+		if err := d.tryDownloadHTTP(ctx, url, filename, uploadToS3); err != nil {
 			lastErr = err
 			if attempt < maxRetries {
 				backoff := min(retryBackoffStepSec*int(attempt), retryBackoffMaxSec)
@@ -205,8 +245,13 @@ func (d *Downloader) downloadEraWithRetries(eraNumber uint64, maxRetries uint32)
 	return fmt.Errorf("failed to download ERA %d after %d attempts: %w", eraNumber, maxRetries, lastErr)
 }
 
-func (d *Downloader) tryDownload(url, filename string) error {
-	resp, err := d.client.Get(url)
+func (d *Downloader) tryDownloadHTTP(ctx context.Context, url, filename string, uploadToS3 bool) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to build ERA file request %q: %w", url, err)
+	}
+
+	resp, err := d.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to download ERA file %q: %w", url, err)
 	}
@@ -225,5 +270,110 @@ func (d *Downloader) tryDownload(url, filename string) error {
 	if err := os.WriteFile(cachePath, data, 0o644); err != nil {
 		return fmt.Errorf("failed to create cache file %q: %w", cachePath, err)
 	}
+	if uploadToS3 {
+		key := eraObjectKey(d.network, filename)
+		if err := d.s3Store.UploadFile(ctx, key, cachePath); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (d *Downloader) tryDownloadEraFromS3(ctx context.Context, eraNumber uint64) (bool, error) {
+	if d.s3Store == nil {
+		return false, nil
+	}
+
+	filename, ok, err := d.s3FilenameForEra(ctx, eraNumber)
+	if err != nil || !ok {
+		return false, err
+	}
+
+	key := eraObjectKey(d.network, filename)
+	cachePath := filepath.Join(d.cacheDir, filename)
+	ok, err = d.s3Store.DownloadFile(ctx, key, cachePath)
+	if err != nil {
+		return false, err
+	}
+	return ok, nil
+}
+
+func (d *Downloader) s3FilenameForEra(ctx context.Context, eraNumber uint64) (string, bool, error) {
+	objects, err := d.s3Store.ListObjects(ctx, eraObjectPrefix(d.network, eraNumber))
+	if err != nil {
+		return "", false, err
+	}
+
+	for _, object := range objects {
+		filename := path.Base(object.Key)
+		if strings.HasPrefix(filename, eraFilePrefix(eraNumber)) && strings.HasSuffix(filename, ".era") {
+			return filename, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// MirrorToS3 mirrors every era in [startEra, endEra] from the public archive to S3.
+func (d *Downloader) MirrorToS3(ctx context.Context, startEra, endEra uint64) (MirrorStats, error) {
+	var stats MirrorStats
+	if d == nil {
+		return stats, fmt.Errorf("nil ERA downloader")
+	}
+	if d.s3Store == nil {
+		return stats, fmt.Errorf("ERA S3 cache is not configured")
+	}
+	if startEra > endEra {
+		return stats, fmt.Errorf("start era %d is after end era %d", startEra, endEra)
+	}
+
+	for eraNumber := startEra; ; eraNumber++ {
+		stats.Scanned++
+
+		filename, err := d.filenameForEra(eraNumber)
+		if err != nil {
+			return stats, err
+		}
+		key := eraObjectKey(d.network, filename)
+		exists, err := d.s3Store.ObjectExists(ctx, key)
+		if err != nil {
+			return stats, err
+		}
+		if exists {
+			stats.Skipped++
+			if eraNumber == endEra {
+				break
+			}
+			continue
+		}
+
+		cachePath := filepath.Join(d.cacheDir, filename)
+		if _, err := os.Stat(cachePath); err != nil {
+			if !os.IsNotExist(err) {
+				return stats, fmt.Errorf("stat ERA cache file %q: %w", cachePath, err)
+			}
+			url := fmt.Sprintf("%s/%s", d.baseURL, filename)
+			if err := d.tryDownloadHTTP(ctx, url, filename, false); err != nil {
+				return stats, err
+			}
+			stats.Downloaded++
+		}
+		if err := d.s3Store.UploadFile(ctx, key, cachePath); err != nil {
+			return stats, err
+		}
+		stats.Uploaded++
+
+		if eraNumber == endEra {
+			break
+		}
+	}
+
+	return stats, nil
+}
+
+func eraObjectPrefix(network string, eraNumber uint64) string {
+	return fmt.Sprintf("era/%s/%s", network, eraFilePrefix(eraNumber))
+}
+
+func eraObjectKey(network, filename string) string {
+	return fmt.Sprintf("era/%s/%s", network, filename)
 }

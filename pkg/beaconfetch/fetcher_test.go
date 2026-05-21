@@ -1,6 +1,7 @@
 package beaconfetch
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/ethpandaops/fcr-simulator/pkg/s3cache"
 	"github.com/stretchr/testify/require"
 )
 
@@ -63,6 +65,39 @@ func TestFetchStateSSZAtSlot_HTTP200WritesCache(t *testing.T) {
 	require.EqualValues(t, 1, calls.Load())
 }
 
+func TestFetchStateSSZAtSlot_S3MissFetchesHTTPAndUploads(t *testing.T) {
+	store := newFakeS3Store(nil)
+	fetcher := newTestFetcherWithS3(t, t.TempDir(), "mainnet", store, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/eth/v2/debug/beacon/states/456", r.URL.Path)
+		require.Equal(t, acceptSSZ, r.Header.Get("Accept"))
+		_, _ = w.Write([]byte("state-456"))
+	})
+
+	data, err := fetcher.FetchStateSSZAtSlot(456)
+	require.NoError(t, err)
+	require.Equal(t, []byte("state-456"), data)
+	require.Equal(t, []byte("state-456"), store.objects["checkpoint-state/mainnet/456.ssz"])
+	require.Equal(t, []byte("state-456"), readCacheFile(t, fetcher.cacheDir, "states", "state-456.ssz"))
+	require.Equal(t, []string{"checkpoint-state/mainnet/456.ssz"}, store.downloads)
+	require.Equal(t, []string{"checkpoint-state/mainnet/456.ssz"}, store.uploads)
+}
+
+func TestFetchStateSSZAtSlot_S3MissLocalHitUploadsAndSkipsHTTP(t *testing.T) {
+	store := newFakeS3Store(nil)
+	fetcher := newTestFetcherWithS3(t, t.TempDir(), "mainnet", store, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("HTTP should not be called on local cache hit")
+	})
+	cachePath := filepath.Join(fetcher.cacheDir, "states", "state-789.ssz")
+	require.NoError(t, os.WriteFile(cachePath, []byte("local-state"), 0o644))
+
+	data, err := fetcher.FetchStateSSZAtSlot(789)
+	require.NoError(t, err)
+	require.Equal(t, []byte("local-state"), data)
+	require.Equal(t, []byte("local-state"), store.objects["checkpoint-state/mainnet/789.ssz"])
+	require.Equal(t, []string{"checkpoint-state/mainnet/789.ssz"}, store.downloads)
+	require.Equal(t, []string{"checkpoint-state/mainnet/789.ssz"}, store.uploads)
+}
+
 func TestFetchGenesisStateSSZ_HTTP200WritesCache(t *testing.T) {
 	fetcher := newTestFetcher(t, t.TempDir(), func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/eth/v2/debug/beacon/states/genesis", r.URL.Path)
@@ -74,6 +109,21 @@ func TestFetchGenesisStateSSZ_HTTP200WritesCache(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("genesis-state"), data)
 	require.Equal(t, []byte("genesis-state"), readCacheFile(t, fetcher.cacheDir, "states", "state-genesis.ssz"))
+}
+
+func TestFetchGenesisStateSSZ_S3Hit(t *testing.T) {
+	store := newFakeS3Store(map[string][]byte{
+		"checkpoint-state/mainnet/genesis.ssz": []byte("genesis-from-s3"),
+	})
+	fetcher := newTestFetcherWithS3(t, t.TempDir(), "mainnet", store, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("HTTP should not be called on S3 hit")
+	})
+
+	data, err := fetcher.FetchGenesisStateSSZ()
+	require.NoError(t, err)
+	require.Equal(t, []byte("genesis-from-s3"), data)
+	require.Equal(t, []byte("genesis-from-s3"), readCacheFile(t, fetcher.cacheDir, "states", "state-genesis.ssz"))
+	require.Equal(t, []string{"checkpoint-state/mainnet/genesis.ssz"}, store.downloads)
 }
 
 func TestFetchBlockSSZByRoot_Cached(t *testing.T) {
@@ -159,6 +209,31 @@ func TestFetchCheckpointAtWarmupSlot_StraightHit(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(100), actualSlot)
 	require.Equal(t, []byte("state-100"), stateSSZ)
+}
+
+func TestFetchCheckpointAtWarmupSlot_StateS3HitSkipsStateHTTP(t *testing.T) {
+	root := testRoot(0x56)
+	store := newFakeS3Store(map[string][]byte{
+		"checkpoint-state/mainnet/100.ssz": []byte("state-from-s3"),
+	})
+	fetcher := newTestFetcherWithS3(t, t.TempDir(), "mainnet", store, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/eth/v1/beacon/headers/100":
+			require.Equal(t, acceptJSON, r.Header.Get("Accept"))
+			_, _ = fmt.Fprintf(w, `{"data":{"root":%q}}`, rootHex(root))
+		case "/eth/v2/debug/beacon/states/100":
+			t.Fatalf("state endpoint should not be called on S3 hit")
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	actualSlot, stateSSZ, err := fetcher.FetchCheckpointAtWarmupSlot(100)
+	require.NoError(t, err)
+	require.Equal(t, uint64(100), actualSlot)
+	require.Equal(t, []byte("state-from-s3"), stateSSZ)
+	require.Equal(t, []byte("state-from-s3"), readCacheFile(t, fetcher.cacheDir, "states", "state-100.ssz"))
+	require.Equal(t, []string{"checkpoint-state/mainnet/100.ssz"}, store.downloads)
 }
 
 func TestFetchCheckpointAtWarmupSlot_MissedSlotFallback(t *testing.T) {
@@ -324,6 +399,20 @@ func newTestFetcher(t *testing.T, cacheDir string, handler http.HandlerFunc) *Fe
 	t.Helper()
 
 	fetcher := mustNewFetcher(t, "http://beacon.example", cacheDir)
+	attachTestTransport(fetcher, handler)
+	return fetcher
+}
+
+func newTestFetcherWithS3(t *testing.T, cacheDir, network string, store s3cache.Store, handler http.HandlerFunc) *Fetcher {
+	t.Helper()
+
+	fetcher, err := NewWithS3("http://beacon.example", cacheDir, network, store)
+	require.NoError(t, err)
+	attachTestTransport(fetcher, handler)
+	return fetcher
+}
+
+func attachTestTransport(fetcher *Fetcher, handler http.HandlerFunc) {
 	fetcher.client = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			recorder := httptest.NewRecorder()
@@ -333,7 +422,6 @@ func newTestFetcher(t *testing.T, cacheDir string, handler http.HandlerFunc) *Fe
 			return response, nil
 		}),
 	}
-	return fetcher
 }
 
 func mustNewFetcher(t *testing.T, beaconNodeURL, cacheDir string) *Fetcher {
@@ -375,4 +463,49 @@ func pathSlot(t *testing.T, requestPath string) uint64 {
 	slot, err := strconv.ParseUint(parts[len(parts)-1], 10, 64)
 	require.NoError(t, err)
 	return slot
+}
+
+type fakeS3Store struct {
+	objects   map[string][]byte
+	downloads []string
+	uploads   []string
+}
+
+func newFakeS3Store(objects map[string][]byte) *fakeS3Store {
+	cloned := make(map[string][]byte)
+	for key, value := range objects {
+		cloned[key] = append([]byte(nil), value...)
+	}
+	return &fakeS3Store{objects: cloned}
+}
+
+func (s *fakeS3Store) Download(_ context.Context, key string) ([]byte, bool, error) {
+	s.downloads = append(s.downloads, key)
+	data, ok := s.objects[key]
+	if !ok {
+		return nil, false, nil
+	}
+	return append([]byte(nil), data...), true, nil
+}
+
+func (s *fakeS3Store) DownloadFile(_ context.Context, _ string, _ string) (bool, error) {
+	panic("unexpected DownloadFile call")
+}
+
+func (s *fakeS3Store) Upload(_ context.Context, key string, data []byte) error {
+	s.uploads = append(s.uploads, key)
+	s.objects[key] = append([]byte(nil), data...)
+	return nil
+}
+
+func (s *fakeS3Store) UploadFile(_ context.Context, _ string, _ string) error {
+	panic("unexpected UploadFile call")
+}
+
+func (s *fakeS3Store) ObjectExists(_ context.Context, _ string) (bool, error) {
+	panic("unexpected ObjectExists call")
+}
+
+func (s *fakeS3Store) ListObjects(_ context.Context, _ string) ([]s3cache.Object, error) {
+	panic("unexpected ListObjects call")
 }

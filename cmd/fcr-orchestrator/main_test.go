@@ -46,6 +46,7 @@ func validArgs(engine string) []string {
 
 func TestParseConfig_DefaultsEngineBinaryByEngine(t *testing.T) {
 	t.Setenv("FCR_ENGINE_BINARY", "")
+	clearOptionalS3Env(t)
 
 	cfg, printVersion, err := parseConfig(validArgs("lighthouse"), ioDiscard{})
 	if err != nil {
@@ -64,6 +65,7 @@ func TestParseConfig_DefaultsEngineBinaryByEngine(t *testing.T) {
 
 func TestParseConfig_EngineBinaryEnvOverridesDefault(t *testing.T) {
 	t.Setenv("FCR_ENGINE_BINARY", "/env/fcr-lighthouse")
+	clearOptionalS3Env(t)
 
 	cfg, _, err := parseConfig(validArgs("lighthouse"), ioDiscard{})
 	if err != nil {
@@ -79,6 +81,7 @@ func TestParseConfig_EngineBinaryEnvOverridesDefault(t *testing.T) {
 
 func TestParseConfig_EngineBinaryFlagOverridesEnv(t *testing.T) {
 	t.Setenv("FCR_ENGINE_BINARY", "/env/fcr-lighthouse")
+	clearOptionalS3Env(t)
 
 	args := append(validArgs("lighthouse"), "--engine-binary", "/flag/fcr-lighthouse")
 	cfg, _, err := parseConfig(args, ioDiscard{})
@@ -251,11 +254,82 @@ func (ioDiscard) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func clearOptionalS3Env(t *testing.T) {
+	t.Helper()
+
+	t.Setenv("S3_ENDPOINT", "")
+	t.Setenv("S3_BUCKET", "")
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+}
+
 func TestValidateConfig_AcceptsAllSupportedEngines(t *testing.T) {
 	for engine := range supportedEngines {
 		if err := validateConfig(validConfig(engine), true, true); err != nil {
 			t.Errorf("engine %q rejected: %v", engine, err)
 		}
+	}
+}
+
+func TestValidateConfig_AcceptsS3Settings(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "access")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+
+	cfg := validConfig("lighthouse")
+	cfg.S3Endpoint = "http://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:8080"
+	cfg.S3Bucket = "fcr-simulator"
+	cfg.S3PathStyle = true
+
+	if err := validateConfig(cfg, true, true); err != nil {
+		t.Fatalf("validateConfig returned error: %v", err)
+	}
+}
+
+func TestValidateConfig_RejectsIncompleteS3Settings(t *testing.T) {
+	cfg := validConfig("lighthouse")
+	cfg.S3Endpoint = "http://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:8080"
+
+	err := validateConfig(cfg, true, true)
+	if err == nil || !strings.Contains(err.Error(), "--s3-bucket") {
+		t.Fatalf("expected missing bucket error, got %v", err)
+	}
+}
+
+func TestValidateConfig_RejectsS3WithoutCredentials(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+
+	cfg := validConfig("lighthouse")
+	cfg.S3Endpoint = "http://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:8080"
+	cfg.S3Bucket = "fcr-simulator"
+
+	err := validateConfig(cfg, true, true)
+	if err == nil || !strings.Contains(err.Error(), "AWS_ACCESS_KEY_ID") {
+		t.Fatalf("expected missing AWS_ACCESS_KEY_ID error, got %v", err)
+	}
+}
+
+func TestParseEraMirrorConfig(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "access")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+
+	cfg, err := parseEraMirrorConfig([]string{
+		"--start-epoch", "10",
+		"--end-epoch", "20",
+		"--s3-endpoint", "http://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:8080",
+		"--s3-bucket", "fcr-simulator",
+	}, ioDiscard{})
+	if err != nil {
+		t.Fatalf("parseEraMirrorConfig returned error: %v", err)
+	}
+	if cfg.Network != "mainnet" {
+		t.Fatalf("Network=%q want mainnet", cfg.Network)
+	}
+	if cfg.StartEpoch != 10 || cfg.EndEpoch != 20 {
+		t.Fatalf("epoch range=(%d,%d) want (10,20)", cfg.StartEpoch, cfg.EndEpoch)
+	}
+	if !cfg.S3PathStyle {
+		t.Fatal("S3PathStyle=false want true")
 	}
 }
 
