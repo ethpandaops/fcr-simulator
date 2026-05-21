@@ -60,6 +60,7 @@ var orchestratorAddedFields = []string{
 	"engine_name",
 	"engine_version",
 	"engine_commit",
+	"confirmed_non_canonical",
 	"attestation_source_mode",
 	"lookahead_cap",
 }
@@ -76,6 +77,7 @@ var csvColumns = []string{
 	"head_root",
 	"confirmed_root",
 	"confirmed_slot",
+	"confirmed_non_canonical",
 	"confirmation_delay_slots",
 	"fast_confirmed",
 	"strict_one_slot_confirmed",
@@ -98,6 +100,8 @@ type Stats struct {
 	LastSlot           uint64
 }
 
+type CanonicalRootLookup func(slot uint64) (root string, exists bool, known bool, err error)
+
 // MergeAndWrite reads JSONL files from workerPaths, validates each record,
 // enriches with orchestrator-added fields from meta, sorts by slot, and writes
 // final JSONL and CSV outputs. Empty output paths are skipped.
@@ -106,11 +110,15 @@ type Stats struct {
 // slot in that set is present exactly once across the worker outputs. This
 // protects against engine workers silently exiting 0 with truncated output.
 func MergeAndWrite(workerPaths []string, jsonlOut, csvOut string, meta schema.OrchestratorMetadata, expectedSlots []uint64) (Stats, error) {
+	return MergeAndWriteWithCanonical(workerPaths, jsonlOut, csvOut, meta, expectedSlots, nil)
+}
+
+func MergeAndWriteWithCanonical(workerPaths []string, jsonlOut, csvOut string, meta schema.OrchestratorMetadata, expectedSlots []uint64, canonicalLookup CanonicalRootLookup) (Stats, error) {
 	if jsonlOut == "" && csvOut == "" {
 		return Stats{}, fmt.Errorf("at least one output path is required")
 	}
 
-	records, err := readWorkerRecords(workerPaths, meta)
+	records, err := readWorkerRecords(workerPaths, meta, canonicalLookup)
 	if err != nil {
 		return Stats{}, err
 	}
@@ -155,7 +163,7 @@ func MergeAndWrite(workerPaths []string, jsonlOut, csvOut string, meta schema.Or
 	return stats, nil
 }
 
-func readWorkerRecords(workerPaths []string, meta schema.OrchestratorMetadata) ([]schema.Record, error) {
+func readWorkerRecords(workerPaths []string, meta schema.OrchestratorMetadata, canonicalLookup CanonicalRootLookup) ([]schema.Record, error) {
 	var records []schema.Record
 	seenSlots := make(map[uint64]string)
 
@@ -175,7 +183,7 @@ func readWorkerRecords(workerPaths []string, meta schema.OrchestratorMetadata) (
 				continue
 			}
 
-			record, err := parseEngineRecord([]byte(line), path, lineNumber, meta)
+			record, err := parseEngineRecord([]byte(line), path, lineNumber, meta, canonicalLookup)
 			if err != nil {
 				_ = file.Close()
 				return nil, err
@@ -200,7 +208,7 @@ func readWorkerRecords(workerPaths []string, meta schema.OrchestratorMetadata) (
 	return records, nil
 }
 
-func parseEngineRecord(line []byte, path string, lineNumber int, meta schema.OrchestratorMetadata) (schema.Record, error) {
+func parseEngineRecord(line []byte, path string, lineNumber int, meta schema.OrchestratorMetadata, canonicalLookup CanonicalRootLookup) (schema.Record, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(line, &raw); err != nil {
 		return schema.Record{}, fmt.Errorf("%s:%d: decode JSON record: %w", path, lineNumber, err)
@@ -249,8 +257,52 @@ func parseEngineRecord(line []byte, path string, lineNumber int, meta schema.Orc
 	record.EngineCommit = meta.EngineCommit
 	record.AttestationSourceMode = meta.AttestationSourceMode
 	record.LookaheadCap = meta.LookaheadCap
+	confirmedNonCanonical, err := computeConfirmedNonCanonical(record, canonicalLookup)
+	if err != nil {
+		return schema.Record{}, fmt.Errorf("%s:%d: compute confirmed_non_canonical: %w", path, lineNumber, err)
+	}
+	record.ConfirmedNonCanonical = confirmedNonCanonical
 
 	return record, nil
+}
+
+func computeConfirmedNonCanonical(record schema.Record, canonicalLookup CanonicalRootLookup) (bool, error) {
+	if canonicalLookup == nil || record.ConfirmedSlot == 0 || isEmptyOrZeroRoot(record.ConfirmedRoot) {
+		return false, nil
+	}
+
+	canonicalRoot, exists, known, err := canonicalLookup(record.ConfirmedSlot)
+	if err != nil {
+		return false, err
+	}
+	if !known {
+		return false, nil
+	}
+	if !exists {
+		return true, nil
+	}
+	return !rootsEqual(record.ConfirmedRoot, canonicalRoot), nil
+}
+
+func isEmptyOrZeroRoot(root string) bool {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return true
+	}
+	trimmed := strings.TrimPrefix(strings.TrimPrefix(root, "0x"), "0X")
+	if len(trimmed) != 64 {
+		return false
+	}
+	for _, ch := range trimmed {
+		if ch != '0' {
+			return false
+		}
+	}
+	return true
+}
+
+func rootsEqual(left, right string) bool {
+	return strings.EqualFold(strings.TrimSpace(left), strings.TrimSpace(right))
 }
 
 func isJSONNull(value json.RawMessage) bool {
@@ -332,6 +384,7 @@ func recordCSVFields(record schema.Record) []string {
 		record.HeadRoot,
 		record.ConfirmedRoot,
 		strconv.FormatUint(record.ConfirmedSlot, 10),
+		strconv.FormatBool(record.ConfirmedNonCanonical),
 		strconv.FormatUint(record.ConfirmationDelaySlots, 10),
 		strconv.FormatBool(record.FastConfirmed),
 		strconv.FormatBool(record.StrictOneSlotConfirmed),

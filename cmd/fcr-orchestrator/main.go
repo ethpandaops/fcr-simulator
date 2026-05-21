@@ -521,16 +521,18 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 		return 1, fmt.Errorf("fetch genesis state: %w", err)
 	}
 
+	archiveWarm, err := warmBlockArchiveCache(cfg, eraReader, workerInfos, checkpointBlocks, stdout)
+	if err != nil {
+		return 1, fmt.Errorf("warm block archive cache: %w", err)
+	}
+
 	if cfg.PrepOnly {
-		if err := warmBlockArchiveCache(cfg, eraReader, workerInfos, checkpointBlocks, stdout); err != nil {
-			return 1, fmt.Errorf("warm block archive cache: %w", err)
-		}
 		fmt.Fprintf(stdout, "prep complete: %d checkpoint state(s) cached for %d worker(s)\n",
 			len(checkpointStates), len(workerInfos))
 		return 0, nil
 	}
 
-	server, serverURL, shutdown, err := startBeaconAPIServer(cfg, eraReader, fetcher, checkpointBlocks)
+	server, serverURL, shutdown, err := startBeaconAPIServer(cfg, eraReader, fetcher, checkpointBlocks, archiveWarm.OrphanRootsBySlot)
 	if err != nil {
 		return 1, err
 	}
@@ -569,13 +571,18 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 			expectedSlots = append(expectedSlots, s)
 		}
 	}
-	stats, err := merge.MergeAndWrite(mergePaths, paths.JSONL, paths.CSV, schema.OrchestratorMetadata{
+	canonicalLookup := beaconapi.NewCanonicalRootLookup(beaconapi.RealBackendConfig{
+		EraReader:             eraReader,
+		ForkSchedule:          beaconapi.ForkSchedule{SlotFork: beaconapi.MainnetForkAtSlot},
+		DecodedBlockCacheSize: cfg.DecodedBlockCacheSize,
+	}, minWarmupSlot(activeChunks), saturatingSlotAdd(maxEndSlot(activeChunks), cfg.LookaheadCap))
+	stats, err := merge.MergeAndWriteWithCanonical(mergePaths, paths.JSONL, paths.CSV, schema.OrchestratorMetadata{
 		EngineName:            engineManifest.EngineName,
 		EngineVersion:         engineManifest.EngineVersion,
 		EngineCommit:          engineManifest.EngineCommit,
 		AttestationSourceMode: cfg.AttestationSourceMode,
 		LookaheadCap:          cfg.LookaheadCap,
-	}, expectedSlots)
+	}, expectedSlots, canonicalLookup.Lookup)
 	if err != nil {
 		return 1, fmt.Errorf("merge worker outputs: %w", err)
 	}
@@ -722,18 +729,18 @@ func newArchiveClient(cfg config) (*blockarchive.Client, error) {
 // request into the local disk cache, so the serving hot loop never contacts the
 // block archive over HTTP (where a slow or timing-out origin would stall or fail
 // a running simulation). No-op when no archive is configured.
-func warmBlockArchiveCache(cfg config, eraReader *era.Reader, workerInfos []workerInfo, checkpointBlocks map[[32]byte][]byte, stdout io.Writer) error {
+func warmBlockArchiveCache(cfg config, eraReader *era.Reader, workerInfos []workerInfo, checkpointBlocks map[[32]byte][]byte, stdout io.Writer) (beaconapi.ArchiveWarmResult, error) {
 	archiveClient, err := newArchiveClient(cfg)
 	if err != nil {
-		return err
+		return beaconapi.ArchiveWarmResult{}, err
 	}
 	if archiveClient == nil {
-		return nil
+		return beaconapi.ArchiveWarmResult{}, nil
 	}
 
 	mode, err := parseAttplanMode(cfg.AttestationSourceMode)
 	if err != nil {
-		return err
+		return beaconapi.ArchiveWarmResult{}, err
 	}
 
 	ranges := make([][2]uint64, 0, len(workerInfos))
@@ -749,11 +756,13 @@ func warmBlockArchiveCache(cfg config, eraReader *era.Reader, workerInfos []work
 		ranges = append(ranges, [2]uint64{from, to})
 	}
 	if len(ranges) == 0 {
-		return nil
+		result := beaconapi.ArchiveWarmResult{}
+		logArchiveWarmSummary(stdout, result.Stats)
+		return result, nil
 	}
 
 	fmt.Fprintf(stdout, "warming block-archive cache for %d worker range(s)\n", len(ranges))
-	return beaconapi.WarmBlockArchiveCache(beaconapi.RealBackendConfig{
+	result, err := beaconapi.WarmBlockArchiveCache(beaconapi.RealBackendConfig{
 		EraReader:              eraReader,
 		GenesisInfo:            mainnetGenesisInfo(),
 		ForkSchedule:           beaconapi.ForkSchedule{SlotFork: beaconapi.MainnetForkAtSlot},
@@ -763,9 +772,27 @@ func warmBlockArchiveCache(cfg config, eraReader *era.Reader, workerInfos []work
 		BlockArchive:           archiveClient,
 		DecodedBlockCacheSize:  cfg.DecodedBlockCacheSize,
 	}, ranges)
+	logArchiveWarmSummary(stdout, result.Stats)
+	return result, err
 }
 
-func startBeaconAPIServer(cfg config, eraReader *era.Reader, fetcher *beaconfetch.Fetcher, checkpointBlocks map[[32]byte][]byte) (*http.Server, string, func(), error) {
+func logArchiveWarmSummary(stdout io.Writer, stats beaconapi.ArchiveWarmStats) {
+	fmt.Fprintf(
+		stdout,
+		"block-archive warm summary: worker_ranges=%d slot_range_queries=%d orphan_roots_discovered=%d high_orphan_fanout_slots=%d roots_resolved_cached=%d roots_archive_missing=%d transient_failures_retried=%d chains_truncated=%d chains_pre_warmup_parent=%d\n",
+		stats.WorkerRanges,
+		stats.SlotRangeQueries,
+		stats.OrphanRootsDiscovered,
+		stats.HighOrphanFanoutSlots,
+		stats.RootsResolvedCached,
+		stats.RootsArchiveMissing,
+		stats.TransientFailuresRetried,
+		stats.ChainsTruncated,
+		stats.ChainsPreWarmupParent,
+	)
+}
+
+func startBeaconAPIServer(cfg config, eraReader *era.Reader, fetcher *beaconfetch.Fetcher, checkpointBlocks map[[32]byte][]byte, archiveOrphanRootsBySlot map[uint64][][32]byte) (*http.Server, string, func(), error) {
 	mode, err := parseAttplanMode(cfg.AttestationSourceMode)
 	if err != nil {
 		return nil, "", nil, err
@@ -777,16 +804,17 @@ func startBeaconAPIServer(cfg config, eraReader *era.Reader, fetcher *beaconfetc
 	}
 
 	backend := beaconapi.NewRealBackend(beaconapi.RealBackendConfig{
-		EraReader:              eraReader,
-		Fetcher:                fetcher,
-		GenesisInfo:            mainnetGenesisInfo(),
-		ForkSchedule:           beaconapi.ForkSchedule{SlotFork: beaconapi.MainnetForkAtSlot},
-		Mode:                   mode,
-		LookaheadCap:           cfg.LookaheadCap,
-		CheckpointBlocksByRoot: checkpointBlocks,
-		BlockArchive:           archiveClient,
-		ArchiveCacheOnly:       true,
-		DecodedBlockCacheSize:  cfg.DecodedBlockCacheSize,
+		EraReader:                eraReader,
+		Fetcher:                  fetcher,
+		GenesisInfo:              mainnetGenesisInfo(),
+		ForkSchedule:             beaconapi.ForkSchedule{SlotFork: beaconapi.MainnetForkAtSlot},
+		Mode:                     mode,
+		LookaheadCap:             cfg.LookaheadCap,
+		CheckpointBlocksByRoot:   checkpointBlocks,
+		BlockArchive:             archiveClient,
+		ArchiveCacheOnly:         true,
+		ArchiveOrphanRootsBySlot: archiveOrphanRootsBySlot,
+		DecodedBlockCacheSize:    cfg.DecodedBlockCacheSize,
 	})
 
 	server := &http.Server{
@@ -1046,6 +1074,13 @@ func maxEndSlot(chunks []chunk.Chunk) uint64 {
 		}
 	}
 	return max
+}
+
+func saturatingSlotAdd(value, delta uint64) uint64 {
+	if delta > math.MaxUint64-value {
+		return math.MaxUint64
+	}
+	return value + delta
 }
 
 func listenerHTTPURL(addr net.Addr) string {

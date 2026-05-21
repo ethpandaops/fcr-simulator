@@ -1,6 +1,6 @@
 package schema
 
-// Record matches SCHEMA_V3.md's full set of fields.
+// Record matches the current output schema's full set of fields.
 type Record struct {
 	SchemaVersion           int     `json:"schema_version"`
 	EngineName              string  `json:"engine_name"`
@@ -13,6 +13,7 @@ type Record struct {
 	HeadRoot                string  `json:"head_root"`
 	ConfirmedRoot           string  `json:"confirmed_root"`
 	ConfirmedSlot           uint64  `json:"confirmed_slot"`
+	ConfirmedNonCanonical   bool    `json:"confirmed_non_canonical"`
 	ConfirmationDelaySlots  uint64  `json:"confirmation_delay_slots"`
 	FastConfirmed           bool    `json:"fast_confirmed"`
 	StrictOneSlotConfirmed  bool    `json:"strict_one_slot_confirmed"`
@@ -35,5 +36,5 @@ type OrchestratorMetadata struct {
 	LookaheadCap          uint64
 }
 
-const CSVSchemaMarker = "# fcr-simulator-csv-schema-version:3"
-const SchemaVersion = 3
+const CSVSchemaMarker = "# fcr-simulator-csv-schema-version:4"
+const SchemaVersion = 4

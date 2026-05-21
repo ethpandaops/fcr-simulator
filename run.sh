@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fcr-simulator chunked runner (v3, orchestrator + engine binary).
+# fcr-simulator chunked runner (v4, orchestrator + engine binary).
 #
 # Splits [start-epoch, end-epoch) into chunks of CHUNK_SIZE epochs, runs the
 # orchestrator on each chunk so a mid-run failure doesn't lose all progress.
@@ -39,7 +39,7 @@ ORCHESTRATOR="./results/fcr-orchestrator"
 ATT_MODE="next-non-missed"
 LOOKAHEAD_CAP=4
 BLOCK_ARCHIVE_URL=""
-CSV_SCHEMA_HEADER="# fcr-simulator-csv-schema-version:3"
+CSV_SCHEMA_HEADER="# fcr-simulator-csv-schema-version:4"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -120,7 +120,7 @@ merge_chunks() {
 TOTAL_EPOCHS=$((END_EPOCH - START_EPOCH))
 TOTAL_CHUNKS=$(( (TOTAL_EPOCHS + CHUNK_SIZE - 1) / CHUNK_SIZE ))
 
-echo "=== FCR Simulator (v3 / orchestrator) ==="
+echo "=== FCR Simulator (v4 / orchestrator) ==="
 echo "Engine:           $ENGINE ($ENGINE_BINARY)"
 echo "Orchestrator:     $ORCHESTRATOR"
 echo "Range:            epochs $START_EPOCH..$END_EPOCH ($TOTAL_EPOCHS epochs)"

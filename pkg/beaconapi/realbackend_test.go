@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/attestantio/go-eth2-client/spec/phase0"
@@ -216,7 +219,7 @@ func TestRealBackendBuildSlotEmitsInlineAttestationsAndOrphans(t *testing.T) {
 		{Slot: 102, Root: formatRoot(canonical102Root), Canonical: true},
 		{Slot: 102, Root: formatRoot(orphan102Root), Canonical: false},
 	}, instruction.ImportBlocks)
-	require.Len(t, instruction.Attestations, 2)
+	require.Len(t, instruction.Attestations, 1)
 	for _, attestation := range instruction.Attestations {
 		require.Equal(t, uint64(102), attestation.Data.Slot)
 		require.Equal(t, formatRoot(orphan102Root), attestation.Data.BeaconBlockRoot)
@@ -224,6 +227,133 @@ func TestRealBackendBuildSlotEmitsInlineAttestationsAndOrphans(t *testing.T) {
 		require.NotEmpty(t, attestation.AggregationBits)
 		require.Nil(t, attestation.CommitteeBits)
 	}
+}
+
+func TestRealBackendBuildSlotUnionsOrphanSourceBlockAttestations(t *testing.T) {
+	cacheDir := t.TempDir()
+
+	canonical101 := encodeTestSignedBeaconBlock(101)
+	canonical101Root := testBlockRoot(t, canonical101)
+	canonical102 := encodeTestSignedBeaconBlockWithAttestations(102, canonical101Root, nil)
+	canonical102Root := testBlockRoot(t, canonical102)
+	canonical103 := encodeTestSignedBeaconBlockWithAttestations(103, canonical102Root, nil)
+	orphanSource103 := encodeTestSignedBeaconBlockWithAttestations(103, canonical102Root, []*phase0.Attestation{
+		testAttestation(102, canonical102Root, canonical102Root),
+	})
+	orphanSource103Root := testBlockRoot(t, orphanSource103)
+	writeTestEraFileWithBlocks(t, cacheDir, 1, canonical101, canonical102, canonical103)
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		switch r.URL.Path {
+		case "/api/v1/index":
+			require.Equal(t, "mainnet", r.URL.Query().Get("network"))
+			require.NotEmpty(t, r.URL.Query().Get("slot_min"))
+			require.NotEmpty(t, r.URL.Query().Get("slot_max"))
+			switch r.URL.Query().Get("offset") {
+			case "0":
+				fmt.Fprintf(w, `{"index":[{"slot":103,"block_root":"%s"}]}`, formatRoot(orphanSource103Root))
+			case "1":
+				fmt.Fprint(w, `{"index":[]}`)
+			default:
+				t.Fatalf("unexpected archive index offset %s", r.URL.Query().Get("offset"))
+			}
+		case "/mainnet/103/" + formatRoot(orphanSource103Root) + ".ssz":
+			_, err := w.Write(orphanSource103)
+			require.NoError(t, err)
+		default:
+			t.Fatalf("unexpected archive path %s", r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	reader, err := era.New(cacheDir)
+	require.NoError(t, err)
+	archiveDir := filepath.Join(cacheDir, "archive")
+	archiveClient, err := blockarchive.New(server.URL, "mainnet", archiveDir)
+	require.NoError(t, err)
+	warm, err := WarmBlockArchiveCache(RealBackendConfig{
+		EraReader:    reader,
+		Mode:         attplan.ModeGreedyLookahead,
+		LookaheadCap: 2,
+		BlockArchive: archiveClient,
+		ForkSchedule: ForkSchedule{SlotFork: MainnetForkAtSlot},
+	}, [][2]uint64{{101, 104}})
+	require.NoError(t, err)
+	require.Equal(t, [][32]byte{orphanSource103Root}, warm.OrphanRootsBySlot[103])
+	require.Equal(t, 1, warm.Stats.SlotRangeQueries)
+	require.Equal(t, 1, warm.Stats.OrphanRootsDiscovered)
+	require.FileExists(t, filepath.Join(archiveDir, formatRoot(orphanSource103Root)+".ssz"))
+
+	afterWarmRequests := requests.Load()
+	cacheOnlyArchive, err := blockarchive.New(server.URL, "mainnet", archiveDir)
+	require.NoError(t, err)
+	backend := NewRealBackend(RealBackendConfig{
+		EraReader:                reader,
+		Mode:                     attplan.ModeGreedyLookahead,
+		LookaheadCap:             2,
+		BlockArchive:             cacheOnlyArchive,
+		ArchiveCacheOnly:         true,
+		ArchiveOrphanRootsBySlot: warm.OrphanRootsBySlot,
+		ForkSchedule:             ForkSchedule{SlotFork: MainnetForkAtSlot},
+	})
+
+	instruction, err := backend.BuildSlot(102, 100)
+	require.NoError(t, err)
+	require.Equal(t, afterWarmRequests, requests.Load(), "BuildSlot must not contact archive HTTP")
+	require.Len(t, instruction.Attestations, 1)
+	require.Equal(t, uint64(102), instruction.Attestations[0].Data.Slot)
+	require.Equal(t, formatRoot(canonical102Root), instruction.Attestations[0].Data.BeaconBlockRoot)
+	require.Equal(t, formatRoot(canonical102Root), instruction.Attestations[0].Data.Target.Root)
+}
+
+func TestRealBackendBuildSlotDedupesExactAggregatesPreservesDistinctBits(t *testing.T) {
+	cacheDir := t.TempDir()
+
+	canonical101 := encodeTestSignedBeaconBlock(101)
+	canonical101Root := testBlockRoot(t, canonical101)
+	canonical102 := encodeTestSignedBeaconBlockWithAttestations(102, canonical101Root, nil)
+	canonical102Root := testBlockRoot(t, canonical102)
+	duplicate := testAttestationWithAggregationBits(102, canonical102Root, canonical102Root, 2, 0)
+	distinctBits := testAttestationWithAggregationBits(102, canonical102Root, canonical102Root, 2, 1)
+	canonical103 := encodeTestSignedBeaconBlockWithAttestations(103, canonical102Root, []*phase0.Attestation{
+		duplicate,
+	})
+	orphan103 := encodeTestSignedBeaconBlockWithAttestations(103, canonical102Root, []*phase0.Attestation{
+		duplicate,
+		distinctBits,
+	})
+	orphan103Root := testBlockRoot(t, orphan103)
+	writeTestEraFileWithBlocks(t, cacheDir, 1, canonical101, canonical102, canonical103)
+
+	archiveDir := filepath.Join(cacheDir, "archive")
+	require.NoError(t, os.MkdirAll(archiveDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(archiveDir, formatRoot(orphan103Root)+".ssz"), orphan103, 0o644))
+
+	reader, err := era.New(cacheDir)
+	require.NoError(t, err)
+	archiveClient, err := blockarchive.New("http://archive.test", "mainnet", archiveDir)
+	require.NoError(t, err)
+	backend := NewRealBackend(RealBackendConfig{
+		EraReader:                reader,
+		Mode:                     attplan.ModeGreedyLookahead,
+		LookaheadCap:             2,
+		BlockArchive:             archiveClient,
+		ArchiveCacheOnly:         true,
+		ArchiveOrphanRootsBySlot: map[uint64][][32]byte{103: [][32]byte{orphan103Root}},
+	})
+
+	instruction, err := backend.BuildSlot(102, 100)
+	require.NoError(t, err)
+	require.Len(t, instruction.Attestations, 2)
+	gotBits := map[string]bool{}
+	for _, attestation := range instruction.Attestations {
+		require.Equal(t, uint64(102), attestation.Data.Slot)
+		require.Equal(t, formatRoot(canonical102Root), attestation.Data.BeaconBlockRoot)
+		gotBits[attestation.AggregationBits] = true
+	}
+	require.Len(t, gotBits, 2)
 }
 
 func TestRealBackendBuildSlotDropsPreWarmupOrphanParents(t *testing.T) {
@@ -447,7 +577,7 @@ func TestRealBackendConfigurationErrors(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
-func TestRealBackendBlockSSZByRootFallsBackToBlockArchive(t *testing.T) {
+func TestRealBackendBlockSSZByRootReadsBlockArchiveCache(t *testing.T) {
 	root := testRoot(0x44)
 	rootText := rootHex(root)
 	cacheDir := t.TempDir()
@@ -459,10 +589,103 @@ func TestRealBackendBlockSSZByRootFallsBackToBlockArchive(t *testing.T) {
 	backend := NewRealBackend(RealBackendConfig{
 		CheckpointBlocksByRoot: map[[32]byte][]byte{},
 		BlockArchive:           archiveClient,
+		ArchiveCacheOnly:       true,
 	})
 	block, err := backend.BlockSSZByRoot(root)
 	require.NoError(t, err)
 	require.Equal(t, []byte("archive-block"), block)
+}
+
+func TestRealBackendBlockSSZByRootCacheOnlyDoesNotContactArchive(t *testing.T) {
+	root := testRoot(0x45)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected archive request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	archiveClient, err := blockarchive.New(server.URL, "mainnet", t.TempDir())
+	require.NoError(t, err)
+
+	backend := NewRealBackend(RealBackendConfig{
+		BlockArchive:     archiveClient,
+		ArchiveCacheOnly: true,
+	})
+	block, err := backend.BlockSSZByRoot(root)
+	require.Nil(t, block)
+	require.ErrorIs(t, err, ErrNotFound)
+	require.Zero(t, requests.Load())
+}
+
+func TestWarmBlockArchiveCacheRetriesAndSummarizes(t *testing.T) {
+	cacheDir := t.TempDir()
+
+	orphanParent100 := encodeTestSignedBeaconBlockWithAttestations(100, [32]byte{}, nil)
+	orphanParent100Root := testBlockRoot(t, orphanParent100)
+	orphanHead101 := encodeTestSignedBeaconBlockWithAttestations(101, orphanParent100Root, nil)
+	orphanHead101Root := testBlockRoot(t, orphanHead101)
+	missingRoot := testRoot(0x77)
+	canonical102 := encodeTestSignedBeaconBlockWithAttestations(102, [32]byte{}, []*phase0.Attestation{
+		testAttestation(101, orphanHead101Root, orphanHead101Root),
+		testAttestation(101, missingRoot, missingRoot),
+	})
+	writeTestEraFileWithBlocks(t, cacheDir, 1, canonical102)
+
+	var orphanHeadIndexRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/index":
+			rootText := r.URL.Query().Get("block_root_prefix")
+			switch rootText {
+			case formatRoot(orphanHead101Root):
+				if orphanHeadIndexRequests.Add(1) == 1 {
+					http.Error(w, "temporary origin failure", http.StatusInternalServerError)
+					return
+				}
+				fmt.Fprintf(w, `{"index":[{"slot":101,"block_root":"%s"}]}`, formatRoot(orphanHead101Root))
+			case formatRoot(orphanParent100Root):
+				fmt.Fprintf(w, `{"index":[{"slot":100,"block_root":"%s"}]}`, formatRoot(orphanParent100Root))
+			case formatRoot(missingRoot):
+				http.NotFound(w, r)
+			default:
+				t.Fatalf("unexpected archive index root %s", rootText)
+			}
+		case "/mainnet/101/" + formatRoot(orphanHead101Root) + ".ssz":
+			_, err := w.Write(orphanHead101)
+			require.NoError(t, err)
+		case "/mainnet/100/" + formatRoot(orphanParent100Root) + ".ssz":
+			_, err := w.Write(orphanParent100)
+			require.NoError(t, err)
+		default:
+			t.Fatalf("unexpected archive path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	reader, err := era.New(cacheDir)
+	require.NoError(t, err)
+	archiveClient, err := blockarchive.New(server.URL, "mainnet", filepath.Join(cacheDir, "archive"))
+	require.NoError(t, err)
+
+	warm, err := WarmBlockArchiveCache(RealBackendConfig{
+		EraReader:    reader,
+		LookaheadCap: 1,
+		BlockArchive: archiveClient,
+		ForkSchedule: ForkSchedule{SlotFork: MainnetForkAtSlot},
+	}, [][2]uint64{{101, 102}})
+	require.NoError(t, err)
+	require.Equal(t, ArchiveWarmStats{
+		WorkerRanges:             1,
+		OrphanRootsDiscovered:    2,
+		RootsResolvedCached:      2,
+		RootsArchiveMissing:      1,
+		TransientFailuresRetried: 1,
+		ChainsPreWarmupParent:    1,
+	}, warm.Stats)
+	require.Equal(t, int32(2), orphanHeadIndexRequests.Load())
+	require.FileExists(t, filepath.Join(cacheDir, "archive", formatRoot(orphanHead101Root)+".ssz"))
+	require.FileExists(t, filepath.Join(cacheDir, "archive", formatRoot(orphanParent100Root)+".ssz"))
 }
 
 func TestRealBackendUtilityEdgeCases(t *testing.T) {
@@ -574,8 +797,14 @@ func encodeTestSignedBeaconBlockWithAttestations(slot uint64, parentRoot [32]byt
 }
 
 func testAttestation(slot uint64, headRoot, targetRoot [32]byte) *phase0.Attestation {
-	bits := bitfield.NewBitlist(1)
-	bits.SetBitAt(0, true)
+	return testAttestationWithAggregationBits(slot, headRoot, targetRoot, 1, 0)
+}
+
+func testAttestationWithAggregationBits(slot uint64, headRoot, targetRoot [32]byte, bitLen uint64, setBits ...uint64) *phase0.Attestation {
+	bits := bitfield.NewBitlist(bitLen)
+	for _, bit := range setBits {
+		bits.SetBitAt(bit, true)
+	}
 	return &phase0.Attestation{
 		AggregationBits: bits,
 		Data: &phase0.AttestationData{

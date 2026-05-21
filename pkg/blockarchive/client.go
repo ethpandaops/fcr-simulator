@@ -10,11 +10,18 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
-const httpTimeout = 600 * time.Second
+const (
+	httpTimeout               = 600 * time.Second
+	fetchMaxAttempts          = 3
+	fetchRetryBaseLag         = 250 * time.Millisecond
+	indexSlotRangePageSize    = 1000
+	indexSafetyEntriesPerSlot = 16
+)
 
 var ErrNotFound = errors.New("block archive: not found")
 
@@ -26,12 +33,18 @@ type Client struct {
 }
 
 type indexResponse struct {
-	Index []indexEntry `json:"index"`
+	Index []IndexEntry `json:"index"`
 }
 
-type indexEntry struct {
+type IndexEntry struct {
 	Slot      uint64 `json:"slot"`
 	BlockRoot string `json:"block_root"`
+}
+
+type FetchStats struct {
+	CacheHit                 bool
+	Downloaded               bool
+	TransientFailuresRetried int
 }
 
 func New(baseURL, network, cacheDir string) (*Client, error) {
@@ -58,29 +71,60 @@ func New(baseURL, network, cacheDir string) (*Client, error) {
 }
 
 func (c *Client) FetchBlockSSZByRoot(root [32]byte) ([]byte, error) {
+	bytes, _, err := c.FetchBlockSSZByRootWithStats(root)
+	return bytes, err
+}
+
+func (c *Client) FetchBlockSSZByRootWithStats(root [32]byte) ([]byte, FetchStats, error) {
+	var stats FetchStats
 	if c == nil {
-		return nil, ErrNotFound
+		return nil, stats, ErrNotFound
 	}
 	if bytes, ok, err := c.readCached(root); err != nil {
-		return nil, err
+		return nil, stats, err
 	} else if ok {
-		return bytes, nil
+		stats.CacheHit = true
+		return bytes, stats, nil
 	}
 
 	rootText := rootHex(root)
-	slot, err := c.lookupSlot(root, rootText)
+	slot, err := c.lookupSlot(root, rootText, &stats)
 	if err != nil {
-		return nil, err
+		return nil, stats, err
 	}
 
-	bytes, err := c.downloadBlock(slot, rootText)
+	bytes, err := c.downloadBlock(slot, rootText, &stats)
 	if err != nil {
-		return nil, err
+		return nil, stats, err
 	}
 	if err := c.writeCached(root, bytes); err != nil {
-		return nil, err
+		return nil, stats, err
 	}
-	return cloneBytes(bytes), nil
+	stats.Downloaded = true
+	return cloneBytes(bytes), stats, nil
+}
+
+func (c *Client) FetchBlockSSZBySlotAndRootWithStats(slot uint64, root [32]byte) ([]byte, FetchStats, error) {
+	var stats FetchStats
+	if c == nil {
+		return nil, stats, ErrNotFound
+	}
+	if bytes, ok, err := c.readCached(root); err != nil {
+		return nil, stats, err
+	} else if ok {
+		stats.CacheHit = true
+		return bytes, stats, nil
+	}
+
+	bytes, err := c.downloadBlock(slot, rootHex(root), &stats)
+	if err != nil {
+		return nil, stats, err
+	}
+	if err := c.writeCached(root, bytes); err != nil {
+		return nil, stats, err
+	}
+	stats.Downloaded = true
+	return cloneBytes(bytes), stats, nil
 }
 
 // ReadCachedSSZByRoot returns a previously-cached block without contacting the
@@ -101,7 +145,117 @@ func (c *Client) ReadCachedSSZByRoot(root [32]byte) ([]byte, error) {
 	return cloneBytes(bytes), nil
 }
 
-func (c *Client) lookupSlot(root [32]byte, rootText string) (uint64, error) {
+func (c *Client) ListIndexBySlotRangeWithStats(slotMin, slotMax uint64, limit int) ([]IndexEntry, FetchStats, error) {
+	var stats FetchStats
+	if c == nil {
+		return nil, stats, ErrNotFound
+	}
+	if slotMin > slotMax {
+		return nil, stats, nil
+	}
+	if limit <= 0 {
+		return nil, stats, fmt.Errorf("slot range index limit must be greater than zero")
+	}
+
+	pageLimit := limit
+	if pageLimit > indexSlotRangePageSize {
+		pageLimit = indexSlotRangePageSize
+	}
+	maxEntries := slotRangeIndexSafetyLimit(slotMin, slotMax, pageLimit)
+	entries := make([]IndexEntry, 0)
+	offset := 0
+	for {
+		page, err := c.listIndexBySlotRangePage(slotMin, slotMax, pageLimit, offset, &stats)
+		if errors.Is(err, ErrNotFound) {
+			return entries, stats, nil
+		}
+		if err != nil {
+			return nil, stats, err
+		}
+		if len(page) == 0 {
+			return entries, stats, nil
+		}
+		if len(entries) > maxEntries-len(page) {
+			return nil, stats, fmt.Errorf("block archive slot range index exceeded safety limit of %d entries for slots [%d,%d]", maxEntries, slotMin, slotMax)
+		}
+		entries = append(entries, page...)
+		offset += len(page)
+	}
+}
+
+func (c *Client) listIndexBySlotRangePage(slotMin, slotMax uint64, limit, offset int, stats *FetchStats) ([]IndexEntry, error) {
+	for attempt := 1; ; attempt++ {
+		entries, err := c.listIndexBySlotRangeOnce(slotMin, slotMax, limit, offset)
+		if err == nil {
+			return entries, nil
+		}
+		if !isTransientArchiveError(err) || attempt >= fetchMaxAttempts {
+			return nil, err
+		}
+		if stats != nil {
+			stats.TransientFailuresRetried++
+		}
+		sleepBeforeRetry(attempt)
+	}
+}
+
+func (c *Client) listIndexBySlotRangeOnce(slotMin, slotMax uint64, limit, offset int) ([]IndexEntry, error) {
+	indexURL, err := url.Parse(c.baseURL + "/api/v1/index")
+	if err != nil {
+		return nil, err
+	}
+	query := indexURL.Query()
+	query.Set("network", c.network)
+	query.Set("slot_min", strconv.FormatUint(slotMin, 10))
+	query.Set("slot_max", strconv.FormatUint(slotMax, 10))
+	query.Set("limit", strconv.Itoa(limit))
+	query.Set("offset", strconv.Itoa(offset))
+	indexURL.RawQuery = query.Encode()
+
+	resp, err := c.client.Get(indexURL.String())
+	if err != nil {
+		return nil, transientArchiveError{err: fmt.Errorf("fetch block archive slot range index: %w", err)}
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, transientArchiveError{err: fmt.Errorf("read block archive slot range index body: %w", err)}
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrNotFound
+	}
+	if retryableHTTPStatus(resp.StatusCode) {
+		return nil, transientArchiveError{err: fmt.Errorf("block archive slot range index HTTP %d: %s", resp.StatusCode, trimBody(string(body)))}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("block archive slot range index HTTP %d: %s", resp.StatusCode, trimBody(string(body)))
+	}
+
+	var parsed indexResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("decode block archive slot range index response: %w", err)
+	}
+	return parsed.Index, nil
+}
+
+func (c *Client) lookupSlot(root [32]byte, rootText string, stats *FetchStats) (uint64, error) {
+	for attempt := 1; ; attempt++ {
+		slot, err := c.lookupSlotOnce(root, rootText)
+		if err == nil {
+			return slot, nil
+		}
+		if !isTransientArchiveError(err) || attempt >= fetchMaxAttempts {
+			return 0, err
+		}
+		if stats != nil {
+			stats.TransientFailuresRetried++
+		}
+		sleepBeforeRetry(attempt)
+	}
+}
+
+func (c *Client) lookupSlotOnce(root [32]byte, rootText string) (uint64, error) {
 	indexURL, err := url.Parse(c.baseURL + "/api/v1/index")
 	if err != nil {
 		return 0, err
@@ -114,16 +268,19 @@ func (c *Client) lookupSlot(root [32]byte, rootText string) (uint64, error) {
 
 	resp, err := c.client.Get(indexURL.String())
 	if err != nil {
-		return 0, fmt.Errorf("fetch block archive index: %w", err)
+		return 0, transientArchiveError{err: fmt.Errorf("fetch block archive index: %w", err)}
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, fmt.Errorf("read block archive index body: %w", err)
+		return 0, transientArchiveError{err: fmt.Errorf("read block archive index body: %w", err)}
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		return 0, ErrNotFound
+	}
+	if retryableHTTPStatus(resp.StatusCode) {
+		return 0, transientArchiveError{err: fmt.Errorf("block archive index HTTP %d: %s", resp.StatusCode, trimBody(string(body)))}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return 0, fmt.Errorf("block archive index HTTP %d: %s", resp.StatusCode, trimBody(string(body)))
@@ -141,7 +298,23 @@ func (c *Client) lookupSlot(root [32]byte, rootText string) (uint64, error) {
 	return 0, ErrNotFound
 }
 
-func (c *Client) downloadBlock(slot uint64, rootText string) ([]byte, error) {
+func (c *Client) downloadBlock(slot uint64, rootText string, stats *FetchStats) ([]byte, error) {
+	for attempt := 1; ; attempt++ {
+		bytes, err := c.downloadBlockOnce(slot, rootText)
+		if err == nil {
+			return bytes, nil
+		}
+		if !isTransientArchiveError(err) || attempt >= fetchMaxAttempts {
+			return nil, err
+		}
+		if stats != nil {
+			stats.TransientFailuresRetried++
+		}
+		sleepBeforeRetry(attempt)
+	}
+}
+
+func (c *Client) downloadBlockOnce(slot uint64, rootText string) ([]byte, error) {
 	blockURL := fmt.Sprintf(
 		"%s/%s/%d/%s.ssz",
 		c.baseURL,
@@ -151,16 +324,19 @@ func (c *Client) downloadBlock(slot uint64, rootText string) ([]byte, error) {
 	)
 	resp, err := c.client.Get(blockURL)
 	if err != nil {
-		return nil, fmt.Errorf("download block archive block: %w", err)
+		return nil, transientArchiveError{err: fmt.Errorf("download block archive block: %w", err)}
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read block archive block body: %w", err)
+		return nil, transientArchiveError{err: fmt.Errorf("read block archive block body: %w", err)}
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, ErrNotFound
+	}
+	if retryableHTTPStatus(resp.StatusCode) {
+		return nil, transientArchiveError{err: fmt.Errorf("block archive download HTTP %d: %s", resp.StatusCode, trimBody(string(body)))}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("block archive download HTTP %d: %s", resp.StatusCode, trimBody(string(body)))
@@ -212,17 +388,24 @@ func rootHex(root [32]byte) string {
 	return "0x" + hex.EncodeToString(root[:])
 }
 
-func rootsEqual(text string, root [32]byte) bool {
+func ParseRoot(text string) ([32]byte, error) {
+	var root [32]byte
 	text = strings.TrimSpace(text)
 	text = strings.TrimPrefix(strings.TrimPrefix(text, "0x"), "0X")
 	if len(text) != 64 {
-		return false
+		return root, fmt.Errorf("invalid block root length")
 	}
 	decoded, err := hex.DecodeString(text)
 	if err != nil {
-		return false
+		return root, fmt.Errorf("invalid block root hex: %w", err)
 	}
-	return string(decoded) == string(root[:])
+	copy(root[:], decoded)
+	return root, nil
+}
+
+func rootsEqual(text string, root [32]byte) bool {
+	parsed, err := ParseRoot(text)
+	return err == nil && parsed == root
 }
 
 func cloneBytes(bytes []byte) []byte {
@@ -240,4 +423,47 @@ func trimBody(body string) string {
 		return body
 	}
 	return body[:maxLen]
+}
+
+func slotRangeIndexSafetyLimit(slotMin, slotMax uint64, pageLimit int) int {
+	maxInt := int(^uint(0) >> 1)
+	span := slotMax - slotMin
+	maxSafeSpan := uint64(maxInt/indexSafetyEntriesPerSlot) - 1
+	if span > maxSafeSpan {
+		return maxInt
+	}
+	maxEntries := int(span+1) * indexSafetyEntriesPerSlot
+	if maxEntries < pageLimit {
+		return pageLimit
+	}
+	return maxEntries
+}
+
+type transientArchiveError struct {
+	err error
+}
+
+func (e transientArchiveError) Error() string {
+	return e.err.Error()
+}
+
+func (e transientArchiveError) Unwrap() error {
+	return e.err
+}
+
+func isTransientArchiveError(err error) bool {
+	var transient transientArchiveError
+	return errors.As(err, &transient)
+}
+
+func retryableHTTPStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+}
+
+func sleepBeforeRetry(attempt int) {
+	delay := fetchRetryBaseLag
+	for i := 1; i < attempt; i++ {
+		delay *= 2
+	}
+	time.Sleep(delay)
 }

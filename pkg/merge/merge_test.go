@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -163,6 +164,93 @@ func TestMergeAndWriteRejectsDuplicateSlots(t *testing.T) {
 	}
 }
 
+func TestMergeAndWriteComputesConfirmedNonCanonical(t *testing.T) {
+	dir := t.TempDir()
+	worker := filepath.Join(dir, "worker.jsonl")
+	jsonlOut := filepath.Join(dir, "results.jsonl")
+	csvOut := filepath.Join(dir, "results.csv")
+
+	canonicalRoot := "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	orphanRoot := "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	zeroRoot := "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+	lines := []string{
+		validEngineRecordJSONWithConfirmation(64, true, canonicalRoot, 10),
+		validEngineRecordJSONWithConfirmation(65, true, orphanRoot, 10),
+		validEngineRecordJSONWithConfirmation(66, true, orphanRoot, 11),
+		validEngineRecordJSONWithConfirmation(67, true, zeroRoot, 10),
+		validEngineRecordJSONWithConfirmation(68, true, "", 10),
+		validEngineRecordJSONWithConfirmation(69, true, orphanRoot, 99),
+		validEngineRecordJSONWithConfirmation(70, true, orphanRoot, 0),
+	}
+	writeFile(t, worker, strings.Join(lines, "\n")+"\n")
+
+	lookup := func(slot uint64) (string, bool, bool, error) {
+		switch slot {
+		case 10:
+			return canonicalRoot, true, true, nil
+		case 11:
+			return "", false, true, nil
+		default:
+			return "", false, false, nil
+		}
+	}
+
+	_, err := MergeAndWriteWithCanonical(
+		[]string{worker},
+		jsonlOut,
+		csvOut,
+		schema.OrchestratorMetadata{EngineName: "lighthouse", AttestationSourceMode: "greedy-lookahead", LookaheadCap: 4},
+		nil,
+		lookup,
+	)
+	if err != nil {
+		t.Fatalf("MergeAndWriteWithCanonical() error = %v", err)
+	}
+
+	records := readJSONLRecords(t, jsonlOut)
+	got := make([]bool, 0, len(records))
+	for _, record := range records {
+		got = append(got, record.ConfirmedNonCanonical)
+	}
+	want := []bool{false, true, true, false, false, false, false}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("confirmed_non_canonical = %#v, want %#v", got, want)
+	}
+
+	csvFile, err := os.Open(csvOut)
+	if err != nil {
+		t.Fatalf("open CSV: %v", err)
+	}
+	defer csvFile.Close()
+	scanner := bufio.NewScanner(csvFile)
+	if !scanner.Scan() {
+		t.Fatal("CSV is empty")
+	}
+	rest := strings.Builder{}
+	for scanner.Scan() {
+		rest.WriteString(scanner.Text())
+		rest.WriteByte('\n')
+	}
+	rows, err := csv.NewReader(strings.NewReader(rest.String())).ReadAll()
+	if err != nil {
+		t.Fatalf("decode CSV: %v", err)
+	}
+	confirmedNonCanonicalIndex := -1
+	for i, column := range rows[0] {
+		if column == "confirmed_non_canonical" {
+			confirmedNonCanonicalIndex = i
+			break
+		}
+	}
+	if confirmedNonCanonicalIndex < 0 {
+		t.Fatalf("CSV header missing confirmed_non_canonical: %#v", rows[0])
+	}
+	if rows[2][confirmedNonCanonicalIndex] != "true" || rows[1][confirmedNonCanonicalIndex] != "false" {
+		t.Fatalf("unexpected CSV confirmed_non_canonical values: %#v", rows[1:3])
+	}
+}
+
 func TestMergeAndWriteEmptyInputs(t *testing.T) {
 	dir := t.TempDir()
 	jsonlOut := filepath.Join(dir, "empty.jsonl")
@@ -216,6 +304,10 @@ func TestMergeAndWriteOutputAndInputErrors(t *testing.T) {
 }
 
 func validEngineRecordJSON(slot uint64, hasBlock bool) string {
+	return validEngineRecordJSONWithConfirmation(slot, hasBlock, "0xconfirmed", slot)
+}
+
+func validEngineRecordJSONWithConfirmation(slot uint64, hasBlock bool, confirmedRoot string, confirmedSlot uint64) string {
 	blockRoot := "null"
 	if hasBlock {
 		blockRoot = `"0x010203"`
@@ -228,8 +320,8 @@ func validEngineRecordJSON(slot uint64, hasBlock bool) string {
 		"has_block":                 hasBlock,
 		"block_root":                json.RawMessage(blockRoot),
 		"head_root":                 "0xhead",
-		"confirmed_root":            "0xconfirmed",
-		"confirmed_slot":            slot,
+		"confirmed_root":            confirmedRoot,
+		"confirmed_slot":            confirmedSlot,
 		"confirmation_delay_slots":  uint64(0),
 		"fast_confirmed":            hasBlock,
 		"strict_one_slot_confirmed": hasBlock,

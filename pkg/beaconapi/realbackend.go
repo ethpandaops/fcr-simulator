@@ -19,7 +19,9 @@ import (
 const (
 	maxOrphanWalk = 16
 
-	canonicalLoadChunkSize = 256
+	canonicalLoadChunkSize    = 256
+	archiveSlotRangeBatchSize = 1024
+	maxArchiveOrphansPerSlot  = 8
 
 	// DefaultDecodedBlockCacheSize is the orchestrator default for decoded
 	// blockInfo LRU caches used by per-slot simulation planning.
@@ -48,6 +50,11 @@ type RealBackendConfig struct {
 	// simulation; the prep pass warms the cache up front via WarmBlockArchiveCache.
 	ArchiveCacheOnly bool
 
+	// ArchiveOrphanRootsBySlot is produced by WarmBlockArchiveCache from
+	// block-archive slot-range index queries. It lets cache-only serving discover
+	// orphan source blocks by slot without contacting the archive.
+	ArchiveOrphanRootsBySlot map[uint64][][32]byte
+
 	// DecodedBlockCacheSize bounds decoded blockInfo caches. Zero disables
 	// decoded caching.
 	DecodedBlockCacheSize int
@@ -64,6 +71,7 @@ func NewRealBackend(cfg RealBackendConfig) Backend {
 	if cfg.ForkSchedule.SlotFork == nil {
 		cfg.ForkSchedule.SlotFork = MainnetForkAtSlot
 	}
+	cfg.ArchiveOrphanRootsBySlot = cloneOrphanRootsBySlot(cfg.ArchiveOrphanRootsBySlot)
 	cacheSize := cfg.DecodedBlockCacheSize
 
 	backend := &realBackend{cfg: cfg}
@@ -77,6 +85,34 @@ func NewRealBackend(cfg RealBackendConfig) Backend {
 		}
 	}
 	return backend
+}
+
+type CanonicalRootLookup struct {
+	backend *realBackend
+	from    uint64
+	to      uint64
+}
+
+func NewCanonicalRootLookup(cfg RealBackendConfig, from, to uint64) *CanonicalRootLookup {
+	cfg.BlockArchive = nil
+	cfg.ArchiveOrphanRootsBySlot = nil
+	cfg.ArchiveCacheOnly = true
+	backend, _ := NewRealBackend(cfg).(*realBackend)
+	return &CanonicalRootLookup{backend: backend, from: from, to: to}
+}
+
+func (l *CanonicalRootLookup) Lookup(slot uint64) (root string, exists bool, known bool, err error) {
+	if l == nil || l.backend == nil || slot < l.from || slot > l.to {
+		return "", false, false, nil
+	}
+	info, ok, err := l.backend.canonicalInfoAtSlot(slot)
+	if err != nil {
+		return "", false, true, err
+	}
+	if !ok {
+		return "", false, true, nil
+	}
+	return formatRoot(info.Root), true, true, nil
 }
 
 func (b *realBackend) BlockSSZBySlot(slot uint64) ([]byte, error) {
@@ -96,24 +132,7 @@ func (b *realBackend) BlockSSZBySlot(slot uint64) ([]byte, error) {
 }
 
 func (b *realBackend) BlockSSZByRoot(root [32]byte) ([]byte, error) {
-	if b.cfg.CheckpointBlocksByRoot != nil {
-		if data, ok := b.cfg.CheckpointBlocksByRoot[root]; ok {
-			return cloneBytes(data), nil
-		}
-	}
-
-	if b.cfg.BlockArchive == nil {
-		return nil, ErrNotFound
-	}
-
-	data, err := b.cfg.BlockArchive.FetchBlockSSZByRoot(root)
-	if errors.Is(err, blockarchive.ErrNotFound) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	return cloneBytes(data), nil
+	return b.fetchBlockSSZByRootForPlan(root)
 }
 
 func (b *realBackend) StateSSZBySlot(slot uint64) ([]byte, error) {
@@ -175,13 +194,14 @@ func (b *realBackend) BuildPlan(from, to uint64) ([]PlanEntry, error) {
 	}
 
 	state := &planBuildState{
-		backend:        b,
-		canonical:      &canonicalBlockMap{bySlot: canonicalBySlot, byRoot: canonicalByRoot},
-		importedRoots:  make(map[[32]byte]bool),
-		scheduledRoots: make(map[[32]byte]bool),
-		missingRoots:   make(map[[32]byte]bool),
-		ignoredRoots:   make(map[[32]byte]bool),
-		fetchedByRoot:  make(map[[32]byte]blockInfo),
+		backend:           b,
+		canonical:         &canonicalBlockMap{bySlot: canonicalBySlot, byRoot: canonicalByRoot},
+		importedRoots:     make(map[[32]byte]bool),
+		scheduledRoots:    make(map[[32]byte]bool),
+		missingRoots:      make(map[[32]byte]bool),
+		ignoredRoots:      make(map[[32]byte]bool),
+		fetchedByRoot:     make(map[[32]byte]blockInfo),
+		orphanRootsBySlot: cloneOrphanRootsBySlot(b.cfg.ArchiveOrphanRootsBySlot),
 	}
 	for root := range b.cfg.CheckpointBlocksByRoot {
 		state.importedRoots[root] = true
@@ -216,6 +236,12 @@ func (b *realBackend) BuildPlan(from, to uint64) ([]PlanEntry, error) {
 			entry.ImportBlocks = append(entry.ImportBlocks, blockImport(info, true))
 			state.importedRoots[info.Root] = true
 		}
+
+		slotOrphanImports, err := state.archiveOrphanImportsForSlot(simSlot, from)
+		if err != nil {
+			return nil, err
+		}
+		entry.ImportBlocks = append(entry.ImportBlocks, slotOrphanImports...)
 
 		if pending := pendingOrphanImports[simSlot]; len(pending) > 0 {
 			sortBlockInfos(pending)
@@ -262,13 +288,14 @@ func (b *realBackend) BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstructio
 	canonical := b.canonicalIndex.view(minImportSlot, loadEnd)
 
 	state := &planBuildState{
-		backend:        b,
-		canonical:      canonical,
-		importedRoots:  make(map[[32]byte]bool),
-		scheduledRoots: make(map[[32]byte]bool),
-		missingRoots:   make(map[[32]byte]bool),
-		ignoredRoots:   make(map[[32]byte]bool),
-		fetchedByRoot:  make(map[[32]byte]blockInfo),
+		backend:           b,
+		canonical:         canonical,
+		importedRoots:     make(map[[32]byte]bool),
+		scheduledRoots:    make(map[[32]byte]bool),
+		missingRoots:      make(map[[32]byte]bool),
+		ignoredRoots:      make(map[[32]byte]bool),
+		fetchedByRoot:     make(map[[32]byte]blockInfo),
+		orphanRootsBySlot: cloneOrphanRootsBySlot(b.cfg.ArchiveOrphanRootsBySlot),
 	}
 	for root := range b.cfg.CheckpointBlocksByRoot {
 		state.importedRoots[root] = true
@@ -286,7 +313,16 @@ func (b *realBackend) BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstructio
 		state.importedRoots[info.Root] = true
 	}
 
-	slotAttestations := attestationsMadeInWindow(canonical, simSlot, b.cfg.LookaheadCap)
+	slotOrphanImports, err := state.archiveOrphanImportsForSlot(simSlot, minImportSlot)
+	if err != nil {
+		return SlotInstruction{}, err
+	}
+	instruction.ImportBlocks = append(instruction.ImportBlocks, slotOrphanImports...)
+
+	slotAttestations, err := state.attestationsMadeInWindow(simSlot, b.cfg.LookaheadCap)
+	if err != nil {
+		return SlotInstruction{}, err
+	}
 	orphanImports, err := state.orphanImportsForSlotAttestations(slotAttestations, simSlot, minImportSlot)
 	if err != nil {
 		return SlotInstruction{}, err
@@ -300,26 +336,142 @@ func (b *realBackend) BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstructio
 	return instruction, nil
 }
 
+type ArchiveWarmStats struct {
+	WorkerRanges             int
+	SlotRangeQueries         int
+	OrphanRootsDiscovered    int
+	HighOrphanFanoutSlots    int
+	RootsResolvedCached      int
+	RootsArchiveMissing      int
+	TransientFailuresRetried int
+	ChainsTruncated          int
+	ChainsPreWarmupParent    int
+}
+
+type ArchiveWarmResult struct {
+	Stats             ArchiveWarmStats
+	OrphanRootsBySlot map[uint64][][32]byte
+}
+
+type archiveWarmAccumulator struct {
+	stats             ArchiveWarmStats
+	resolved          map[[32]byte]bool
+	missing           map[[32]byte]bool
+	orphanRootsBySlot map[uint64][][32]byte
+	highFanoutSlots   map[uint64]bool
+}
+
+func newArchiveWarmAccumulator() *archiveWarmAccumulator {
+	return &archiveWarmAccumulator{
+		resolved:          make(map[[32]byte]bool),
+		missing:           make(map[[32]byte]bool),
+		orphanRootsBySlot: make(map[uint64][][32]byte),
+		highFanoutSlots:   make(map[uint64]bool),
+	}
+}
+
+func (a *archiveWarmAccumulator) result() ArchiveWarmResult {
+	if a == nil {
+		return ArchiveWarmResult{}
+	}
+	return ArchiveWarmResult{
+		Stats:             a.stats,
+		OrphanRootsBySlot: cloneOrphanRootsBySlot(a.orphanRootsBySlot),
+	}
+}
+
+func (a *archiveWarmAccumulator) addSlotRangeQuery() {
+	if a == nil {
+		return
+	}
+	a.stats.SlotRangeQueries++
+}
+
+func (a *archiveWarmAccumulator) addOrphanRoot(slot uint64, root [32]byte) bool {
+	if a == nil {
+		return false
+	}
+	added, highFanout := appendOrphanRoot(a.orphanRootsBySlot, slot, root)
+	if highFanout {
+		a.addHighFanoutSlot(slot)
+	}
+	if added {
+		a.stats.OrphanRootsDiscovered++
+	}
+	return added
+}
+
+func (a *archiveWarmAccumulator) addHighFanoutSlot(slot uint64) {
+	if a == nil || a.highFanoutSlots[slot] {
+		return
+	}
+	a.highFanoutSlots[slot] = true
+	a.stats.HighOrphanFanoutSlots++
+}
+
+func (a *archiveWarmAccumulator) addResolved(root [32]byte) {
+	if a == nil || a.resolved[root] {
+		return
+	}
+	a.resolved[root] = true
+	a.stats.RootsResolvedCached++
+}
+
+func (a *archiveWarmAccumulator) addMissing(root [32]byte) {
+	if a == nil || a.missing[root] {
+		return
+	}
+	a.missing[root] = true
+	a.stats.RootsArchiveMissing++
+}
+
+func (a *archiveWarmAccumulator) addTransientRetries(count int) {
+	if a == nil {
+		return
+	}
+	a.stats.TransientFailuresRetried += count
+}
+
+func (a *archiveWarmAccumulator) addTruncatedChain() {
+	if a == nil {
+		return
+	}
+	a.stats.ChainsTruncated++
+}
+
+func (a *archiveWarmAccumulator) observeChain(chain []blockInfo, minSlot uint64) {
+	if a == nil {
+		return
+	}
+	for _, info := range chain {
+		if info.Slot < minSlot {
+			a.stats.ChainsPreWarmupParent++
+			return
+		}
+	}
+}
+
 // WarmBlockArchiveCache resolves and disk-caches every orphan block that the
 // per-slot hot loop could request for the given sim-slot ranges. This is the
 // only place the block archive is contacted over HTTP; the serving backend runs
 // with ArchiveCacheOnly so it reads exclusively from the cache this warms. Each
 // range is [from, to) in slots, matching one worker's import window.
-func WarmBlockArchiveCache(cfg RealBackendConfig, ranges [][2]uint64) error {
+func WarmBlockArchiveCache(cfg RealBackendConfig, ranges [][2]uint64) (ArchiveWarmResult, error) {
 	cfg.ArchiveCacheOnly = false
 	backend, ok := NewRealBackend(cfg).(*realBackend)
 	if !ok {
-		return fmt.Errorf("warm block archive cache: unexpected backend type")
+		return ArchiveWarmResult{}, fmt.Errorf("warm block archive cache: unexpected backend type")
 	}
+	acc := newArchiveWarmAccumulator()
 	for _, r := range ranges {
-		if err := backend.warmArchiveCache(r[0], r[1]); err != nil {
-			return err
+		if err := backend.warmArchiveCache(r[0], r[1], acc); err != nil {
+			return acc.result(), err
 		}
 	}
-	return nil
+	return acc.result(), nil
 }
 
-func (b *realBackend) warmArchiveCache(from, to uint64) error {
+func (b *realBackend) warmArchiveCache(from, to uint64, acc *archiveWarmAccumulator) error {
 	if b.cfg.BlockArchive == nil {
 		return nil
 	}
@@ -329,6 +481,9 @@ func (b *realBackend) warmArchiveCache(from, to uint64) error {
 	if from >= to {
 		return nil
 	}
+	if acc != nil {
+		acc.stats.WorkerRanges++
+	}
 
 	loadEnd := saturatingAdd(to, b.cfg.LookaheadCap)
 	canonicalBySlot, canonicalByRoot, err := b.loadCanonicalBlockInfos(from, loadEnd)
@@ -337,34 +492,125 @@ func (b *realBackend) warmArchiveCache(from, to uint64) error {
 	}
 
 	state := &planBuildState{
-		backend:        b,
-		canonical:      &canonicalBlockMap{bySlot: canonicalBySlot, byRoot: canonicalByRoot},
-		importedRoots:  make(map[[32]byte]bool),
-		scheduledRoots: make(map[[32]byte]bool),
-		missingRoots:   make(map[[32]byte]bool),
-		ignoredRoots:   make(map[[32]byte]bool),
-		fetchedByRoot:  make(map[[32]byte]blockInfo),
+		backend:           b,
+		canonical:         &canonicalBlockMap{bySlot: canonicalBySlot, byRoot: canonicalByRoot},
+		importedRoots:     make(map[[32]byte]bool),
+		scheduledRoots:    make(map[[32]byte]bool),
+		missingRoots:      make(map[[32]byte]bool),
+		ignoredRoots:      make(map[[32]byte]bool),
+		fetchedByRoot:     make(map[[32]byte]blockInfo),
+		orphanRootsBySlot: make(map[uint64][][32]byte),
+		warm:              acc,
 	}
 	for root := range b.cfg.CheckpointBlocksByRoot {
 		state.importedRoots[root] = true
 	}
 
+	if b.cfg.Mode == attplan.ModeGreedyLookahead {
+		if err := b.warmSlotRangeOrphans(state, from, loadEnd, acc); err != nil {
+			return err
+		}
+	}
+
 	roots := make(map[[32]byte]bool)
 	for _, info := range canonicalBySlot {
-		for _, attestation := range info.Attestations {
-			for _, root := range [][32]byte{attestation.TargetRoot, attestation.BeaconBlockRoot} {
-				if isZeroRoot(root) || state.rootKnown(root) {
-					continue
-				}
-				roots[root] = true
-			}
+		state.collectUnknownAttestationRoots(info, roots)
+	}
+	for slot := range state.orphanRootsBySlot {
+		infos, err := state.archiveOrphanInfosBySlot(slot)
+		if err != nil {
+			return err
+		}
+		for _, info := range infos {
+			state.collectUnknownAttestationRoots(info, roots)
 		}
 	}
 
 	for _, root := range sortedRootKeys(roots) {
-		if _, err := state.resolveOrphanChain(root, loadEnd); err != nil {
+		chain, err := state.resolveOrphanChain(root, loadEnd)
+		if err != nil {
 			return err
 		}
+		acc.observeChain(chain, from)
+	}
+	return nil
+}
+
+func (b *realBackend) warmSlotRangeOrphans(state *planBuildState, from, to uint64, acc *archiveWarmAccumulator) error {
+	if b.cfg.BlockArchive == nil || from > to {
+		return nil
+	}
+
+	for batchFrom := from; ; {
+		batchTo := to
+		if maxBatchTo, ok := checkedAdd(batchFrom, archiveSlotRangeBatchSize-1); ok && maxBatchTo < batchTo {
+			batchTo = maxBatchTo
+		}
+		limit := int(batchTo - batchFrom + 1)
+
+		acc.addSlotRangeQuery()
+		entries, fetchStats, err := b.cfg.BlockArchive.ListIndexBySlotRangeWithStats(batchFrom, batchTo, limit)
+		acc.addTransientRetries(fetchStats.TransientFailuresRetried)
+		if errors.Is(err, blockarchive.ErrNotFound) {
+			entries = nil
+		} else if err != nil {
+			return err
+		}
+
+		for _, entry := range entries {
+			root, err := blockarchive.ParseRoot(entry.BlockRoot)
+			if err != nil {
+				return fmt.Errorf("parse block archive index root for slot %d: %w", entry.Slot, err)
+			}
+			if isZeroRoot(root) || state.rootKnown(root) {
+				continue
+			}
+			if info, ok := state.fetchedByRoot[root]; ok {
+				if info.Slot == entry.Slot {
+					canonical, err := state.isCanonicalBlockInfo(info)
+					if err != nil {
+						return err
+					}
+					if !canonical {
+						state.rememberArchiveOrphanInfo(info)
+					}
+				}
+				continue
+			}
+
+			data, fetchStats, err := b.cfg.BlockArchive.FetchBlockSSZBySlotAndRootWithStats(entry.Slot, root)
+			acc.addTransientRetries(fetchStats.TransientFailuresRetried)
+			if errors.Is(err, blockarchive.ErrNotFound) {
+				acc.addMissing(root)
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			info, err := b.decodeBlockInfoByRoot(root, data)
+			if err != nil {
+				return fmt.Errorf("parse slot-range orphan block %s at slot %d: %w", formatRoot(root), entry.Slot, err)
+			}
+			if info.Slot != entry.Slot {
+				return fmt.Errorf("block archive index said root %s was at slot %d, decoded slot %d", formatRoot(root), entry.Slot, info.Slot)
+			}
+			canonical, err := state.isCanonicalBlockInfo(info)
+			if err != nil {
+				return err
+			}
+			if canonical {
+				continue
+			}
+
+			state.fetchedByRoot[root] = info
+			acc.addResolved(root)
+			state.rememberArchiveOrphanInfo(info)
+		}
+
+		if batchTo == to || batchTo == math.MaxUint64 {
+			break
+		}
+		batchFrom = batchTo + 1
 	}
 	return nil
 }
@@ -779,13 +1025,15 @@ func (v *canonicalBlockView) add(info blockInfo) {
 }
 
 type planBuildState struct {
-	backend        *realBackend
-	canonical      canonicalBlocks
-	importedRoots  map[[32]byte]bool
-	scheduledRoots map[[32]byte]bool
-	missingRoots   map[[32]byte]bool
-	ignoredRoots   map[[32]byte]bool
-	fetchedByRoot  map[[32]byte]blockInfo
+	backend           *realBackend
+	canonical         canonicalBlocks
+	importedRoots     map[[32]byte]bool
+	scheduledRoots    map[[32]byte]bool
+	missingRoots      map[[32]byte]bool
+	ignoredRoots      map[[32]byte]bool
+	fetchedByRoot     map[[32]byte]blockInfo
+	orphanRootsBySlot map[uint64][][32]byte
+	warm              *archiveWarmAccumulator
 }
 
 func (s *planBuildState) orphanImportsForSources(
@@ -802,19 +1050,24 @@ func (s *planBuildState) orphanImportsForSources(
 
 	roots := make(map[[32]byte]bool)
 	for _, source := range sources {
-		info, ok := s.canonical.infoBySlot(source.Slot)
-		if !ok {
+		sourceInfos, err := s.sourceBlockInfosBySlot(source.Slot)
+		if err != nil {
+			return nil, err
+		}
+		if len(sourceInfos) == 0 {
 			return nil, fmt.Errorf("attestation source slot %d is not a canonical block", source.Slot)
 		}
-		for _, attestation := range info.Attestations {
-			if source.MaxAttestationSlot != nil && attestation.Slot > *source.MaxAttestationSlot {
-				continue
-			}
-			for _, root := range [][32]byte{attestation.TargetRoot, attestation.BeaconBlockRoot} {
-				if isZeroRoot(root) || s.rootKnown(root) || s.scheduledRoots[root] || s.missingRoots[root] || s.ignoredRoots[root] {
+		for _, info := range sourceInfos {
+			for _, attestation := range info.Attestations {
+				if source.MaxAttestationSlot != nil && attestation.Slot > *source.MaxAttestationSlot {
 					continue
 				}
-				roots[root] = true
+				for _, root := range [][32]byte{attestation.TargetRoot, attestation.BeaconBlockRoot} {
+					if isZeroRoot(root) || s.rootKnown(root) || s.scheduledRoots[root] || s.missingRoots[root] || s.ignoredRoots[root] {
+						continue
+					}
+					roots[root] = true
+				}
 			}
 		}
 	}
@@ -867,28 +1120,37 @@ func (s *planBuildState) orphanImportsForSources(
 	return imports, nil
 }
 
-func attestationsMadeInWindow(canonical canonicalBlocks, madeSlot, lookaheadCap uint64) []attestationInfo {
+func (s *planBuildState) attestationsMadeInWindow(madeSlot, lookaheadCap uint64) ([]attestationInfo, error) {
 	if lookaheadCap == 0 || madeSlot == math.MaxUint64 {
-		return nil
+		return nil, nil
 	}
 
 	end, ok := checkedAdd(madeSlot, lookaheadCap)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	start := madeSlot + 1
 	out := make([]attestationInfo, 0)
+	seen := make(map[[32]byte]bool)
 	for sourceSlot := start; ; sourceSlot++ {
-		if info, ok := canonical.infoBySlot(sourceSlot); ok {
+		sourceInfos, err := s.sourceBlockInfosBySlot(sourceSlot)
+		if err != nil {
+			return nil, err
+		}
+		for _, info := range sourceInfos {
 			for _, attestation := range info.Attestations {
 				if attestation.Slot != madeSlot {
 					continue
 				}
-				// Preserve every aggregate for this attested slot. Multiple
-				// inclusion blocks can carry overlapping aggregates with the
-				// same attestation data/root, and fork choice de-duplicates at
-				// the validator vote level.
+				// De-duplicate only exact aggregate repeats. Different
+				// aggregates for the same attestation data carry different
+				// validator bits and must all be injected; fork choice
+				// de-duplicates at the validator vote level.
+				if seen[attestation.Root] {
+					continue
+				}
+				seen[attestation.Root] = true
 				out = append(out, attestation)
 			}
 		}
@@ -896,7 +1158,117 @@ func attestationsMadeInWindow(canonical canonicalBlocks, madeSlot, lookaheadCap 
 			break
 		}
 	}
-	return out
+	return out, nil
+}
+
+func (s *planBuildState) sourceBlockInfosBySlot(slot uint64) ([]blockInfo, error) {
+	infos := make([]blockInfo, 0, 1)
+	if info, ok := s.canonical.infoBySlot(slot); ok {
+		infos = append(infos, info)
+	}
+	orphanInfos, err := s.archiveOrphanInfosBySlot(slot)
+	if err != nil {
+		return nil, err
+	}
+	infos = append(infos, orphanInfos...)
+	return infos, nil
+}
+
+func (s *planBuildState) archiveOrphanInfosBySlot(slot uint64) ([]blockInfo, error) {
+	roots := s.orphanRootsBySlot[slot]
+	if len(roots) == 0 {
+		return nil, nil
+	}
+
+	infos := make([]blockInfo, 0, len(roots))
+	seen := make(map[[32]byte]bool, len(roots))
+	for _, root := range roots {
+		if isZeroRoot(root) || seen[root] || s.missingRoots[root] || s.ignoredRoots[root] {
+			continue
+		}
+		seen[root] = true
+
+		info, err := s.fetchBlockInfoByRoot(root)
+		if errors.Is(err, ErrNotFound) {
+			s.missingRoots[root] = true
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if info.Slot != slot {
+			s.ignoredRoots[root] = true
+			continue
+		}
+		canonical, err := s.isCanonicalBlockInfo(info)
+		if err != nil {
+			return nil, err
+		}
+		if canonical {
+			s.ignoredRoots[root] = true
+			continue
+		}
+		infos = append(infos, info)
+	}
+
+	sortBlockInfos(infos)
+	return infos, nil
+}
+
+func (s *planBuildState) archiveOrphanImportsForSlot(slot, minImportSlot uint64) ([]PlanBlockImport, error) {
+	infos, err := s.archiveOrphanInfosBySlot(slot)
+	if err != nil {
+		return nil, err
+	}
+	if len(infos) == 0 {
+		return nil, nil
+	}
+
+	imports := make([]PlanBlockImport, 0, len(infos))
+	for _, info := range infos {
+		if info.Slot < minImportSlot {
+			s.ignoredRoots[info.Root] = true
+			continue
+		}
+		if s.rootKnown(info.Root) || s.scheduledRoots[info.Root] {
+			continue
+		}
+		s.importedRoots[info.Root] = true
+		imports = append(imports, blockImport(info, false))
+	}
+	return imports, nil
+}
+
+func (s *planBuildState) collectUnknownAttestationRoots(info blockInfo, roots map[[32]byte]bool) {
+	for _, attestation := range info.Attestations {
+		for _, root := range [][32]byte{attestation.TargetRoot, attestation.BeaconBlockRoot} {
+			if isZeroRoot(root) || s.rootKnown(root) || s.scheduledRoots[root] || s.missingRoots[root] || s.ignoredRoots[root] {
+				continue
+			}
+			roots[root] = true
+		}
+	}
+}
+
+func (s *planBuildState) rememberArchiveOrphanInfo(info blockInfo) {
+	s.rememberArchiveOrphanRoot(info.Slot, info.Root)
+}
+
+func (s *planBuildState) rememberArchiveOrphanRoot(slot uint64, root [32]byte) {
+	if isZeroRoot(root) {
+		return
+	}
+	if s.orphanRootsBySlot == nil {
+		s.orphanRootsBySlot = make(map[uint64][][32]byte)
+	}
+	added, highFanout := appendOrphanRoot(s.orphanRootsBySlot, slot, root)
+	if highFanout {
+		s.warm.addHighFanoutSlot(slot)
+		return
+	}
+	if added {
+		s.warm.addOrphanRoot(slot, root)
+	}
 }
 
 func (s *planBuildState) orphanImportsForSlotAttestations(attestations []attestationInfo, simSlot, minImportSlot uint64) ([]PlanBlockImport, error) {
@@ -989,9 +1361,11 @@ func (s *planBuildState) resolveOrphanChain(root [32]byte, evalSlot uint64) ([]b
 	current := root
 	seen := make(map[[32]byte]bool)
 	chain := make([]blockInfo, 0, maxOrphanWalk)
+	truncated := true
 
 	for depth := 0; depth < maxOrphanWalk; depth++ {
 		if isZeroRoot(current) || s.rootKnown(current) || s.missingRoots[current] || seen[current] {
+			truncated = false
 			break
 		}
 		seen[current] = true
@@ -999,12 +1373,14 @@ func (s *planBuildState) resolveOrphanChain(root [32]byte, evalSlot uint64) ([]b
 		info, err := s.fetchBlockInfoByRoot(current)
 		if errors.Is(err, ErrNotFound) {
 			s.missingRoots[current] = true
+			truncated = false
 			break
 		}
 		if err != nil {
 			return nil, err
 		}
 		if info.Slot > evalSlot {
+			truncated = false
 			break
 		}
 		canonical, err := s.isCanonicalBlockInfo(info)
@@ -1012,11 +1388,16 @@ func (s *planBuildState) resolveOrphanChain(root [32]byte, evalSlot uint64) ([]b
 			return nil, err
 		}
 		if canonical {
+			truncated = false
 			break
 		}
 
 		chain = append(chain, info)
+		s.rememberArchiveOrphanInfo(info)
 		current = info.ParentRoot
+	}
+	if truncated {
+		s.warm.addTruncatedChain()
 	}
 
 	for left, right := 0, len(chain)-1; left < right; left, right = left+1, right-1 {
@@ -1049,8 +1430,12 @@ func (s *planBuildState) fetchBlockInfoByRoot(root [32]byte) (blockInfo, error) 
 		return info, nil
 	}
 
-	data, err := s.backend.fetchBlockSSZByRootForPlan(root)
+	data, fetchStats, err := s.backend.fetchBlockSSZByRootForPlanWithStats(root)
+	s.warm.addTransientRetries(fetchStats.TransientFailuresRetried)
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			s.warm.addMissing(root)
+		}
 		return blockInfo{}, err
 	}
 	info, err := s.backend.decodeBlockInfoByRoot(root, data)
@@ -1059,17 +1444,24 @@ func (s *planBuildState) fetchBlockInfoByRoot(root [32]byte) (blockInfo, error) 
 	}
 
 	s.fetchedByRoot[root] = info
+	s.warm.addResolved(root)
 	return info, nil
 }
 
 func (b *realBackend) fetchBlockSSZByRootForPlan(root [32]byte) ([]byte, error) {
+	data, _, err := b.fetchBlockSSZByRootForPlanWithStats(root)
+	return data, err
+}
+
+func (b *realBackend) fetchBlockSSZByRootForPlanWithStats(root [32]byte) ([]byte, blockarchive.FetchStats, error) {
+	var stats blockarchive.FetchStats
 	if b.cfg.CheckpointBlocksByRoot != nil {
 		if data, ok := b.cfg.CheckpointBlocksByRoot[root]; ok {
-			return cloneBytes(data), nil
+			return cloneBytes(data), stats, nil
 		}
 	}
 	if b.cfg.BlockArchive == nil {
-		return nil, ErrNotFound
+		return nil, stats, ErrNotFound
 	}
 
 	var data []byte
@@ -1077,15 +1469,15 @@ func (b *realBackend) fetchBlockSSZByRootForPlan(root [32]byte) ([]byte, error) 
 	if b.cfg.ArchiveCacheOnly {
 		data, err = b.cfg.BlockArchive.ReadCachedSSZByRoot(root)
 	} else {
-		data, err = b.cfg.BlockArchive.FetchBlockSSZByRoot(root)
+		data, stats, err = b.cfg.BlockArchive.FetchBlockSSZByRootWithStats(root)
 	}
 	if errors.Is(err, blockarchive.ErrNotFound) {
-		return nil, ErrNotFound
+		return nil, stats, ErrNotFound
 	}
 	if err != nil {
-		return nil, err
+		return nil, stats, err
 	}
-	return cloneBytes(data), nil
+	return cloneBytes(data), stats, nil
 }
 
 func (s *planBuildState) rootKnown(root [32]byte) bool {
@@ -1111,6 +1503,41 @@ func sortedRootKeys(roots map[[32]byte]bool) [][32]byte {
 	sort.Slice(out, func(i, j int) bool {
 		return bytes.Compare(out[i][:], out[j][:]) < 0
 	})
+	return out
+}
+
+func appendOrphanRoot(rootsBySlot map[uint64][][32]byte, slot uint64, root [32]byte) (bool, bool) {
+	if rootsBySlot == nil || isZeroRoot(root) {
+		return false, false
+	}
+	roots := rootsBySlot[slot]
+	for _, existing := range roots {
+		if existing == root {
+			return false, false
+		}
+	}
+	if len(roots) >= maxArchiveOrphansPerSlot {
+		return false, true
+	}
+	rootsBySlot[slot] = append(roots, root)
+	return true, false
+}
+
+func cloneOrphanRootsBySlot(in map[uint64][][32]byte) map[uint64][][32]byte {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[uint64][][32]byte, len(in))
+	for slot, roots := range in {
+		if len(roots) == 0 {
+			continue
+		}
+		cloned := append([][32]byte(nil), roots...)
+		sort.Slice(cloned, func(i, j int) bool {
+			return bytes.Compare(cloned[i][:], cloned[j][:]) < 0
+		})
+		out[slot] = cloned
+	}
 	return out
 }
 

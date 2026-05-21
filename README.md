@@ -101,7 +101,7 @@ Per-worker RAM: ~2–3 GB for the Rust engines; Lodestar settles around 4 GB aft
 
 ## Output
 
-CSV starts with `# fcr-simulator-csv-schema-version:3` followed by the header row. JSONL is one record per line. Schema is the `SlotResult` struct in `pkg/schema/schema.go`. Key columns: `slot`, `epoch`, `has_block`, `block_root`, `head_root`, `confirmed_root`, `confirmed_slot`, `confirmation_delay_slots`, `fast_confirmed`, `strict_one_slot_confirmed`, `source_block_slot`, `num_attestations_injected`, `engine_name`, `engine_version`, `engine_commit`.
+CSV starts with `# fcr-simulator-csv-schema-version:4` followed by the header row. JSONL is one record per line. Schema is the `SlotResult` struct in `pkg/schema/schema.go`. Key columns: `slot`, `epoch`, `has_block`, `block_root`, `head_root`, `confirmed_root`, `confirmed_slot`, `confirmed_non_canonical`, `confirmation_delay_slots`, `fast_confirmed`, `strict_one_slot_confirmed`, `source_block_slot`, `num_attestations_injected`, `engine_name`, `engine_version`, `engine_commit`.
 
 A sidecar `<output>.manifest.json` captures engine manifest, run config, ERA file hashes, and output hashes for reproducibility.
 

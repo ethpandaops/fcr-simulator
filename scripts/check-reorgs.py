@@ -4,7 +4,7 @@
 import csv
 import sys
 
-CSV_SCHEMA_HEADER = "# fcr-simulator-csv-schema-version:3"
+CSV_SCHEMA_HEADER = "# fcr-simulator-csv-schema-version:4"
 
 def open_versioned_csv(path):
     f = open(path)

@@ -15,8 +15,8 @@ type Backend interface {
 	BlockSSZBySlot(slot uint64) ([]byte, error)
 
 	// BlockSSZByRoot returns the SSZ-encoded block by its hash_tree_root.
-	// Only checkpoint blocks pre-fetched by the orchestrator are addressable
-	// by root. Returns (nil, ErrNotFound) otherwise.
+	// Checkpoint blocks and warmed block-archive cache entries are
+	// addressable by root. Returns (nil, ErrNotFound) otherwise.
 	BlockSSZByRoot(root [32]byte) ([]byte, error)
 
 	// StateSSZBySlot returns the SSZ-encoded state at the given slot.
