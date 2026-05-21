@@ -63,11 +63,32 @@ type
     output: string
     manifestJson: bool
 
-  PlanEntry = object
-    simSlot: uint64
-    sourceBlockSlot: Option[uint64]
+  PlanCheckpoint = object
+    epoch: Epoch
+    root: Eth2Digest
 
-  AttestationPlan = Table[uint64, Option[uint64]]
+  PlanAttestationData = object
+    slot: Slot
+    index: uint64
+    beaconBlockRoot: Eth2Digest
+    source: PlanCheckpoint
+    target: PlanCheckpoint
+
+  PlanAttestation = object
+    aggregationBits: seq[byte]
+    committeeBits: Option[seq[byte]]
+    data: PlanAttestationData
+
+  PlanBlockImport = object
+    slot: Slot
+    root: Eth2Digest
+    canonical: bool
+
+  SlotInstruction = object
+    simSlot: Slot
+    evalSlot: Slot
+    importBlocks: seq[PlanBlockImport]
+    attestations: seq[PlanAttestation]
 
   EngineError = object of CatchableError
 
@@ -160,10 +181,6 @@ proc parseEngineConfig(): tuple[cfg: EngineConfig, exit: Option[ExitKind]] =
   if cfg.network != "mainnet":
     stderr.writeLine "--network must be 'mainnet' (V1)"
     return (cfg, some(ekConfig))
-  if cfg.attestationSourceMode notin [
-      "next-non-missed", "strict-source-block-k-minus-1"]:
-    stderr.writeLine "invalid --attestation-source-mode"
-    return (cfg, some(ekConfig))
   if cfg.warmupStartSlot > cfg.startSlot:
     stderr.writeLine "--warmup-start-slot must be <= --start-slot"
     return (cfg, some(ekConfig))
@@ -192,6 +209,145 @@ proc printManifest() =
 
 proc trimBaseUrl(url: string): string =
   if url.endsWith("/"): url[0 ..< ^1] else: url
+
+proc parsePlanRoot(value, ctx: string): Eth2Digest =
+  if not value.startsWith("0x"):
+    raise newException(EngineError, ctx & ": root must have 0x prefix")
+  if value.len != 66:
+    raise newException(EngineError,
+      &"{ctx}: expected 32-byte root hex string, got {value.len - 2} hex chars")
+  try:
+    Eth2Digest(data: hexToByteArrayStrict[32](value))
+  except ValueError as e:
+    raise newException(EngineError, ctx & ": invalid root hex: " & e.msg)
+
+proc parsePlanHexBytes(value, ctx: string): seq[byte] =
+  try:
+    hexToSeqByte(value)
+  except ValueError as e:
+    raise newException(EngineError, ctx & ": invalid hex: " & e.msg)
+
+proc requireObject(node: JsonNode, ctx: string) =
+  if node.isNil or node.kind != JObject:
+    raise newException(EngineError, ctx & " must be an object")
+
+proc requireField(node: JsonNode, field, ctx: string): JsonNode =
+  requireObject(node, ctx)
+  if not node.hasKey(field):
+    raise newException(EngineError, ctx & " is missing " & field)
+  node[field]
+
+proc requireArrayField(node: JsonNode, field, ctx: string): JsonNode =
+  let child = requireField(node, field, ctx)
+  if child.kind != JArray:
+    raise newException(EngineError, ctx & "." & field & " must be an array")
+  child
+
+proc requireStringField(node: JsonNode, field, ctx: string): string =
+  let child = requireField(node, field, ctx)
+  if child.kind != JString:
+    raise newException(EngineError, ctx & "." & field & " must be a string")
+  child.getStr()
+
+proc requireUint64Field(node: JsonNode, field, ctx: string): uint64 =
+  let child = requireField(node, field, ctx)
+  if child.kind != JInt:
+    raise newException(EngineError, ctx & "." & field & " must be an integer")
+  let value = child.getBiggestInt()
+  if value < 0:
+    raise newException(EngineError, ctx & "." & field & " must be non-negative")
+  value.uint64
+
+proc requireBoolField(node: JsonNode, field, ctx: string): bool =
+  let child = requireField(node, field, ctx)
+  if child.kind != JBool:
+    raise newException(EngineError, ctx & "." & field & " must be a bool")
+  child.getBool()
+
+proc parseCheckpoint(node: JsonNode, ctx: string): PlanCheckpoint =
+  requireObject(node, ctx)
+  PlanCheckpoint(
+    epoch: Epoch(requireUint64Field(node, "epoch", ctx)),
+    root: parsePlanRoot(requireStringField(node, "root", ctx), ctx & ".root"))
+
+proc parseAttestationData(node: JsonNode, ctx: string): PlanAttestationData =
+  requireObject(node, ctx)
+  PlanAttestationData(
+    slot: Slot(requireUint64Field(node, "slot", ctx)),
+    index: requireUint64Field(node, "index", ctx),
+    beaconBlockRoot: parsePlanRoot(
+      requireStringField(node, "beacon_block_root", ctx),
+      ctx & ".beacon_block_root"),
+    source: parseCheckpoint(requireField(node, "source", ctx), ctx & ".source"),
+    target: parseCheckpoint(requireField(node, "target", ctx), ctx & ".target"))
+
+proc parsePlanAttestation(node: JsonNode, ctx: string): PlanAttestation =
+  requireObject(node, ctx)
+  var committeeBits = none(seq[byte])
+  if node.hasKey("committee_bits"):
+    let committeeNode = node["committee_bits"]
+    if committeeNode.kind != JNull:
+      if committeeNode.kind != JString:
+        raise newException(EngineError,
+          ctx & ".committee_bits must be a string or null")
+      committeeBits = some(parsePlanHexBytes(
+        committeeNode.getStr(), ctx & ".committee_bits"))
+  PlanAttestation(
+    aggregationBits: parsePlanHexBytes(
+      requireStringField(node, "aggregation_bits", ctx),
+      ctx & ".aggregation_bits"),
+    committeeBits: committeeBits,
+    data: parseAttestationData(requireField(node, "data", ctx), ctx & ".data"))
+
+proc parsePlanBlockImport(node: JsonNode, ctx: string): PlanBlockImport =
+  requireObject(node, ctx)
+  PlanBlockImport(
+    slot: Slot(requireUint64Field(node, "slot", ctx)),
+    root: parsePlanRoot(requireStringField(node, "root", ctx), ctx & ".root"),
+    canonical: requireBoolField(node, "canonical", ctx))
+
+proc parseSlotInstruction(body: seq[byte], simSlot: Slot): SlotInstruction =
+  let parsed = try:
+    parseJson(string.fromBytes(body))
+  except CatchableError as e:
+    raise newException(EngineError,
+      "failed to decode slot instruction JSON: " & e.msg)
+
+  let version = requireUint64Field(parsed, "version", "slot instruction response")
+  if version != 3:
+    raise newException(EngineError,
+      &"unsupported slot instruction version {version}; expected 3")
+
+  let slotNode = requireField(parsed, "slot", "slot instruction response")
+  let gotSimSlot = requireUint64Field(slotNode, "sim_slot", "slot instruction")
+  if gotSimSlot != simSlot.uint64:
+    raise newException(EngineError,
+      "slot instruction response sim_slot mismatch: requested " &
+      $simSlot.uint64 & ", got " & $gotSimSlot)
+
+  var imports: seq[PlanBlockImport]
+  let importsNode =
+    requireArrayField(slotNode, "import_blocks", "slot instruction")
+  var importIdx = 0
+  for importNode in importsNode:
+    imports.add(parsePlanBlockImport(
+      importNode, &"slot instruction.import_blocks[{importIdx}]"))
+    inc importIdx
+
+  var attestations: seq[PlanAttestation]
+  let attestationsNode =
+    requireArrayField(slotNode, "attestations", "slot instruction")
+  var attestationIdx = 0
+  for attestationNode in attestationsNode:
+    attestations.add(parsePlanAttestation(
+      attestationNode, &"slot instruction.attestations[{attestationIdx}]"))
+    inc attestationIdx
+
+  SlotInstruction(
+    simSlot: Slot(gotSimSlot),
+    evalSlot: Slot(requireUint64Field(slotNode, "eval_slot", "slot instruction")),
+    importBlocks: imports,
+    attestations: attestations)
 
 proc httpGet(session: HttpSessionRef, url: string, acceptSsz: bool):
     Future[tuple[status: int, body: seq[byte]]]
@@ -225,14 +381,36 @@ proc fetchSszBlockAtSlot(session: HttpSessionRef, base: string, slot: Slot,
   let blck = readSszForkedSignedBeaconBlock(cfg, body)
   some(blck)
 
+proc fetchSszBlockByRootOptional(session: HttpSessionRef, base: string,
+    root: Eth2Digest, cfg: RuntimeConfig):
+    Future[Option[ForkedSignedBeaconBlock]]
+    {.async: (raises: [CatchableError]).} =
+  let url = base & "/eth/v2/beacon/blocks/0x" & root.data.toHex()
+  let (status, body) = await httpGet(session, url, acceptSsz = true)
+  if status == 404:
+    return none(ForkedSignedBeaconBlock)
+  if status != 200:
+    raise newException(EngineError, &"HTTP {status} from {url}")
+  some(readSszForkedSignedBeaconBlock(cfg, body))
+
 proc fetchSszBlockByRoot(session: HttpSessionRef, base: string,
     root: Eth2Digest, cfg: RuntimeConfig):
     Future[ForkedSignedBeaconBlock] {.async: (raises: [CatchableError]).} =
-  let url = base & "/eth/v2/beacon/blocks/0x" & root.data.toHex()
-  let (status, body) = await httpGet(session, url, acceptSsz = true)
+  let blck = await fetchSszBlockByRootOptional(session, base, root, cfg)
+  if blck.isNone:
+    let url = base & "/eth/v2/beacon/blocks/0x" & root.data.toHex()
+    raise newException(EngineError, &"HTTP 404 from {url}")
+  blck.get
+
+proc fetchSlotInstruction(session: HttpSessionRef, base: string,
+    simSlot, warmupStartSlot: Slot):
+    Future[SlotInstruction] {.async: (raises: [CatchableError]).} =
+  let url = base & "/fcr-sim/v1/slot/" & $simSlot.uint64 &
+    "?warmup_start_slot=" & $warmupStartSlot.uint64
+  let (status, body) = await httpGet(session, url, acceptSsz = false)
   if status != 200:
     raise newException(EngineError, &"HTTP {status} from {url}")
-  readSszForkedSignedBeaconBlock(cfg, body)
+  parseSlotInstruction(body, simSlot)
 
 proc fetchCheckpointState(session: HttpSessionRef, base: string, slot: Slot,
     cfg: RuntimeConfig):
@@ -252,25 +430,6 @@ proc fetchGenesisState(session: HttpSessionRef, base: string,
     raise newException(EngineError, &"HTTP {status} from {url}")
   readSszForkedHashedBeaconState(cfg, body)
 
-proc fetchAttestationPlan(session: HttpSessionRef, base: string,
-    fromSlot, toSlot: Slot):
-    Future[AttestationPlan] {.async: (raises: [CatchableError]).} =
-  let url =
-    base & "/fcr-sim/v1/plan?from=" & $fromSlot.uint64 & "&to=" & $toSlot.uint64
-  let (status, body) = await httpGet(session, url, acceptSsz = false)
-  if status != 200:
-    raise newException(EngineError, &"HTTP {status} from {url}")
-  let bodyStr = string.fromBytes(body)
-  let parsed = parseJson(bodyStr)
-  var plan: AttestationPlan
-  for entry in parsed["entries"]:
-    let sim = entry["sim_slot"].getInt().uint64
-    if entry.hasKey("source_block_slot") and entry["source_block_slot"].kind != JNull:
-      plan[sim] = some(entry["source_block_slot"].getInt().uint64)
-    else:
-      plan[sim] = none(uint64)
-  plan
-
 # --------------------------------------------------------------------------------
 # Engine core
 
@@ -288,7 +447,6 @@ type
     attPool: ref AttestationPool
     batchVerifier: ref BatchVerifier
     validatorMonitor: ref ValidatorMonitor
-    plan: AttestationPlan
     blockCache: Table[uint64, Option[ForkedSignedBeaconBlock]]
     outFile: File
     recordsWritten: uint64
@@ -338,11 +496,6 @@ proc init(T: type Engine, cfg: EngineConfig): Future[T]
   eng.batchVerifier = newClone(
     BatchVerifier.new(eng.rng, eng.taskpool))
 
-  stderr.writeLine "[fcr-nimbus] fetching attestation plan from " &
-    $cfg.warmupStartSlot.uint64 & " (+1) to " & $cfg.endSlot.uint64
-  eng.plan = await fetchAttestationPlan(
-    eng.session, eng.base, cfg.warmupStartSlot + 1, cfg.endSlot)
-
   # Open output file (overwrite mode).
   eng.outFile = open(cfg.output, fmWrite)
 
@@ -367,21 +520,23 @@ proc makeOnBlockAdded(self: Engine, wallTime: BeaconTime, consensusFork: static 
     self.attPool[].addForkChoice(
       epochRef, blckRef, unrealized, blck.message, wallTime)
 
+func forkedBlockRoot(forked: ForkedSignedBeaconBlock): Eth2Digest =
+  withBlck(forked): forkyBlck.root
+
+func forkedBlockSlot(forked: ForkedSignedBeaconBlock): Slot =
+  withBlck(forked): forkyBlck.message.slot
+
 proc processBlock(self: Engine, forked: ForkedSignedBeaconBlock):
-    Result[BlockRef, string] =
-  ## Imports a canonical-chain block via dag.addHeadBlockWithParent + addForkChoice.
-  var resultRef: BlockRef = nil
+    Result[bool, string] =
+  var imported = false
+  var duplicate = false
   var errMsg = ""
   withBlck(forked):
     let parentRes = checkHeadBlock(self.dag, forkyBlck)
     if parentRes.isErr:
       let parentErr = results.error(parentRes)
       if parentErr == VerifierError.Duplicate:
-        let existing = self.dag.getBlockRef(forkyBlck.root)
-        if existing.isSome:
-          resultRef = existing.get
-        else:
-          errMsg = "Duplicate but missing BlockRef"
+        duplicate = true
       else:
         errMsg = "checkHeadBlock failed: " & $parentErr
     else:
@@ -392,51 +547,210 @@ proc processBlock(self: Engine, forked: ForkedSignedBeaconBlock):
         self.dag, self.batchVerifier[], forkyBlck, parent,
         OptimisticStatus.valid, cb)
       if addRes.isErr:
-        errMsg = "addHeadBlock failed: " & $results.error(addRes)
+        let addErr = results.error(addRes)
+        if addErr == VerifierError.Duplicate:
+          duplicate = true
+        else:
+          errMsg = "addHeadBlock failed: " & $addErr
       else:
-        resultRef = addRes.value
+        imported = true
   if errMsg.len > 0:
     return err(errMsg)
-  if resultRef.isNil:
-    return err("processBlock: no BlockRef")
-  ok(resultRef)
+  if duplicate:
+    return ok(false)
+  if not imported:
+    return err("processBlock: no import result")
+  ok(true)
 
-func process_attestation(
-    self: var ForkChoiceBackend,
-    validator_index: ValidatorIndex, block_root: Eth2Digest, slot: Slot) =
-  self.votes.extend(validator_index.int + 1)
-
-  template vote: untyped = self.votes[validator_index]
-  if vote.slot != FAR_FUTURE_SLOT:
-    if slot.epoch > vote.slot.epoch or vote.next_root.isZero:
-      vote.next_root = block_root
-      vote.slot = slot
-
-proc injectAttestationsFromBlock(self: Engine, simSlot: Slot,
-    sourceBlockSlot: Slot): Future[uint64]
+proc importPlannedBlocks(self: Engine, simSlot: Slot,
+    imports: seq[PlanBlockImport]):
+    Future[tuple[hasBlock: bool, blockRoot: Option[Eth2Digest]]]
     {.async: (raises: [CatchableError]).} =
-  let blckOpt = await self.getBlockAtSlot(sourceBlockSlot)
-  if blckOpt.isNone:
-    raise newException(EngineError,
-      "attestation plan referenced missing source block at slot " &
-      $sourceBlockSlot.uint64)
+  var blockRoot = none(Eth2Digest)
+  for plan in imports:
+    if plan.canonical and plan.slot == simSlot and blockRoot.isNone:
+      blockRoot = some(plan.root)
+
+  for plan in imports:
+    var blockOpt: Option[ForkedSignedBeaconBlock]
+    if plan.canonical:
+      blockOpt = await self.getBlockAtSlot(plan.slot)
+      if blockOpt.isNone:
+        raise newException(EngineError,
+          "planned canonical block at slot " & $plan.slot.uint64 &
+          " was not found")
+    else:
+      blockOpt = await fetchSszBlockByRootOptional(
+        self.session, self.base, plan.root, self.spec)
+      if blockOpt.isNone:
+        stderr.writeLine "[fcr-nimbus] planned non-canonical block at slot " &
+          $plan.slot.uint64 & " root 0x" & plan.root.data.toHex() &
+          " was not found"
+        continue
+
+    let fetched = blockOpt.get
+    let fetchedRoot = forkedBlockRoot(fetched)
+    if fetchedRoot != plan.root:
+      raise newException(EngineError,
+        "planned block root mismatch at slot " & $plan.slot.uint64 &
+        ": expected 0x" & plan.root.data.toHex() & ", got 0x" &
+        fetchedRoot.data.toHex())
+    let fetchedSlot = forkedBlockSlot(fetched)
+    if fetchedSlot != plan.slot:
+      raise newException(EngineError,
+        "planned block slot mismatch for root 0x" & plan.root.data.toHex() &
+        ": expected " & $plan.slot.uint64 & ", got " & $fetchedSlot.uint64)
+
+    let imported = self.processBlock(fetched)
+    if imported.isErr:
+      if plan.canonical:
+        raise newException(EngineError,
+          "processBlock@" & $plan.slot.uint64 & ": " & imported.error)
+      stderr.writeLine "[fcr-nimbus] skipping non-canonical block at slot " &
+        $plan.slot.uint64 & " root 0x" & plan.root.data.toHex() & ": " &
+        imported.error
+      continue
+    if not imported.value:
+      stderr.writeLine "[fcr-nimbus] duplicate planned block at slot " &
+        $plan.slot.uint64 & " root 0x" & plan.root.data.toHex()
+
+  (hasBlock: blockRoot.isSome, blockRoot: blockRoot)
+
+func planCheckpointToNative(planned: PlanCheckpoint): Checkpoint =
+  Checkpoint(epoch: planned.epoch, root: planned.root)
+
+func planAttestationDataToNative(planned: PlanAttestationData): AttestationData =
+  AttestationData(
+    slot: planned.slot,
+    index: planned.index,
+    beacon_block_root: planned.beaconBlockRoot,
+    source: planCheckpointToNative(planned.source),
+    target: planCheckpointToNative(planned.target))
+
+proc decodeBaseAggregationBits(bytes: seq[byte]):
+    Result[CommitteeValidatorsBits, string] =
+  try:
+    ok(SSZ.decode(bytes, CommitteeValidatorsBits))
+  except CatchableError as e:
+    err("failed to decode base aggregation_bits: " & e.msg)
+
+proc decodeElectraAggregationBits(bytes: seq[byte]):
+    Result[electra.AggregationBits, string] =
+  try:
+    ok(SSZ.decode(bytes, electra.AggregationBits))
+  except CatchableError as e:
+    err("failed to decode electra aggregation_bits: " & e.msg)
+
+proc decodeElectraCommitteeBits(bytes: seq[byte]):
+    Result[AttestationCommitteeBits, string] =
+  try:
+    ok(SSZ.decode(bytes, AttestationCommitteeBits))
+  except CatchableError as e:
+    err("failed to decode electra committee_bits: " & e.msg)
+
+proc logFailedAttestationInjection(self: Engine, simSlot: Slot,
+    data: AttestationData, reason: string) =
+  let
+    targetRoot = data.target.root
+    headRoot = data.beacon_block_root
+    targetInFc = self.attPool[].forkChoice.backend.contains(targetRoot)
+    headInFc = self.attPool[].forkChoice.backend.contains(headRoot)
+    finalized = self.attPool[].forkChoice.checkpoints.finalized
+  stderr.writeLine "[fcr-nimbus] failed to inject attestation for sim_slot " &
+    $simSlot.uint64 & " attestation_slot " & $data.slot.uint64 &
+    " error " & reason &
+    " target_root 0x" & targetRoot.data.toHex() &
+    " target_in_fc " & $targetInFc &
+    " head_root 0x" & headRoot.data.toHex() &
+    " head_in_fc " & $headInFc &
+    " finalized_epoch " & $finalized.epoch.uint64 &
+    " finalized_root 0x" & finalized.root.data.toHex()
+
+proc injectForkChoiceAttestation(self: Engine, simSlot: Slot,
+    data: AttestationData, attestingIndices: seq[ValidatorIndex]):
+    bool =
+  let
+    targetRoot = data.target.root
+    headRoot = data.beacon_block_root
+    targetInFc = self.attPool[].forkChoice.backend.contains(targetRoot)
+    headInFc = self.attPool[].forkChoice.backend.contains(headRoot)
+    injectSlot = simSlot + 1
+    wallTime = injectSlot.start_beacon_time(self.dag.timeParams)
+
+  # Lighthouse accepts zero-head attestations without applying them to fork
+  # choice; do the same instead of letting Nimbus record a zero latest vote.
+  if headRoot.isZero:
+    return true
+
+  if not targetInFc or not headInFc:
+    let reason =
+      if not targetInFc:
+        "InvalidAttestation(UnknownTargetRoot)"
+      else:
+        "InvalidAttestation(UnknownHeadBlock)"
+    self.logFailedAttestationInjection(simSlot, data, reason)
+    return false
+
+  let
+    res = self.attPool[].forkChoice.on_attestation(
+      self.dag, data.slot, data.beacon_block_root, attestingIndices, wallTime)
+  if res.isErr:
+    self.logFailedAttestationInjection(simSlot, data, $res.error)
+    return false
+  true
+
+proc injectAttestations(self: Engine, simSlot: Slot,
+    attestations: seq[PlanAttestation]): Result[uint64, string] =
   var injected: uint64 = 0
-  withBlck(blckOpt.get()):
-    for attestation in forkyBlck.message.body.attestations:
-      var attestingIndices: seq[ValidatorIndex]
-      for vidx in self.dag.get_attesting_indices(attestation):
-        attestingIndices.add(vidx)
+  for planned in attestations:
+    let data = planAttestationDataToNative(planned.data)
+    var cache = StateCache()
+    let fork = self.spec.consensusForkAtEpoch(planned.data.slot.epoch)
+    if fork >= ConsensusFork.Electra:
+      if planned.committeeBits.isNone:
+        return err("electra attestation is missing committee_bits")
+
+      let aggregationBits = decodeElectraAggregationBits(planned.aggregationBits)
+      if aggregationBits.isErr:
+        return err(aggregationBits.error)
+      let committeeBits = decodeElectraCommitteeBits(planned.committeeBits.get)
+      if committeeBits.isErr:
+        return err(committeeBits.error)
+
+      let attestingIndices = withState(self.dag.headState):
+        var indices: seq[ValidatorIndex]
+        for vidx in forkyState.data.get_attesting_indices(
+            data.slot, committeeBits.value, aggregationBits.value, cache):
+          indices.add(vidx)
+        indices
       if attestingIndices.len == 0:
         continue
-      for validator_index in attestingIndices:
-        self.attPool[].forkChoice.backend.process_attestation(
-          validator_index, attestation.data.beacon_block_root,
-          attestation.data.slot)
-      inc injected
-  injected
+      if self.injectForkChoiceAttestation(simSlot, data, attestingIndices):
+        inc injected
+    else:
+      let aggregationBits = decodeBaseAggregationBits(planned.aggregationBits)
+      if aggregationBits.isErr:
+        return err(aggregationBits.error)
 
-proc recomputeHead(self: Engine, simSlot: Slot): Result[Eth2Digest, string] =
-  let wallTime = (simSlot + 1).start_beacon_time(self.dag.cfg.timeParams)
+      let attestingIndices = withState(self.dag.headState):
+        var indices: seq[ValidatorIndex]
+        let
+          committeesPerSlot = get_committee_count_per_slot(
+            forkyState.data, data.slot.epoch, cache)
+          committeeIndex = check_attestation_index(data, committeesPerSlot)
+        if committeeIndex.isOk:
+          for vidx in forkyState.data.get_attesting_indices(
+              data.slot, committeeIndex.value, aggregationBits.value, cache):
+            indices.add(vidx)
+        indices
+      if attestingIndices.len == 0:
+        continue
+      if self.injectForkChoiceAttestation(simSlot, data, attestingIndices):
+        inc injected
+  ok(injected)
+
+proc recomputeHead(self: Engine, evalSlot: Slot): Result[Eth2Digest, string] =
+  let wallTime = evalSlot.start_beacon_time(self.dag.cfg.timeParams)
   let headRes = self.attPool[].forkChoice.get_head(self.dag, wallTime)
   if headRes.isErr:
     return err("get_head failed")
@@ -453,8 +767,7 @@ proc recomputeHead(self: Engine, simSlot: Slot): Result[Eth2Digest, string] =
 
 proc emitRecord(self: Engine, simSlot: Slot, hasBlock: bool,
     blockRoot: Option[Eth2Digest], headRoot: Eth2Digest,
-    sourceSlot: Option[Slot], numInjected: uint64,
-    fcrEvalUs: uint64) =
+    numInjected: uint64, fcrEvalUs: uint64) =
   let confirmedBid = self.attPool[].forkChoice.retrieve_fast_confirmed_bid()
   let confirmedRoot = confirmedBid.root
   let confirmedSlot = confirmedBid.slot.uint64
@@ -467,11 +780,8 @@ proc emitRecord(self: Engine, simSlot: Slot, hasBlock: bool,
     blockRoot.isSome and blockRoot.get == confirmedRoot and
     confirmedSlot == simSlot.uint64 and delay == 1
 
-  let head = self.dag.head
-  let finalizedEpoch =
-    self.attPool[].forkChoice.checkpoints.finalized.epoch.uint64
-  let justifiedEpoch =
-    self.attPool[].forkChoice.checkpoints.justified.checkpoint.epoch.uint64
+  let finalizedEpoch = self.dag.headState.finalized_checkpoint.epoch.uint64
+  let justifiedEpoch = self.dag.headState.current_justified_checkpoint.epoch.uint64
 
   var rec = newJObject()
   rec["slot"] = %(simSlot.uint64)
@@ -489,10 +799,7 @@ proc emitRecord(self: Engine, simSlot: Slot, hasBlock: bool,
   rec["strict_one_slot_confirmed"] = %strictOne
   rec["finalized_epoch"] = %finalizedEpoch
   rec["justified_epoch"] = %justifiedEpoch
-  if sourceSlot.isSome:
-    rec["source_block_slot"] = %(sourceSlot.get.uint64)
-  else:
-    rec["source_block_slot"] = newJNull()
+  rec["source_block_slot"] = newJNull()
   rec["num_attestations_injected"] = %numInjected
   rec["is_epoch_boundary"] = %((simSlot.uint64 mod 32) == 0)
   rec["is_missed_slot"] = %(not hasBlock)
@@ -508,35 +815,31 @@ proc run(self: Engine): Future[Result[void, string]]
     {.async: (raises: [CatchableError]).} =
   var slot = self.cfg.warmupStartSlot + 1
   while slot < self.cfg.endSlot:
-    if not self.plan.hasKey(slot.uint64):
-      return err("attestation plan missing sim_slot " & $slot.uint64)
     let isRecording = slot >= self.cfg.startSlot
 
-    let blockOpt = await self.getBlockAtSlot(slot)
-    let hasBlock = blockOpt.isSome
-    var blockRoot = none(Eth2Digest)
-    if hasBlock:
-      let imported = self.processBlock(blockOpt.get())
-      if imported.isErr:
-        return err("processBlock@" & $slot.uint64 & ": " & imported.error)
-      blockRoot = some(imported.value.root)
+    let instruction = await fetchSlotInstruction(
+      self.session, self.base, slot, self.cfg.warmupStartSlot)
+    if instruction.simSlot != slot:
+      return err("slot instruction response sim_slot mismatch: requested " &
+        $slot.uint64 & ", got " & $instruction.simSlot.uint64)
 
-    let sourceOpt = self.plan[slot.uint64]
-    var sourceSlot = none(Slot)
-    var numInjected: uint64 = 0
-    if sourceOpt.isSome:
-      sourceSlot = some(Slot(sourceOpt.get))
-      numInjected = await self.injectAttestationsFromBlock(slot, sourceSlot.get)
+    let importedBlocks = await self.importPlannedBlocks(
+      slot, instruction.importBlocks)
+
+    let injected = self.injectAttestations(slot, instruction.attestations)
+    if injected.isErr:
+      return err("injectAttestations@" & $slot.uint64 & ": " & injected.error)
+    let numInjected = injected.value
 
     let t0 = getMonoTime()
-    let headRes = self.recomputeHead(slot)
+    let headRes = self.recomputeHead(instruction.evalSlot)
     if headRes.isErr:
       return err("recomputeHead@" & $slot.uint64 & ": " & results.error(headRes))
     let dur = (getMonoTime() - t0).inMicroseconds.uint64
 
     if isRecording:
-      self.emitRecord(slot, hasBlock, blockRoot, headRes.value,
-        sourceSlot, numInjected, dur)
+      self.emitRecord(slot, importedBlocks.hasBlock, importedBlocks.blockRoot,
+        headRes.value, numInjected, dur)
 
     slot = slot + 1
   self.outFile.flushFile()
