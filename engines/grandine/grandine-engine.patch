@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index c42957d..7fbcd17 100644
+index c42957df..7fbcd17d 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -5719,6 +5719,35 @@ dependencies = [
@@ -39,7 +39,7 @@ index c42957d..7fbcd17 100644
  name = "features"
  version = "0.0.0"
 diff --git a/Cargo.toml b/Cargo.toml
-index 3f3f61a..623d22d 100644
+index 3f3f61a2..623d22d6 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -2,6 +2,7 @@
@@ -52,7 +52,7 @@ index 3f3f61a..623d22d 100644
      'benches',
 diff --git a/fcr-simulator/Cargo.toml b/fcr-simulator/Cargo.toml
 new file mode 100644
-index 0000000..559e870
+index 00000000..559e8709
 --- /dev/null
 +++ b/fcr-simulator/Cargo.toml
 @@ -0,0 +1,40 @@
@@ -98,10 +98,10 @@ index 0000000..559e870
 +types = { workspace = true }
 diff --git a/fcr-simulator/src/config.rs b/fcr-simulator/src/config.rs
 new file mode 100644
-index 0000000..cf1d871
+index 00000000..effe8355
 --- /dev/null
 +++ b/fcr-simulator/src/config.rs
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,118 @@
 +use std::path::{Path, PathBuf};
 +
 +use anyhow::{Result, bail};
@@ -129,8 +129,8 @@ index 0000000..cf1d871
 +    #[arg(long, default_value_t = 25)]
 +    pub byzantine_threshold: u64,
 +
-+    #[arg(long, value_enum)]
-+    pub attestation_source_mode: Option<AttestationSourceMode>,
++    #[arg(long)]
++    pub attestation_source_mode: Option<String>,
 +
 +    #[arg(long)]
 +    pub lookahead_cap: Option<u64>,
@@ -154,8 +154,6 @@ index 0000000..cf1d871
 +
 +        self.required_str(self.beacon_node_url.as_deref(), "--beacon-node-url")?;
 +        self.required(self.network, "--network")?;
-+        self.required(self.attestation_source_mode, "--attestation-source-mode")?;
-+        self.required_u64(self.lookahead_cap, "--lookahead-cap")?;
 +        self.required_path(self.output.as_deref(), "--output")?;
 +
 +        if warmup_start_slot > start_slot {
@@ -222,20 +220,12 @@ index 0000000..cf1d871
 +pub enum Network {
 +    Mainnet,
 +}
-+
-+#[derive(Debug, Clone, Copy, ValueEnum)]
-+pub enum AttestationSourceMode {
-+    #[value(name = "next-non-missed")]
-+    NextNonMissed,
-+    #[value(name = "strict-source-block-k-minus-1")]
-+    StrictSourceBlockKMinus1,
-+}
 diff --git a/fcr-simulator/src/http/fetcher.rs b/fcr-simulator/src/http/fetcher.rs
 new file mode 100644
-index 0000000..ca7790d
+index 00000000..5ebe6283
 --- /dev/null
 +++ b/fcr-simulator/src/http/fetcher.rs
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,135 @@
 +use std::sync::Arc;
 +
 +use anyhow::{Context, Result, bail};
@@ -272,15 +262,40 @@ index 0000000..ca7790d
 +            .map_err(|e| anyhow::anyhow!("failed to decode state SSZ at slot {}: {:?}", slot, e))
 +    }
 +
-+    pub async fn fetch_block_by_root<P: Preset>(
++    pub async fn fetch_block_by_root<P: Preset>(&self, root: H256) -> Result<SignedBeaconBlock<P>> {
++        self.fetch_block_by_root_optional(root)
++            .await?
++            .with_context(|| format!("block 0x{} was not found", hex::encode(root)))
++    }
++
++    pub async fn fetch_block_by_root_optional<P: Preset>(
 +        &self,
 +        root: H256,
-+    ) -> Result<SignedBeaconBlock<P>> {
-+        let url = format!("{}/eth/v2/beacon/blocks/0x{}", self.base_url, hex::encode(root));
-+        let data = self.fetch_ssz(&url).await?;
-+        SignedBeaconBlock::<P>::from_ssz(&self.config, &data).map_err(|e| {
-+            anyhow::anyhow!("failed to decode block SSZ for root 0x{}: {:?}", hex::encode(root), e)
-+        })
++    ) -> Result<Option<SignedBeaconBlock<P>>> {
++        let root_hex = hex::encode(root);
++        let url = format!("{}/eth/v2/beacon/blocks/0x{}", self.base_url, root_hex);
++        let response = self
++            .client
++            .get(&url)
++            .header("Accept", "application/octet-stream")
++            .send()
++            .await
++            .with_context(|| format!("failed to fetch {}", url))?;
++
++        if response.status() == reqwest::StatusCode::NOT_FOUND {
++            return Ok(None);
++        }
++
++        let data = read_success_body(response, &url).await?;
++        SignedBeaconBlock::<P>::from_ssz(&self.config, &data)
++            .map_err(|e| {
++                anyhow::anyhow!(
++                    "failed to decode block SSZ for root 0x{}: {:?}",
++                    root_hex,
++                    e
++                )
++            })
++            .map(Some)
 +    }
 +
 +    pub async fn fetch_block_at_slot<P: Preset>(
@@ -348,15 +363,15 @@ index 0000000..ca7790d
 +}
 diff --git a/fcr-simulator/src/http/mod.rs b/fcr-simulator/src/http/mod.rs
 new file mode 100644
-index 0000000..7a2c77b
+index 00000000..95513649
 --- /dev/null
 +++ b/fcr-simulator/src/http/mod.rs
 @@ -0,0 +1,18 @@
 +pub mod fetcher;
-+pub mod plan;
++pub mod slot;
 +
 +pub use fetcher::BeaconFetcher;
-+pub use plan::{AttestationPlan, fetch_attestation_plan};
++pub use slot::{PlanAttestation, PlanBlockImport, fetch_slot_instruction};
 +
 +use anyhow::{Context, Result};
 +
@@ -370,41 +385,109 @@ index 0000000..7a2c77b
 +pub fn base_url(base_url: &str) -> String {
 +    base_url.trim_end_matches('/').to_string()
 +}
-diff --git a/fcr-simulator/src/http/plan.rs b/fcr-simulator/src/http/plan.rs
+diff --git a/fcr-simulator/src/http/slot.rs b/fcr-simulator/src/http/slot.rs
 new file mode 100644
-index 0000000..d1b50d2
+index 00000000..96c29457
 --- /dev/null
-+++ b/fcr-simulator/src/http/plan.rs
-@@ -0,0 +1,69 @@
-+use std::collections::HashMap;
-+
-+use anyhow::{Context, Result, bail};
++++ b/fcr-simulator/src/http/slot.rs
+@@ -0,0 +1,231 @@
++use anyhow::{Context as _, Result, bail};
 +use serde::Deserialize;
-+use types::phase0::primitives::Slot;
++use types::phase0::primitives::{Epoch, H256, Slot};
 +
 +use crate::http::{base_url, build_client};
 +
-+pub type AttestationPlan = HashMap<Slot, Option<Slot>>;
++#[derive(Clone)]
++pub struct SlotInstruction {
++    pub sim_slot: Slot,
++    pub eval_slot: Slot,
++    pub import_blocks: Vec<PlanBlockImport>,
++    pub attestations: Vec<PlanAttestation>,
++}
 +
-+#[derive(Deserialize)]
-+struct PlanResponse {
-+    entries: Vec<PlanEntry>,
++#[derive(Clone)]
++pub struct PlanBlockImport {
++    pub slot: Slot,
++    pub root: H256,
++    pub canonical: bool,
++}
++
++#[derive(Clone)]
++pub struct PlanAttestation {
++    pub aggregation_bits: Vec<u8>,
++    pub committee_bits: Option<Vec<u8>>,
++    pub data: PlanAttestationData,
++}
++
++#[derive(Clone)]
++pub struct PlanAttestationData {
++    pub slot: Slot,
++    pub index: u64,
++    pub beacon_block_root: H256,
++    pub source: PlanCheckpoint,
++    pub target: PlanCheckpoint,
++}
++
++#[derive(Clone)]
++pub struct PlanCheckpoint {
++    pub epoch: Epoch,
++    pub root: H256,
 +}
 +
 +#[derive(Deserialize)]
-+struct PlanEntry {
++struct SlotResponse {
++    version: Option<u64>,
++    slot: SlotInstructionWire,
++}
++
++#[derive(Deserialize)]
++struct SlotInstructionWire {
 +    sim_slot: u64,
-+    source_block_slot: Option<u64>,
++    eval_slot: u64,
++    import_blocks: Vec<PlanBlockImportWire>,
++    attestations: Vec<PlanAttestationWire>,
 +}
 +
-+pub async fn fetch_attestation_plan(
++#[derive(Deserialize)]
++struct PlanBlockImportWire {
++    slot: u64,
++    root: String,
++    canonical: bool,
++}
++
++#[derive(Deserialize)]
++struct PlanAttestationWire {
++    aggregation_bits: String,
++    committee_bits: Option<String>,
++    data: PlanAttestationDataWire,
++}
++
++#[derive(Deserialize)]
++struct PlanAttestationDataWire {
++    slot: u64,
++    index: u64,
++    beacon_block_root: String,
++    source: PlanCheckpointWire,
++    target: PlanCheckpointWire,
++}
++
++#[derive(Deserialize)]
++struct PlanCheckpointWire {
++    epoch: u64,
++    root: String,
++}
++
++pub async fn fetch_slot_instruction(
 +    beacon_node_url: &str,
-+    from: Slot,
-+    to: Slot,
-+) -> Result<AttestationPlan> {
++    sim_slot: Slot,
++    warmup_start_slot: Slot,
++) -> Result<SlotInstruction> {
 +    let client = build_client()?;
 +    let base_url = base_url(beacon_node_url);
-+    let url = format!("{}/fcr-sim/v1/plan?from={}&to={}", base_url, from, to);
++    let url = format!(
++        "{}/fcr-sim/v1/slot/{}?warmup_start_slot={}",
++        base_url, sim_slot, warmup_start_slot
++    );
 +
 +    let response = client
 +        .get(&url)
@@ -419,20 +502,114 @@ index 0000000..d1b50d2
 +        bail!("HTTP {} from {}: {}", status, url, trim_body(&body));
 +    }
 +
-+    let plan_response = response
-+        .json::<PlanResponse>()
++    let slot_response = response
++        .json::<SlotResponse>()
 +        .await
-+        .context("failed to decode attestation plan JSON")?;
++        .context("failed to decode slot instruction JSON")?;
 +
-+    Ok(plan_response
-+        .entries
-+        .into_iter()
-+        .map(|entry| (entry.sim_slot, entry.source_block_slot))
-+        .collect())
++    let version = slot_response
++        .version
++        .context("slot instruction response is missing version")?;
++    if version != 3 {
++        bail!(
++            "unsupported slot instruction version {}; expected 3",
++            version
++        );
++    }
++
++    let slot = slot_response.slot;
++    if slot.sim_slot != sim_slot {
++        bail!(
++            "slot instruction response sim_slot mismatch: requested {}, got {}",
++            sim_slot,
++            slot.sim_slot
++        );
++    }
++
++    Ok(SlotInstruction {
++        sim_slot: slot.sim_slot,
++        eval_slot: slot.eval_slot,
++        import_blocks: slot
++            .import_blocks
++            .into_iter()
++            .map(|block| {
++                Ok(PlanBlockImport {
++                    slot: block.slot,
++                    root: parse_root(&block.root).with_context(|| {
++                        format!(
++                            "invalid import block root for sim_slot {} slot {}",
++                            sim_slot, block.slot
++                        )
++                    })?,
++                    canonical: block.canonical,
++                })
++            })
++            .collect::<Result<Vec<_>>>()?,
++        attestations: slot
++            .attestations
++            .into_iter()
++            .map(parse_attestation)
++            .collect::<Result<Vec<_>>>()?,
++    })
++}
++
++fn parse_attestation(attestation: PlanAttestationWire) -> Result<PlanAttestation> {
++    Ok(PlanAttestation {
++        aggregation_bits: parse_hex_bytes(&attestation.aggregation_bits)
++            .context("invalid attestation aggregation_bits")?,
++        committee_bits: attestation
++            .committee_bits
++            .as_deref()
++            .map(parse_hex_bytes)
++            .transpose()
++            .context("invalid attestation committee_bits")?,
++        data: parse_attestation_data(attestation.data)?,
++    })
++}
++
++fn parse_attestation_data(data: PlanAttestationDataWire) -> Result<PlanAttestationData> {
++    Ok(PlanAttestationData {
++        slot: data.slot,
++        index: data.index,
++        beacon_block_root: parse_root(&data.beacon_block_root)
++            .context("invalid attestation beacon_block_root")?,
++        source: parse_checkpoint(data.source).context("invalid attestation source checkpoint")?,
++        target: parse_checkpoint(data.target).context("invalid attestation target checkpoint")?,
++    })
++}
++
++fn parse_checkpoint(checkpoint: PlanCheckpointWire) -> Result<PlanCheckpoint> {
++    Ok(PlanCheckpoint {
++        epoch: checkpoint.epoch,
++        root: parse_root(&checkpoint.root)?,
++    })
++}
++
++fn parse_root(root: &str) -> Result<H256> {
++    let root = root.strip_prefix("0x").unwrap_or(root);
++    if root.len() != 64 {
++        bail!(
++            "expected 32-byte root hex string, got {} hex chars",
++            root.len()
++        );
++    }
++
++    let bytes = hex::decode(root).map_err(|e| anyhow::anyhow!("invalid root hex: {:?}", e))?;
++    Ok(H256::from_slice(&bytes))
++}
++
++fn parse_hex_bytes(value: &str) -> Result<Vec<u8>> {
++    let value = value.strip_prefix("0x").unwrap_or(value);
++    if !value.len().is_multiple_of(2) {
++        bail!("expected even-length hex string");
++    }
++
++    hex::decode(value).map_err(|e| anyhow::anyhow!("invalid hex: {:?}", e))
 +}
 +
 +fn trim_body(body: &str) -> &str {
 +    const MAX_LEN: usize = 512;
++
 +    if body.len() <= MAX_LEN {
 +        body
 +    } else {
@@ -447,11 +624,12 @@ index 0000000..d1b50d2
 +}
 diff --git a/fcr-simulator/src/main.rs b/fcr-simulator/src/main.rs
 new file mode 100644
-index 0000000..4a8673b
+index 00000000..7a45fde7
 --- /dev/null
 +++ b/fcr-simulator/src/main.rs
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,121 @@
 +use bls as _;
++use bytesize as _;
 +use kzg_utils as _;
 +
 +mod config;
@@ -573,7 +751,7 @@ index 0000000..4a8673b
 +}
 diff --git a/fcr-simulator/src/output/mod.rs b/fcr-simulator/src/output/mod.rs
 new file mode 100644
-index 0000000..9d58a02
+index 00000000..9d58a02d
 --- /dev/null
 +++ b/fcr-simulator/src/output/mod.rs
 @@ -0,0 +1,5 @@
@@ -584,7 +762,7 @@ index 0000000..9d58a02
 +pub use writer::OutputWriter;
 diff --git a/fcr-simulator/src/output/schema.rs b/fcr-simulator/src/output/schema.rs
 new file mode 100644
-index 0000000..eb71f64
+index 00000000..eb71f646
 --- /dev/null
 +++ b/fcr-simulator/src/output/schema.rs
 @@ -0,0 +1,22 @@
@@ -612,7 +790,7 @@ index 0000000..eb71f64
 +}
 diff --git a/fcr-simulator/src/output/writer.rs b/fcr-simulator/src/output/writer.rs
 new file mode 100644
-index 0000000..3b915f8
+index 00000000..3b915f88
 --- /dev/null
 +++ b/fcr-simulator/src/output/writer.rs
 @@ -0,0 +1,41 @@
@@ -659,33 +837,40 @@ index 0000000..3b915f8
 +}
 diff --git a/fcr-simulator/src/sim/engine.rs b/fcr-simulator/src/sim/engine.rs
 new file mode 100644
-index 0000000..bc082f0
+index 00000000..a36f0d91
 --- /dev/null
 +++ b/fcr-simulator/src/sim/engine.rs
-@@ -0,0 +1,486 @@
+@@ -0,0 +1,656 @@
 +use std::collections::HashMap;
 +use std::sync::Arc;
 +use std::time::Instant;
 +
 +use anyhow::{Context, Result, bail};
++use bls::{AggregateSignatureBytes, traits::SignatureBytes as _};
 +use crossbeam_utils::sync::WaitGroup;
 +use database::Database;
 +use execution_engine::{PayloadStatusV1, PayloadValidationStatus};
 +use fork_choice_control::{AdHocBenchController, MutatorHandle};
-+use fork_choice_store::StoreConfig;
++use fork_choice_store::{AttestationItem, AttestationOrigin, StoreConfig};
 +use helper_functions::{accessors, misc};
 +use pubkey_cache::PubkeyCache;
++use ssz::{BitList, BitVector, SszReadDefault as _};
 +use tracing::{info, warn};
 +use types::{
-+    combined::{BeaconState, SignedBeaconBlock},
++    combined::{Attestation, BeaconState, SignedBeaconBlock},
 +    config::Config as ChainConfig,
-+    phase0::primitives::{H256, Slot},
++    electra::containers::Attestation as ElectraAttestation,
++    nonstandard::Phase,
++    phase0::{
++        containers::{Attestation as Phase0Attestation, AttestationData, Checkpoint},
++        primitives::{H256, Slot},
++    },
 +    preset::{Mainnet, Preset},
 +    traits::{BeaconState as _, SignedBeaconBlock as _},
 +};
 +
 +use crate::config::{Config, Network};
-+use crate::http::{AttestationPlan, BeaconFetcher, fetch_attestation_plan};
++use crate::http::{BeaconFetcher, PlanAttestation, PlanBlockImport, fetch_slot_instruction};
 +use crate::output::{OutputWriter, SlotResult};
 +
 +type P = Mainnet;
@@ -695,7 +880,6 @@ index 0000000..bc082f0
 +    _mutator_handle: MutatorHandle<P, WaitGroup>,
 +    fetcher: BeaconFetcher,
 +    block_cache: HashMap<Slot, Option<Arc<SignedBeaconBlock<P>>>>,
-+    plan: AttestationPlan,
 +    output: OutputWriter,
 +    config: EngineConfig,
 +    _db_dir: tempfile::TempDir,
@@ -705,6 +889,7 @@ index 0000000..bc082f0
 +    start_slot: Slot,
 +    end_slot: Slot,
 +    warmup_start_slot: Slot,
++    beacon_node_url: String,
 +}
 +
 +impl Engine {
@@ -850,21 +1035,6 @@ index 0000000..bc082f0
 +        }
 +        info!(catchup_blocks, "Catchup complete");
 +
-+        let plan =
-+            fetch_attestation_plan(config.beacon_node_url(), warmup_start_slot + 1, end_slot)
-+                .await
-+                .context("failed to fetch attestation plan")?;
-+        info!(plan_entries = plan.len(), "Attestation plan fetched");
-+
-+        for slot in (warmup_start_slot + 1)..end_slot {
-+            if !plan.contains_key(&slot) {
-+                bail!(
-+                    "attestation plan is missing sim_slot {}; orchestrator served an incomplete plan",
-+                    slot
-+                );
-+            }
-+        }
-+
 +        let output =
 +            OutputWriter::new(config.output()).context("failed to create JSONL output writer")?;
 +
@@ -873,12 +1043,12 @@ index 0000000..bc082f0
 +            _mutator_handle: mutator_handle,
 +            fetcher,
 +            block_cache: HashMap::new(),
-+            plan,
 +            output,
 +            config: EngineConfig {
 +                start_slot,
 +                end_slot,
 +                warmup_start_slot,
++                beacon_node_url: config.beacon_node_url().to_string(),
 +            },
 +            _db_dir: db_dir,
 +        })
@@ -903,28 +1073,40 @@ index 0000000..bc082f0
 +            self.controller.on_slot(slot);
 +            self.controller.wait_for_tasks();
 +
-+            let block_at_slot = self.get_block_at_slot(slot).await?;
-+            let has_block = block_at_slot.is_some();
-+            let block_root = block_at_slot
-+                .as_ref()
-+                .map(|block| block.message().hash_tree_root());
-+
-+            if let Some(ref block) = block_at_slot {
-+                self.controller.on_replay_block(block.clone());
-+                self.controller.wait_for_tasks();
-+                promote_imported_payload_to_valid(&self.controller, block.as_ref());
++            let instruction = fetch_slot_instruction(
++                &self.config.beacon_node_url,
++                slot,
++                self.config.warmup_start_slot,
++            )
++            .await
++            .with_context(|| format!("failed to fetch slot instruction for sim slot {}", slot))?;
++            if instruction.sim_slot != slot {
++                bail!(
++                    "slot instruction sim_slot mismatch: requested {}, got {}",
++                    slot,
++                    instruction.sim_slot
++                );
 +            }
 +
-+            let source_slot = self.plan.get(&slot).copied().flatten();
-+            let mut num_attestations_injected = 0u64;
-+            if let Some(source_block_slot) = source_slot {
-+                num_attestations_injected = self
-+                    .inject_attestations_from_source(source_block_slot)
-+                    .await?;
-+            }
++            let (has_block, block_root) = self
++                .import_planned_blocks(slot, &instruction.import_blocks)
++                .await
++                .with_context(|| {
++                    format!("failed to import planned blocks for sim slot {}", slot)
++                })?;
++
++            let num_attestations_injected = self
++                .inject_attestations(slot, &instruction.attestations)
++                .with_context(|| {
++                    format!(
++                        "failed to inject {} planned attestations for sim slot {}",
++                        instruction.attestations.len(),
++                        slot
++                    )
++                })?;
 +
 +            let fcr_eval_start = Instant::now();
-+            self.controller.on_slot(slot + 1);
++            self.controller.on_slot(instruction.eval_slot);
 +            self.controller.wait_for_tasks();
 +            let fcr_eval_duration_us = micros_since(fcr_eval_start);
 +
@@ -943,7 +1125,7 @@ index 0000000..bc082f0
 +                    slot,
 +                    has_block,
 +                    block_root,
-+                    source_slot,
++                    None,
 +                    num_attestations_injected,
 +                    fcr_eval_duration_us,
 +                );
@@ -979,35 +1161,201 @@ index 0000000..bc082f0
 +        Ok(block)
 +    }
 +
-+    /// Replays attestations from the source block at `source_slot` using
-+    /// `AttestationOrigin::Block(block_root)`. The source block need not be in the store —
-+    /// `validate_attestation` only requires the attestation's target/beacon_block_root to be
-+    /// present in fork-choice, not the source block itself.
-+    async fn inject_attestations_from_source(&mut self, source_slot: Slot) -> Result<u64> {
-+        let Some(source_block) = self.get_block_at_slot(source_slot).await? else {
-+            bail!(
-+                "attestation plan referenced missing source block at slot {}",
-+                source_slot
-+            );
-+        };
-+        let attestation_count = source_block
-+            .message()
-+            .body()
-+            .combined_attestations()
-+            .count();
-+        if attestation_count == 0 {
++    async fn import_planned_blocks(
++        &mut self,
++        sim_slot: Slot,
++        imports: &[PlanBlockImport],
++    ) -> Result<(bool, Option<H256>)> {
++        let canonical_root = imports
++            .iter()
++            .find(|import| import.canonical && import.slot == sim_slot)
++            .map(|import| import.root);
++
++        for import in imports {
++            let Some(block) = self.fetch_planned_block(import).await? else {
++                continue;
++            };
++
++            let block_root = block.message().hash_tree_root();
++            if block_root != import.root {
++                bail!(
++                    "planned block root mismatch for slot {}: plan {}, fetched {}",
++                    import.slot,
++                    format_root(import.root),
++                    format_root(block_root)
++                );
++            }
++            if block.message().slot() != import.slot {
++                bail!(
++                    "planned block slot mismatch for root {}: plan {}, fetched {}",
++                    format_root(import.root),
++                    import.slot,
++                    block.message().slot()
++                );
++            }
++
++            if self
++                .controller
++                .block_by_root(import.root)
++                .with_context(|| {
++                    format!("failed to check planned block {}", format_root(import.root))
++                })?
++                .is_some()
++            {
++                warn!(
++                    block_root = %format_root(import.root),
++                    slot = import.slot,
++                    canonical = import.canonical,
++                    "planned block was already known; skipping duplicate import"
++                );
++                continue;
++            }
++
++            self.controller.on_replay_block(block.clone());
++            self.controller.wait_for_tasks();
++
++            if self
++                .controller
++                .block_by_root(import.root)
++                .with_context(|| {
++                    format!(
++                        "failed to check imported block {}",
++                        format_root(import.root)
++                    )
++                })?
++                .is_some()
++            {
++                promote_imported_payload_to_valid(&self.controller, block.as_ref());
++            } else if import.canonical {
++                bail!(
++                    "planned canonical block {} at slot {} was not visible after import",
++                    format_root(import.root),
++                    import.slot
++                );
++            } else {
++                warn!(
++                    block_root = %format_root(import.root),
++                    slot = import.slot,
++                    "planned non-canonical block was not visible after import; skipping"
++                );
++            }
++        }
++
++        Ok((canonical_root.is_some(), canonical_root))
++    }
++
++    async fn fetch_planned_block(
++        &mut self,
++        import: &PlanBlockImport,
++    ) -> Result<Option<Arc<SignedBeaconBlock<P>>>> {
++        if import.canonical {
++            let block = self.get_block_at_slot(import.slot).await?;
++            return block.map(Some).with_context(|| {
++                format!(
++                    "planned canonical block at slot {} was not found",
++                    import.slot
++                )
++            });
++        }
++
++        match self
++            .fetcher
++            .fetch_block_by_root_optional::<P>(import.root)
++            .await?
++        {
++            Some(block) => Ok(Some(Arc::new(block))),
++            None => {
++                warn!(
++                    block_root = %format_root(import.root),
++                    slot = import.slot,
++                    "planned non-canonical block was not found; skipping"
++                );
++                Ok(None)
++            }
++        }
++    }
++
++    fn inject_attestations(&self, sim_slot: Slot, attestations: &[PlanAttestation]) -> Result<u64> {
++        if attestations.is_empty() {
 +            return Ok(0);
 +        }
 +
-+        let block_root = source_block.message().hash_tree_root();
-+        self.controller
-+            .on_replay_block_attestations(block_root, source_block);
-+        self.controller.wait_for_tasks();
++        let mut items = Vec::with_capacity(attestations.len());
++        for planned_attestation in attestations {
++            let attestation = self.build_attestation(planned_attestation)?;
++            let beacon_block_root = attestation.data().beacon_block_root;
++            items.push(AttestationItem::unverified(
++                Arc::new(attestation),
++                AttestationOrigin::Block(beacon_block_root),
++            ));
++        }
 +
-+        // BlockAttestationsTask doesn't return per-attestation success counts to user space.
-+        // Report the count of attestations in the source block as injected; failures are
-+        // logged via mutator's warning path.
-+        Ok(attestation_count as u64)
++        let accepted = self.controller.replay_attestations(items);
++        info!(
++            sim_slot,
++            planned_attestations = attestations.len(),
++            accepted_attestations = accepted,
++            "Injected planned attestations"
++        );
++
++        Ok(accepted as u64)
++    }
++
++    fn build_attestation(&self, planned: &PlanAttestation) -> Result<Attestation<P>> {
++        let data = AttestationData {
++            slot: planned.data.slot,
++            index: planned.data.index,
++            beacon_block_root: planned.data.beacon_block_root,
++            source: Checkpoint {
++                epoch: planned.data.source.epoch,
++                root: planned.data.source.root,
++            },
++            target: Checkpoint {
++                epoch: planned.data.target.epoch,
++                root: planned.data.target.root,
++            },
++        };
++
++        match self.controller.chain_config().phase_at_slot::<P>(data.slot) {
++            Phase::Electra | Phase::Fulu | Phase::Gloas => {
++                let committee_bits = planned
++                    .committee_bits
++                    .as_deref()
++                    .context("electra attestation is missing committee_bits")?;
++
++                Ok(Attestation::Electra(ElectraAttestation {
++                    aggregation_bits:
++                        BitList::<<P as Preset>::MaxAttestersPerSlot>::from_ssz_default(
++                            &planned.aggregation_bits,
++                        )
++                        .map_err(|e| {
++                            anyhow::anyhow!("failed to decode electra aggregation_bits: {:?}", e)
++                        })?,
++                    data,
++                    signature: AggregateSignatureBytes::empty(),
++                    committee_bits:
++                        BitVector::<<P as Preset>::MaxCommitteesPerSlot>::from_ssz_default(
++                            committee_bits,
++                        )
++                        .map_err(|e| {
++                            anyhow::anyhow!("failed to decode electra committee_bits: {:?}", e)
++                        })?,
++                }))
++            }
++            Phase::Phase0 | Phase::Altair | Phase::Bellatrix | Phase::Capella | Phase::Deneb => {
++                Ok(Attestation::Phase0(Phase0Attestation {
++                    aggregation_bits:
++                        BitList::<<P as Preset>::MaxValidatorsPerCommittee>::from_ssz_default(
++                            &planned.aggregation_bits,
++                        )
++                        .map_err(|e| {
++                            anyhow::anyhow!("failed to decode phase0 aggregation_bits: {:?}", e)
++                        })?,
++                    data,
++                    signature: AggregateSignatureBytes::empty(),
++                }))
++            }
++        }
 +    }
 +
 +    fn build_slot_result(
@@ -1151,7 +1499,7 @@ index 0000000..bc082f0
 +}
 diff --git a/fcr-simulator/src/sim/mod.rs b/fcr-simulator/src/sim/mod.rs
 new file mode 100644
-index 0000000..ded3cc8
+index 00000000..ded3cc84
 --- /dev/null
 +++ b/fcr-simulator/src/sim/mod.rs
 @@ -0,0 +1,3 @@
@@ -1159,10 +1507,27 @@ index 0000000..ded3cc8
 +
 +pub use engine::Engine;
 diff --git a/fork_choice_control/src/controller.rs b/fork_choice_control/src/controller.rs
-index 0ac4a87..9809f18 100644
+index 0ac4a876..d59b1ce5 100644
 --- a/fork_choice_control/src/controller.rs
 +++ b/fork_choice_control/src/controller.rs
-@@ -65,9 +65,9 @@ use crate::{
+@@ -19,12 +19,13 @@ use std::{
+ use anyhow::{Context as _, Result};
+ use arc_swap::{ArcSwap, Guard};
+ use clock::Tick;
++use crossbeam_utils::sync::WaitGroup;
+ use eth2_libp2p::{GossipId, PeerId};
+ use execution_engine::{ExecutionEngine, PayloadStatusV1};
+ use fork_choice_store::{
+-    AggregateAndProofOrigin, AttestationItem, AttestationOrigin, AttesterSlashingOrigin,
+-    BlobSidecarOrigin, BlockOrigin, DataColumnSidecarOrigin, ExecutionPayloadBidOrigin,
+-    FastConfirmationStore, StateCacheProcessor, Store, StoreConfig,
++    AggregateAndProofOrigin, AttestationAction, AttestationItem, AttestationOrigin,
++    AttesterSlashingOrigin, BlobSidecarOrigin, BlockOrigin, DataColumnSidecarOrigin,
++    ExecutionPayloadBidOrigin, FastConfirmationStore, StateCacheProcessor, Store, StoreConfig,
+ };
+ use futures::channel::{mpsc::Sender as MultiSender, oneshot::Sender as OneshotSender};
+ use genesis::AnchorCheckpointProvider;
+@@ -65,9 +66,9 @@ use crate::{
      state_at_slot_cache::StateAtSlotCache,
      storage::Storage,
      tasks::{
@@ -1175,7 +1540,7 @@ index 0ac4a87..9809f18 100644
      },
      thread_pool::{Spawn, ThreadPool},
      unbounded_sink::UnboundedSink,
-@@ -309,6 +309,41 @@ where
+@@ -309,6 +310,41 @@ where
          self.spawn_block_task(block, BlockOrigin::Requested(peer_id))
      }
  
@@ -1217,8 +1582,47 @@ index 0ac4a87..9809f18 100644
      #[instrument(
          parent = None,
          skip_all
+@@ -902,6 +938,38 @@ where
+     }
+ }
+ 
++impl<P, E, A> Controller<P, E, A, WaitGroup>
++where
++    P: Preset,
++    E: ExecutionEngine<P> + Clone + Send + Sync + 'static,
++    A: UnboundedSink<AttestationVerifierMessage<P, WaitGroup>> + Sync,
++{
++    /// Validates and injects a batch of replayed from-block attestations against the
++    /// current store snapshot, mirroring `AttestationTask` + `on_attestation_batch`.
++    /// Returns the number of attestations that were accepted into fork choice.
++    ///
++    /// Intended for historical canonical-chain replay (fcr-simulator).
++    pub fn replay_attestations(&self, attestations: Vec<AttestationItem<P, GossipId>>) -> usize {
++        let snapshot = self.owned_store_snapshot();
++        let mut accepted = 0;
++        let results: Vec<VerifyAttestationResult<P>> = attestations
++            .into_iter()
++            .map(|attestation| {
++                let result = snapshot.validate_attestation(attestation, false);
++                if matches!(&result, Ok(AttestationAction::Accept { .. })) {
++                    accepted += 1;
++                }
++                result
++            })
++            .collect();
++
++        self.on_attestation_batch(results);
++        self.wait_for_tasks();
++
++        accepted
++    }
++}
++
+ /// A wrapper over [`JoinHandle`] that can be used to wait for the mutator thread to finish.
+ ///
+ /// We previously used [`std::process::exit`] to terminate the process when the mutator thread
 diff --git a/fork_choice_control/src/lib.rs b/fork_choice_control/src/lib.rs
-index d9877ca..92806e9 100644
+index d9877ca3..92806e96 100644
 --- a/fork_choice_control/src/lib.rs
 +++ b/fork_choice_control/src/lib.rs
 @@ -13,7 +13,7 @@
