@@ -600,6 +600,8 @@ class DebugTracer {
 
 class StateCache {
   private readonly stateByStateRoot = new Map<RootHex, StateCacheEntry>();
+  private readonly importedPostStateByBlockRoot = new Map<RootHex, StateCacheEntry>();
+  private readonly importedPostStateByStateRoot = new Map<RootHex, StateCacheEntry>();
   private readonly stateByCheckpointKey = new Map<string, CheckpointStateCacheEntry>();
   private readonly evictedStateRoots = new Map<RootHex, {slot: number; evictedAtSlot: number}>();
   private readonly evictedCheckpoints = new Map<string, {epoch: number; evictedAtSlot: number}>();
@@ -611,9 +613,23 @@ class StateCache {
     this.evictedStateRoots.delete(rootHex);
   }
 
+  setImportedPostState(
+    blockRootHex: RootHex,
+    stateRootHex: RootHex,
+    slot: number,
+    state: CachedBeaconStateAllForks,
+  ): void {
+    // Bounded Lighthouse-store substitute: only post-states imported in this process plus the bootstrap anchor can be recovered.
+    const entry = {slot, state};
+    this.importedPostStateByBlockRoot.set(blockRootHex, entry);
+    this.importedPostStateByStateRoot.set(stateRootHex, entry);
+  }
+
   getStateRoot(rootHex: RootHex): CachedBeaconStateAllForks | null {
     const entry = this.stateByStateRoot.get(rootHex);
     if (entry) return entry.state;
+    const imported = this.importedPostStateByStateRoot.get(rootHex);
+    if (imported) return imported.state;
     const evicted = this.evictedStateRoots.get(rootHex);
     this.debug.cache("state_cache_miss", {
       kind: "state_root",
@@ -621,6 +637,20 @@ class StateCache {
       evictedSlot: evicted?.slot,
       evictedAtSlot: evicted?.evictedAtSlot,
       stateRoots: this.stateByStateRoot.size,
+      importedBlockStates: this.importedPostStateByBlockRoot.size,
+      checkpoints: this.stateByCheckpointKey.size,
+    });
+    return null;
+  }
+
+  getImportedBlockPostState(blockRootHex: RootHex): CachedBeaconStateAllForks | null {
+    const entry = this.importedPostStateByBlockRoot.get(blockRootHex);
+    if (entry) return entry.state;
+    this.debug.cache("state_cache_miss", {
+      kind: "imported_block",
+      blockRootHex,
+      stateRoots: this.stateByStateRoot.size,
+      importedBlockStates: this.importedPostStateByBlockRoot.size,
       checkpoints: this.stateByCheckpointKey.size,
     });
     return null;
@@ -651,6 +681,7 @@ class StateCache {
       evictedEpoch: evicted?.epoch,
       evictedAtSlot: evicted?.evictedAtSlot,
       stateRoots: this.stateByStateRoot.size,
+      importedBlockStates: this.importedPostStateByBlockRoot.size,
       checkpoints: this.stateByCheckpointKey.size,
     });
     return null;
@@ -669,6 +700,7 @@ class StateCache {
           currentSlot,
           minStateSlot,
           stateRoots: this.stateByStateRoot.size,
+          importedBlockStates: this.importedPostStateByBlockRoot.size,
           checkpoints: this.stateByCheckpointKey.size,
         });
       }
@@ -686,6 +718,7 @@ class StateCache {
           currentSlot,
           minCheckpointEpoch,
           stateRoots: this.stateByStateRoot.size,
+          importedBlockStates: this.importedPostStateByBlockRoot.size,
           checkpoints: this.stateByCheckpointKey.size,
         });
       }
@@ -786,7 +819,9 @@ async function bootstrapEngine(cfg: CliConfig): Promise<BootstrapResult> {
   // Seed the checkpoint-state cache: the anchor state is the justified+finalized
   // checkpoint state at bootstrap.
   const anchor = bootstrapStateView.computeAnchorCheckpoint();
-  stateCache.setCheckpoint(anchor.checkpoint.epoch, toRootHex(anchor.checkpoint.root), PayloadStatus.FULL, cachedState);
+  const anchorBlockRoot = toRootHex(anchor.checkpoint.root);
+  stateCache.setImportedPostState(anchorBlockRoot, anchorStateRoot, cachedState.slot, cachedState);
+  stateCache.setCheckpoint(anchor.checkpoint.epoch, anchorBlockRoot, PayloadStatus.FULL, cachedState);
 
   return {
     beaconConfig,
@@ -1040,7 +1075,10 @@ function resolveOrphanParentPostState(
     return null;
   }
 
-  const parentPostState = ctx.stateCache.getStateRoot(parentProto.stateRoot);
+  const parentPostState =
+    ctx.stateCache.getImportedBlockPostState(parentRootHex) ??
+    (ctx.forkChoice.getHead().blockRoot === parentRootHex ? ctx.headStateRef.state : null) ??
+    ctx.stateCache.getStateRoot(parentProto.stateRoot);
   if (!parentPostState) {
     warn(
       `planned non-canonical block missing parent post-state; skipping root=${planned.rootHex} slot=${planned.slot} parent=${parentRootHex} parent_state_root=${parentProto.stateRoot}`,
@@ -1069,6 +1107,7 @@ function stateCacheImport(
     ExecutionStatus.Valid,
     DataAvailabilityStatus.Available,
   );
+  ctx.stateCache.setImportedPostState(protoBlock.blockRoot, postStateRoot, blockSlot, postState);
 
   // If this block is an epoch boundary, cache it as a potential checkpoint
   // state under FULL payload status to satisfy FCR lookups.
