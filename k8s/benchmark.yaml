@@ -38,14 +38,14 @@ spec:
           effect: NoSchedule
       containers:
         - name: benchmark
-          image: ghcr.io/ethpandaops/fcr-simulator:latest
+          image: ghcr.io/ethpandaops/fcr-simulator:lighthouse-latest
           env:
             - name: BEACON_NODE_URL
               valueFrom:
                 secretKeyRef:
                   name: fcr-simulator-config
                   key: beacon-node-url
-          command: ["/bin/bash", "-c"]
+          command: ["/bin/sh", "-c"]
           args:
             - |
               BN_URL="$BEACON_NODE_URL"

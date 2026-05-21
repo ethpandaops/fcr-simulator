@@ -155,6 +155,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	cfg, printVersion, err := parseConfig(args, stderr)
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
@@ -339,6 +342,9 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 func runEraMirrorCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	cfg, err := parseEraMirrorConfig(args, stderr)
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
