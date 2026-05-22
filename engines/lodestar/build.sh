@@ -36,8 +36,15 @@ if ! command -v pnpm >/dev/null 2>&1; then
   exit 1
 fi
 
-LODESTAR_COMMIT="$(git -C "${LODESTAR_DIR}" rev-parse HEAD)"
-LODESTAR_DESCRIBE="$(git -C "${LODESTAR_DIR}" describe --always --tags 2>/dev/null || echo "${LODESTAR_COMMIT:0:8}")"
+if LODESTAR_COMMIT="$(git -C "${LODESTAR_DIR}" rev-parse HEAD 2>/dev/null)"; then
+  LODESTAR_DESCRIBE="$(git -C "${LODESTAR_DIR}" describe --always --tags 2>/dev/null || echo "${LODESTAR_COMMIT:0:8}")"
+elif [[ -n "${FCR_LODESTAR_COMMIT:-}" ]]; then
+  LODESTAR_COMMIT="${FCR_LODESTAR_COMMIT}"
+  LODESTAR_DESCRIBE="${FCR_LODESTAR_DESCRIBE:-${LODESTAR_COMMIT:0:8}}"
+else
+  echo "lodestar git metadata unavailable at ${LODESTAR_DIR}; set FCR_LODESTAR_COMMIT when building from a worktree Docker context" >&2
+  exit 1
+fi
 
 echo "[fcr-lodestar] installing engine + lodestar workspaces (pinned ${LODESTAR_COMMIT})" >&2
 (

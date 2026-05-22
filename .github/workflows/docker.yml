@@ -1,19 +1,52 @@
-name: Build and Push Docker Image
+name: Build and Push Docker Images
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   docker:
+    name: Build ${{ matrix.thing }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - thing: orchestrator
+            target: orchestrator
+            submodule: ""
+          - thing: lighthouse
+            target: lighthouse
+            submodule: engines/lighthouse/lighthouse
+          - thing: teku
+            target: teku
+            submodule: engines/teku/teku
+          - thing: lodestar
+            target: lodestar
+            submodule: engines/lodestar/lodestar
+          - thing: nimbus
+            target: nimbus
+            submodule: engines/nimbus/nimbus-eth2
+          - thing: grandine
+            target: grandine
+            submodule: ""
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
+
+      - name: Configure HTTPS submodule URLs
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Initialize engine submodule
+        if: matrix.submodule != ''
+        run: git submodule update --init --recursive "${{ matrix.submodule }}"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -26,9 +59,13 @@ jobs:
       - uses: docker/build-push-action@v5
         with:
           context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/ethpandaops/fcr-simulator:latest
-            ghcr.io/ethpandaops/fcr-simulator:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ghcr.io/ethpandaops/fcr-simulator:${{ matrix.thing }}-latest
+            ghcr.io/ethpandaops/fcr-simulator:${{ matrix.thing }}-${{ github.sha }}
+          build-args: |
+            VERSION=${{ github.sha }}
+          cache-from: type=gha,scope=fcr-${{ matrix.thing }}
+          cache-to: type=gha,mode=max,scope=fcr-${{ matrix.thing }}

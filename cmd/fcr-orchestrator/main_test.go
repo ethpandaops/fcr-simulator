@@ -15,6 +15,32 @@ func TestEndToEndSmoke(t *testing.T) {
 	t.Skip("TODO: wire a mock beacon node plus fixture ERA cache for an orchestrator end-to-end smoke test")
 }
 
+func TestRunHelpExitsZero(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code := run(context.Background(), []string{"--help"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run --help exit code=%d want 0; stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Usage of fcr-orchestrator:") {
+		t.Fatalf("stderr=%q want usage text", stderr.String())
+	}
+}
+
+func TestRunEraMirrorHelpExitsZero(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code := run(context.Background(), []string{"era-mirror", "--help"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run era-mirror --help exit code=%d want 0; stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Usage of fcr-orchestrator era-mirror:") {
+		t.Fatalf("stderr=%q want era-mirror usage text", stderr.String())
+	}
+}
+
 func validConfig(engine string) *config {
 	return &config{
 		Engine:                engine,
