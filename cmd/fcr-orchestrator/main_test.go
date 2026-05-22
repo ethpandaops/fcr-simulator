@@ -338,7 +338,7 @@ func TestValidateConfig_RejectsS3WithoutCredentials(t *testing.T) {
 
 func TestValidateConfig_AcceptsFirstSeenLocalBase(t *testing.T) {
 	cfg := validConfig("lighthouse")
-	cfg.AttestationSourceMode = "first-seen"
+	cfg.AttestationSourceMode = "xatu-first-seen-singles"
 	cfg.FirstSeenBasePath = "deploy/attestation-backfill/fixtures"
 
 	if err := validateConfig(cfg, true, true); err != nil {
@@ -348,11 +348,22 @@ func TestValidateConfig_AcceptsFirstSeenLocalBase(t *testing.T) {
 
 func TestValidateConfig_RejectsFirstSeenWithoutBase(t *testing.T) {
 	cfg := validConfig("lighthouse")
-	cfg.AttestationSourceMode = "first-seen"
+	cfg.AttestationSourceMode = "xatu-first-seen-singles"
 
 	err := validateConfig(cfg, true, true)
 	if err == nil || !strings.Contains(err.Error(), "--attestation-first-seen-base") {
 		t.Fatalf("expected missing first-seen base error, got %v", err)
+	}
+}
+
+func TestValidateConfig_RejectsFirstSeenNonLighthouse(t *testing.T) {
+	cfg := validConfig("nimbus")
+	cfg.AttestationSourceMode = "xatu-first-seen-singles"
+	cfg.FirstSeenBasePath = "deploy/attestation-backfill/fixtures"
+
+	err := validateConfig(cfg, true, true)
+	if err == nil || !strings.Contains(err.Error(), "--engine lighthouse") {
+		t.Fatalf("expected first-seen lighthouse-only error, got %v", err)
 	}
 }
 
@@ -361,7 +372,7 @@ func TestValidateConfig_AcceptsFirstSeenS3BaseWithoutCacheBucket(t *testing.T) {
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
 
 	cfg := validConfig("lighthouse")
-	cfg.AttestationSourceMode = "first-seen"
+	cfg.AttestationSourceMode = "xatu-first-seen-singles"
 	cfg.FirstSeenBasePath = "s3://fcr-simulator/attestation_first_seen"
 	cfg.S3Endpoint = "http://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:8080"
 	cfg.S3Bucket = ""

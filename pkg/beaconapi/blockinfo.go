@@ -28,16 +28,17 @@ type blockInfo struct {
 }
 
 type attestationInfo struct {
-	Root            [32]byte
-	AggregationBits string
-	CommitteeBits   *string
-	Slot            uint64
-	Index           uint64
-	BeaconBlockRoot [32]byte
-	SourceEpoch     uint64
-	SourceRoot      [32]byte
-	TargetEpoch     uint64
-	TargetRoot      [32]byte
+	Root             [32]byte
+	AggregationBits  string
+	CommitteeBits    *string
+	Slot             uint64
+	Index            uint64
+	BeaconBlockRoot  [32]byte
+	SourceEpoch      uint64
+	SourceRoot       [32]byte
+	TargetEpoch      uint64
+	TargetRoot       [32]byte
+	AttestingIndices []uint64
 }
 
 func parseBlockInfo(ssz []byte, forkAtSlot func(uint64) string) (blockInfo, error) {

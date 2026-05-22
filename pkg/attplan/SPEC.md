@@ -67,7 +67,7 @@ def source(N):
 For planner compatibility, `Plan` returns the same representative source as `ModeNextNonMissed`. The HTTP slot-instruction backend expands this mode into every non-missed source block in the lookahead window.
 
 ### ModeFirstSeenGossip
-For each sim_slot `N`, `SourceBlockSlot` is always nil. The HTTP slot-instruction backend serves inline attestations reconstructed from first-seen parquet rows, so no source block is selected by the planner.
+For each sim_slot `N`, `SourceBlockSlot` is always nil. The HTTP slot-instruction backend serves inline indexed attestations grouped from first-seen parquet rows, so no source block is selected by the planner.
 
 ## Test scenarios
 

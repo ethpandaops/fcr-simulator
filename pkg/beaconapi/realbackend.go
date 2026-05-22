@@ -1370,8 +1370,9 @@ func (s *planBuildState) orphanImportsForSlotAttestations(attestations []attesta
 
 func planAttestation(attestation attestationInfo) PlanAttestation {
 	return PlanAttestation{
-		AggregationBits: attestation.AggregationBits,
-		CommitteeBits:   attestation.CommitteeBits,
+		AggregationBits:  attestation.AggregationBits,
+		CommitteeBits:    attestation.CommitteeBits,
+		AttestingIndices: append([]uint64(nil), attestation.AttestingIndices...),
 		Data: PlanAttestationData{
 			Slot:            attestation.Slot,
 			Index:           attestation.Index,

@@ -43,7 +43,7 @@ The orchestrator owns which block sources attestations for each sim slot:
 - **`next-non-missed`** (default): for sim slot N, the first non-missed block in `N+1..N+lookahead-cap`. `--lookahead-cap=4` reproduces today's Lighthouse behavior; `--lookahead-cap=32` covers the spec's full inclusion range.
 - **`strict-source-block-k-minus-1`**: source is exactly `N+1` if it exists, else nothing.
 - **`greedy-lookahead`**: consumes every non-missed block in `N+1..N+lookahead-cap`, bounded to attestations for the FCR evaluation slot.
-- **`first-seen`**: serves pre-computed per-validator first-seen gossip votes from parquet instead of sourcing attestations from blocks. The orchestrator groups rows by `(slot, committee, vote tuple)`, rebuilds aggregation bits from beacon committees, filters by `raw_seen_ms <= --attestation-first-seen-deadline-ms` (default `12000`), and sends the same inline attestation objects to engines. Use `--attestation-first-seen-base` as either a local base path or `s3://bucket/prefix`; files are expected below `network=<network>/source=raw/epoch=<epoch>/data.parquet`.
+- **`first-seen`**: serves pre-computed per-validator first-seen gossip votes from parquet instead of sourcing attestations from blocks. The orchestrator groups rows by vote tuple, filters by `raw_seen_ms <= --attestation-first-seen-deadline-ms` (default `12000`), and sends attestation data plus `attesting_indices` directly to the Lighthouse engine. Use `--attestation-first-seen-base` as either a local base path or `s3://bucket/prefix`; files are expected below `network=<network>/source=raw/epoch=<epoch>/data.parquet`.
 
 ## Build
 
@@ -103,7 +103,7 @@ For long resumable runs, [`run.sh`](run.sh) chunks the range and merges on compl
          --beacon-node-url http://your-beacon-node:5052 --parallel 4
 ```
 
-**Beacon node**: must serve `/eth/v2/debug/beacon/states/{slot}` and `/eth/v1/beacon/headers/{slot}` for the warmup slots. `first-seen` mode also needs `/eth/v1/beacon/states/{slot}/committees?epoch={epoch}` so the orchestrator can rebuild aggregation bits. Lighthouse needs `--reconstruct-historic-states`; Teku needs `--data-storage-mode=ARCHIVE`. Recent ranges (within ~256 epochs of head) often work without archive mode.
+**Beacon node**: must serve `/eth/v2/debug/beacon/states/{slot}` and `/eth/v1/beacon/headers/{slot}` for the warmup slots. Lighthouse needs `--reconstruct-historic-states`; Teku needs `--data-storage-mode=ARCHIVE`. Recent ranges (within ~256 epochs of head) often work without archive mode.
 
 Per-worker RAM: ~2–3 GB for the Rust engines; Lodestar settles around 4 GB after the bounded-cache fix. `--parallel` should be at most `num_cpus / 4`.
 

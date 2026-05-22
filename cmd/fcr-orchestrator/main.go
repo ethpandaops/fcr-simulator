@@ -203,9 +203,9 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 	fs.StringVar(&cfg.Output, "output", defaultOutput, "output path")
 	fs.StringVar(&cfg.OutputFormat, "output-format", defaultOutputFormat, "csv, jsonl, or both")
 	fs.Uint64Var(&cfg.ByzantineThreshold, "byzantine-threshold", defaultByzantineThreshold, "FCR byzantine threshold percent")
-	fs.StringVar(&cfg.AttestationSourceMode, "attestation-source-mode", defaultAttestationSourceMode, "next-non-missed, strict-source-block-k-minus-1, greedy-lookahead, or first-seen")
+	fs.StringVar(&cfg.AttestationSourceMode, "attestation-source-mode", defaultAttestationSourceMode, "next-non-missed, strict-source-block-k-minus-1, greedy-lookahead, or xatu-first-seen-singles")
 	fs.StringVar(&cfg.FirstSeenBasePath, "attestation-first-seen-base", "", "base path for first-seen parquet files (local path or s3://bucket/prefix)")
-	fs.Uint64Var(&cfg.FirstSeenDeadlineMS, "attestation-first-seen-deadline-ms", defaultFirstSeenDeadlineMS, "first-seen raw_seen_ms deadline for first-seen mode")
+	fs.Uint64Var(&cfg.FirstSeenDeadlineMS, "attestation-first-seen-deadline-ms", defaultFirstSeenDeadlineMS, "first-seen raw_seen_ms deadline for xatu-first-seen-singles mode")
 	fs.Uint64Var(&cfg.LookaheadCap, "lookahead-cap", defaultLookaheadCap, "attestation lookahead cap")
 	fs.StringVar(&cfg.HTTPListen, "http-listen", defaultHTTPListen, "local HTTP listen address")
 	fs.StringVar(&cfg.BlockArchiveURL, "block-archive-url", "", "optional block-archiver URL for resolving attestations to orphan/non-canonical blocks")
@@ -271,7 +271,7 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 		}
 		cfg.FirstSeenBasePath = expandedFirstSeenBase
 	}
-	if cfg.AttestationSourceMode == "strict-source-block-k-minus-1" || cfg.AttestationSourceMode == "first-seen" {
+	if cfg.AttestationSourceMode == "strict-source-block-k-minus-1" || cfg.AttestationSourceMode == "xatu-first-seen-singles" {
 		cfg.LookaheadCap = 0
 	}
 
@@ -337,9 +337,12 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 			return fmt.Errorf("--lookahead-cap must be greater than zero for %s mode", cfg.AttestationSourceMode)
 		}
 	case "strict-source-block-k-minus-1":
-	case "first-seen":
+	case "xatu-first-seen-singles":
+		if cfg.Engine != "lighthouse" {
+			return fmt.Errorf("--attestation-source-mode xatu-first-seen-singles is currently supported only with --engine lighthouse")
+		}
 		if strings.TrimSpace(cfg.FirstSeenBasePath) == "" {
-			return fmt.Errorf("--attestation-first-seen-base is required for first-seen mode")
+			return fmt.Errorf("--attestation-first-seen-base is required for xatu-first-seen-singles mode")
 		}
 		if isS3URI(cfg.FirstSeenBasePath) {
 			if err := validateFirstSeenS3Settings(cfg.S3Endpoint); err != nil {
@@ -347,7 +350,7 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 			}
 		}
 	default:
-		return fmt.Errorf("--attestation-source-mode must be next-non-missed, strict-source-block-k-minus-1, greedy-lookahead, or first-seen")
+		return fmt.Errorf("--attestation-source-mode must be next-non-missed, strict-source-block-k-minus-1, greedy-lookahead, or xatu-first-seen-singles")
 	}
 	if strings.TrimSpace(cfg.HTTPListen) == "" {
 		return fmt.Errorf("--http-listen is required")
@@ -539,7 +542,7 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 		return 1, err
 	}
 
-	firstSeenSource, err := newFirstSeenSource(cfg, fetcher)
+	firstSeenSource, err := newFirstSeenSource(cfg)
 	if err != nil {
 		return 1, err
 	}
@@ -758,8 +761,8 @@ func newArchiveClient(cfg config) (*blockarchive.Client, error) {
 	)
 }
 
-func newFirstSeenSource(cfg config, fetcher *beaconfetch.Fetcher) (*beaconapi.FirstSeenAttestationSource, error) {
-	if cfg.AttestationSourceMode != "first-seen" {
+func newFirstSeenSource(cfg config) (*beaconapi.FirstSeenAttestationSource, error) {
+	if cfg.AttestationSourceMode != "xatu-first-seen-singles" {
 		return nil, nil
 	}
 
@@ -773,7 +776,6 @@ func newFirstSeenSource(cfg config, fetcher *beaconfetch.Fetcher) (*beaconapi.Fi
 		DeadlineMS: cfg.FirstSeenDeadlineMS,
 		CacheDir:   cfg.CacheDir,
 		S3Store:    s3Store,
-		Committees: fetcher,
 	})
 }
 
@@ -1048,7 +1050,7 @@ func writeRunManifest(cfg config, engineManifest manifest.EngineManifest, eraCac
 
 	firstSeenBasePath := ""
 	firstSeenDeadlineMS := uint64(0)
-	if cfg.AttestationSourceMode == "first-seen" {
+	if cfg.AttestationSourceMode == "xatu-first-seen-singles" {
 		firstSeenBasePath = cfg.FirstSeenBasePath
 		firstSeenDeadlineMS = cfg.FirstSeenDeadlineMS
 	}
@@ -1096,7 +1098,7 @@ func parseAttplanMode(mode string) (attplan.Mode, error) {
 		return attplan.ModeStrictKMinus1, nil
 	case "greedy-lookahead":
 		return attplan.ModeGreedyLookahead, nil
-	case "first-seen":
+	case "xatu-first-seen-singles":
 		return attplan.ModeFirstSeenGossip, nil
 	default:
 		return 0, fmt.Errorf("unsupported attestation source mode %q", mode)

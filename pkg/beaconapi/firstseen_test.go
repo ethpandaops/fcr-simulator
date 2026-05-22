@@ -5,37 +5,22 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/ethpandaops/fcr-simulator/pkg/beaconfetch"
 	"github.com/parquet-go/parquet-go"
 	"github.com/stretchr/testify/require"
 )
 
-type fakeFirstSeenCommittees struct {
-	committees []beaconfetch.BeaconCommittee
-	calls      int
-}
-
-func (f *fakeFirstSeenCommittees) FetchBeaconCommittees(epoch uint64) ([]beaconfetch.BeaconCommittee, error) {
-	f.calls++
-	return f.committees, nil
-}
-
 func TestFirstSeenAttestationSourceGroupsRowsByVoteTuple(t *testing.T) {
 	base := writeFirstSeenFixture(t, "mainnet", 2, []firstSeenParquetRow{
 		firstSeenRow(64, 2, 10, "3", rootWithByte(0x11), 1000),
-		firstSeenRow(64, 2, 12, "3", rootWithByte(0x11), 12000),
+		firstSeenRow(64, 2, 12, "not-a-committee", rootWithByte(0x11), 12000),
 		firstSeenRow(64, 2, 11, "3", rootWithByte(0x11), 12001),
 		firstSeenRow(64, 2, 10, "3", rootWithByte(0x22), 1000),
 	})
-	committees := &fakeFirstSeenCommittees{committees: []beaconfetch.BeaconCommittee{
-		{Slot: 64, Index: 3, Validators: []uint64{9, 10, 11, 12}},
-	}}
 	source, err := NewFirstSeenAttestationSource(FirstSeenAttestationSourceConfig{
 		BasePath:   base,
 		Network:    "mainnet",
 		DeadlineMS: 12000,
 		CacheDir:   t.TempDir(),
-		Committees: committees,
 	})
 	require.NoError(t, err)
 
@@ -43,48 +28,45 @@ func TestFirstSeenAttestationSourceGroupsRowsByVoteTuple(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, attestations, 2)
 
-	require.Equal(t, "0x1a", attestations[0].AggregationBits)
+	require.Empty(t, attestations[0].AggregationBits)
 	require.Nil(t, attestations[0].CommitteeBits)
+	require.Equal(t, []uint64{10, 12}, attestations[0].AttestingIndices)
 	require.Equal(t, uint64(64), attestations[0].Slot)
-	require.Equal(t, uint64(3), attestations[0].Index)
+	require.Equal(t, uint64(0), attestations[0].Index)
 	require.Equal(t, rootWithByte(0x11), attestations[0].BeaconBlockRoot)
 	require.Equal(t, uint64(1), attestations[0].SourceEpoch)
 	require.Equal(t, rootWithByte(0x01), attestations[0].SourceRoot)
 	require.Equal(t, uint64(2), attestations[0].TargetEpoch)
 	require.Equal(t, rootWithByte(0x02), attestations[0].TargetRoot)
 
-	require.Equal(t, "0x12", attestations[1].AggregationBits)
-	require.Equal(t, uint64(3), attestations[1].Index)
+	require.Empty(t, attestations[1].AggregationBits)
+	require.Nil(t, attestations[1].CommitteeBits)
+	require.Equal(t, []uint64{10}, attestations[1].AttestingIndices)
+	require.Equal(t, uint64(0), attestations[1].Index)
 	require.Equal(t, rootWithByte(0x22), attestations[1].BeaconBlockRoot)
 
 	_, err = source.AttestationsForSlot(65, func(uint64) string { return "deneb" })
 	require.NoError(t, err)
-	require.Equal(t, 1, committees.calls, "epoch parquet and committees should be cached")
 }
 
-func TestFirstSeenAttestationSourceBuildsElectraCommitteeBits(t *testing.T) {
+func TestFirstSeenAttestationSourceDeduplicatesValidatorIndices(t *testing.T) {
 	base := writeFirstSeenFixture(t, "mainnet", 2, []firstSeenParquetRow{
 		firstSeenRow(64, 2, 10, "3", rootWithByte(0x11), 1000),
+		firstSeenRow(64, 2, 10, "3", rootWithByte(0x11), 1001),
+		firstSeenRow(64, 2, 9, "3", rootWithByte(0x11), 1002),
 	})
-	committees := &fakeFirstSeenCommittees{committees: []beaconfetch.BeaconCommittee{
-		{Slot: 64, Index: 3, Validators: []uint64{9, 10, 11, 12}},
-	}}
 	source, err := NewFirstSeenAttestationSource(FirstSeenAttestationSourceConfig{
 		BasePath:   base,
 		Network:    "mainnet",
 		DeadlineMS: 12000,
 		CacheDir:   t.TempDir(),
-		Committees: committees,
 	})
 	require.NoError(t, err)
 
 	attestations, err := source.AttestationsForSlot(64, func(uint64) string { return "electra" })
 	require.NoError(t, err)
 	require.Len(t, attestations, 1)
-	require.Equal(t, "0x12", attestations[0].AggregationBits)
-	require.NotNil(t, attestations[0].CommitteeBits)
-	require.Equal(t, "0x0800000000000000", *attestations[0].CommitteeBits)
-	require.Equal(t, uint64(0), attestations[0].Index)
+	require.Equal(t, []uint64{9, 10}, attestations[0].AttestingIndices)
 }
 
 func writeFirstSeenFixture(t *testing.T, network string, epoch uint64, rows []firstSeenParquetRow) string {

@@ -15,22 +15,15 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/ethpandaops/fcr-simulator/pkg/beaconfetch"
 	"github.com/ethpandaops/fcr-simulator/pkg/s3cache"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/parquet-go/parquet-go"
-	"github.com/prysmaticlabs/go-bitfield"
 )
 
 const (
 	defaultFirstSeenEpochCacheSize = 64
 	mainnetSlotsPerEpoch           = uint64(32)
-	maxCommitteesPerSlot           = uint64(64)
 )
-
-type FirstSeenCommitteeProvider interface {
-	FetchBeaconCommittees(epoch uint64) ([]beaconfetch.BeaconCommittee, error)
-}
 
 type FirstSeenAttestationSourceConfig struct {
 	BasePath       string
@@ -38,7 +31,6 @@ type FirstSeenAttestationSourceConfig struct {
 	DeadlineMS     uint64
 	CacheDir       string
 	S3Store        s3cache.Store
-	Committees     FirstSeenCommitteeProvider
 	EpochCacheSize int
 }
 
@@ -48,7 +40,6 @@ type FirstSeenAttestationSource struct {
 	deadlineMS uint64
 	cacheDir   string
 	s3Store    s3cache.Store
-	committees FirstSeenCommitteeProvider
 	cache      *lru.Cache[uint64, *firstSeenEpoch]
 
 	mu       sync.Mutex
@@ -86,32 +77,18 @@ type firstSeenParquetRow struct {
 }
 
 type firstSeenGroupKey struct {
-	slot             uint64
-	committeeIndex   uint64
-	dataIndex        uint64
-	beaconBlockRoot  [32]byte
-	sourceEpoch      uint64
-	sourceRoot       [32]byte
-	targetEpoch      uint64
-	targetRoot       [32]byte
-	committeeBits    string
-	hasCommitteeBits bool
+	slot            uint64
+	beaconBlockRoot [32]byte
+	sourceEpoch     uint64
+	sourceRoot      [32]byte
+	targetEpoch     uint64
+	targetRoot      [32]byte
 }
 
 type firstSeenGroup struct {
-	key  firstSeenGroupKey
-	bits bitfield.Bitlist
-	root [32]byte
-}
-
-type slotCommitteeKey struct {
-	slot  uint64
-	index uint64
-}
-
-type firstSeenCommittee struct {
-	validators map[uint64]uint64
-	size       uint64
+	key              firstSeenGroupKey
+	attestingIndices []uint64
+	root             [32]byte
 }
 
 func NewFirstSeenAttestationSource(cfg FirstSeenAttestationSourceConfig) (*FirstSeenAttestationSource, error) {
@@ -125,9 +102,6 @@ func NewFirstSeenAttestationSource(cfg FirstSeenAttestationSourceConfig) (*First
 	}
 	if strings.TrimSpace(cfg.CacheDir) == "" {
 		return nil, fmt.Errorf("first-seen cache dir is required")
-	}
-	if cfg.Committees == nil {
-		return nil, fmt.Errorf("first-seen committee provider is required")
 	}
 	if base.isS3 && cfg.S3Store == nil {
 		return nil, fmt.Errorf("first-seen base %q requires an S3 store", cfg.BasePath)
@@ -148,18 +122,17 @@ func NewFirstSeenAttestationSource(cfg FirstSeenAttestationSourceConfig) (*First
 		deadlineMS: cfg.DeadlineMS,
 		cacheDir:   cfg.CacheDir,
 		s3Store:    cfg.S3Store,
-		committees: cfg.Committees,
 		cache:      cache,
 		inflight:   make(map[uint64]*firstSeenInflight),
 	}, nil
 }
 
-func (s *FirstSeenAttestationSource) AttestationsForSlot(slot uint64, forkAtSlot func(uint64) string) ([]attestationInfo, error) {
+func (s *FirstSeenAttestationSource) AttestationsForSlot(slot uint64, _ func(uint64) string) ([]attestationInfo, error) {
 	if s == nil {
 		return nil, fmt.Errorf("first-seen attestation source is not configured")
 	}
 	epoch := slot / mainnetSlotsPerEpoch
-	loaded, err := s.epoch(epoch, forkAtSlot)
+	loaded, err := s.epoch(epoch)
 	if err != nil {
 		return nil, err
 	}
@@ -168,11 +141,14 @@ func (s *FirstSeenAttestationSource) AttestationsForSlot(slot uint64, forkAtSlot
 		return nil, nil
 	}
 	out := make([]attestationInfo, len(attestations))
-	copy(out, attestations)
+	for i, attestation := range attestations {
+		out[i] = attestation
+		out[i].AttestingIndices = append([]uint64(nil), attestation.AttestingIndices...)
+	}
 	return out, nil
 }
 
-func (s *FirstSeenAttestationSource) epoch(epoch uint64, forkAtSlot func(uint64) string) (*firstSeenEpoch, error) {
+func (s *FirstSeenAttestationSource) epoch(epoch uint64) (*firstSeenEpoch, error) {
 	s.mu.Lock()
 	if cached, ok := s.cache.Get(epoch); ok {
 		s.mu.Unlock()
@@ -187,7 +163,7 @@ func (s *FirstSeenAttestationSource) epoch(epoch uint64, forkAtSlot func(uint64)
 	s.inflight[epoch] = in
 	s.mu.Unlock()
 
-	loaded, err := s.loadEpoch(epoch, forkAtSlot)
+	loaded, err := s.loadEpoch(epoch)
 
 	s.mu.Lock()
 	if err == nil {
@@ -201,12 +177,7 @@ func (s *FirstSeenAttestationSource) epoch(epoch uint64, forkAtSlot func(uint64)
 	return loaded, err
 }
 
-func (s *FirstSeenAttestationSource) loadEpoch(epoch uint64, forkAtSlot func(uint64) string) (*firstSeenEpoch, error) {
-	committees, err := s.loadCommittees(epoch)
-	if err != nil {
-		return nil, err
-	}
-
+func (s *FirstSeenAttestationSource) loadEpoch(epoch uint64) (*firstSeenEpoch, error) {
 	path, err := s.localParquetPath(epoch)
 	if err != nil {
 		return nil, err
@@ -218,7 +189,6 @@ func (s *FirstSeenAttestationSource) loadEpoch(epoch uint64, forkAtSlot func(uin
 	}
 
 	groups := make(map[firstSeenGroupKey]*firstSeenGroup)
-	droppedUnassigned := 0
 	for _, row := range rows {
 		if uint64(row.RawSeenMS) > s.deadlineMS {
 			continue
@@ -228,24 +198,6 @@ func (s *FirstSeenAttestationSource) loadEpoch(epoch uint64, forkAtSlot func(uin
 		}
 
 		slot := uint64(row.Slot)
-		committeeIndex, err := strconv.ParseUint(strings.TrimSpace(row.CommitteeIndex), 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("first-seen row slot %d validator %d committee_index %q: %w", row.Slot, row.ValidatorIndex, row.CommitteeIndex, err)
-		}
-
-		committee, ok := committees[slotCommitteeKey{slot: slot, index: committeeIndex}]
-		if !ok {
-			// Rare post-Electra rows reference a (slot, committee) the validator was not
-			// actually assigned to (xatu attesting_validator_committee_index resolution
-			// artifact, ~0.003% of rows). Skip the row rather than fail the whole run.
-			droppedUnassigned++
-			continue
-		}
-		position, ok := committee.validators[uint64(row.ValidatorIndex)]
-		if !ok {
-			droppedUnassigned++
-			continue
-		}
 
 		beaconBlockRoot, err := parseFirstSeenRoot(row.BlockRoot)
 		if err != nil {
@@ -260,45 +212,23 @@ func (s *FirstSeenAttestationSource) loadEpoch(epoch uint64, forkAtSlot func(uin
 			return nil, fmt.Errorf("first-seen row slot %d validator %d target_root: %w", row.Slot, row.ValidatorIndex, err)
 		}
 
-		dataIndex := committeeIndex
-		var committeeBits string
-		var hasCommitteeBits bool
-		if isElectraOrLaterFork(forkAtSlot(slot)) {
-			dataIndex = 0
-			bits, err := encodeCommitteeBits(committeeIndex)
-			if err != nil {
-				return nil, fmt.Errorf("first-seen row slot %d committee %d: %w", slot, committeeIndex, err)
-			}
-			committeeBits = bits
-			hasCommitteeBits = true
-		}
-
 		key := firstSeenGroupKey{
-			slot:             slot,
-			committeeIndex:   committeeIndex,
-			dataIndex:        dataIndex,
-			beaconBlockRoot:  beaconBlockRoot,
-			sourceEpoch:      uint64(row.SourceEpoch),
-			sourceRoot:       sourceRoot,
-			targetEpoch:      uint64(row.TargetEpoch),
-			targetRoot:       targetRoot,
-			committeeBits:    committeeBits,
-			hasCommitteeBits: hasCommitteeBits,
+			slot:            slot,
+			beaconBlockRoot: beaconBlockRoot,
+			sourceEpoch:     uint64(row.SourceEpoch),
+			sourceRoot:      sourceRoot,
+			targetEpoch:     uint64(row.TargetEpoch),
+			targetRoot:      targetRoot,
 		}
 		group := groups[key]
 		if group == nil {
 			group = &firstSeenGroup{
-				key:  key,
-				bits: bitfield.NewBitlist(committee.size),
+				key: key,
 			}
 			group.root = syntheticFirstSeenAttestationRoot(key)
 			groups[key] = group
 		}
-		group.bits.SetBitAt(position, true)
-	}
-
-	if droppedUnassigned > 0 {
-		fmt.Fprintf(os.Stderr, "first-seen epoch %d: skipped %d row(s) whose validator was not in the referenced committee (post-Electra resolution artifacts)\n", epoch, droppedUnassigned)
+		group.attestingIndices = append(group.attestingIndices, uint64(row.ValidatorIndex))
 	}
 
 	epochData := &firstSeenEpoch{slots: make(map[uint64][]attestationInfo)}
@@ -311,48 +241,20 @@ func (s *FirstSeenAttestationSource) loadEpoch(epoch uint64, forkAtSlot func(uin
 	})
 	for _, group := range sortedGroups {
 		key := group.key
-		var committeeBits *string
-		if key.hasCommitteeBits {
-			bits := key.committeeBits
-			committeeBits = &bits
-		}
+		attestingIndices := sortedUniqueUint64s(group.attestingIndices)
 		epochData.slots[key.slot] = append(epochData.slots[key.slot], attestationInfo{
-			Root:            group.root,
-			AggregationBits: bytesHex([]byte(group.bits)),
-			CommitteeBits:   committeeBits,
-			Slot:            key.slot,
-			Index:           key.dataIndex,
-			BeaconBlockRoot: key.beaconBlockRoot,
-			SourceEpoch:     key.sourceEpoch,
-			SourceRoot:      key.sourceRoot,
-			TargetEpoch:     key.targetEpoch,
-			TargetRoot:      key.targetRoot,
+			Root:             group.root,
+			Slot:             key.slot,
+			Index:            0,
+			BeaconBlockRoot:  key.beaconBlockRoot,
+			SourceEpoch:      key.sourceEpoch,
+			SourceRoot:       key.sourceRoot,
+			TargetEpoch:      key.targetEpoch,
+			TargetRoot:       key.targetRoot,
+			AttestingIndices: attestingIndices,
 		})
 	}
 	return epochData, nil
-}
-
-func (s *FirstSeenAttestationSource) loadCommittees(epoch uint64) (map[slotCommitteeKey]firstSeenCommittee, error) {
-	committees, err := s.committees.FetchBeaconCommittees(epoch)
-	if err != nil {
-		return nil, fmt.Errorf("fetch beacon committees for first-seen epoch %d: %w", epoch, err)
-	}
-	out := make(map[slotCommitteeKey]firstSeenCommittee, len(committees))
-	for _, committee := range committees {
-		key := slotCommitteeKey{slot: committee.Slot, index: committee.Index}
-		if _, exists := out[key]; exists {
-			return nil, fmt.Errorf("duplicate beacon committee for slot %d index %d", committee.Slot, committee.Index)
-		}
-		positions := make(map[uint64]uint64, len(committee.Validators))
-		for position, validator := range committee.Validators {
-			positions[validator] = uint64(position)
-		}
-		out[key] = firstSeenCommittee{
-			validators: positions,
-			size:       uint64(len(committee.Validators)),
-		}
-	}
-	return out, nil
 }
 
 func (s *FirstSeenAttestationSource) localParquetPath(epoch uint64) (string, error) {
@@ -464,37 +366,14 @@ func parseFirstSeenRoot(value string) ([32]byte, error) {
 	return root, nil
 }
 
-func encodeCommitteeBits(committeeIndex uint64) (string, error) {
-	if committeeIndex >= maxCommitteesPerSlot {
-		return "", fmt.Errorf("committee index exceeds max committees per slot")
-	}
-	bits := bitfield.NewBitvector64()
-	bits.SetBitAt(committeeIndex, true)
-	return bytesHex(bits.Bytes()), nil
-}
-
-func isElectraOrLaterFork(fork string) bool {
-	switch strings.ToLower(strings.TrimSpace(fork)) {
-	case "electra", "fulu":
-		return true
-	default:
-		return false
-	}
-}
-
 func syntheticFirstSeenAttestationRoot(key firstSeenGroupKey) [32]byte {
 	h := sha256.New()
 	writeUint64Decimal(h, key.slot)
-	writeUint64Decimal(h, key.committeeIndex)
-	writeUint64Decimal(h, key.dataIndex)
 	h.Write(key.beaconBlockRoot[:])
 	writeUint64Decimal(h, key.sourceEpoch)
 	h.Write(key.sourceRoot[:])
 	writeUint64Decimal(h, key.targetEpoch)
 	h.Write(key.targetRoot[:])
-	if key.hasCommitteeBits {
-		h.Write([]byte(key.committeeBits))
-	}
 	sum := h.Sum(nil)
 	var root [32]byte
 	copy(root[:], sum)
@@ -509,9 +388,6 @@ func writeUint64Decimal(w io.Writer, value uint64) {
 func compareFirstSeenGroupKeys(a, b firstSeenGroupKey) int {
 	if a.slot != b.slot {
 		return compareUint64(a.slot, b.slot)
-	}
-	if a.committeeIndex != b.committeeIndex {
-		return compareUint64(a.committeeIndex, b.committeeIndex)
 	}
 	if c := compareRoot(a.beaconBlockRoot, b.beaconBlockRoot); c != 0 {
 		return c
@@ -528,7 +404,23 @@ func compareFirstSeenGroupKeys(a, b firstSeenGroupKey) int {
 	if c := compareRoot(a.targetRoot, b.targetRoot); c != 0 {
 		return c
 	}
-	return compareUint64(a.dataIndex, b.dataIndex)
+	return 0
+}
+
+func sortedUniqueUint64s(values []uint64) []uint64 {
+	if len(values) == 0 {
+		return nil
+	}
+	out := append([]uint64(nil), values...)
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	n := 1
+	for _, value := range out[1:] {
+		if value != out[n-1] {
+			out[n] = value
+			n++
+		}
+	}
+	return out[:n]
 }
 
 func compareUint64(a, b uint64) int {

@@ -77,9 +77,10 @@ type SlotInstruction struct {
 }
 
 type PlanAttestation struct {
-	AggregationBits string              `json:"aggregation_bits"`
-	CommitteeBits   *string             `json:"committee_bits,omitempty"`
-	Data            PlanAttestationData `json:"data"`
+	AggregationBits  string              `json:"aggregation_bits,omitempty"`
+	CommitteeBits    *string             `json:"committee_bits,omitempty"`
+	Data             PlanAttestationData `json:"data"`
+	AttestingIndices []uint64            `json:"attesting_indices,omitempty"`
 }
 
 type PlanAttestationData struct {
