@@ -218,6 +218,7 @@ func (s *FirstSeenAttestationSource) loadEpoch(epoch uint64, forkAtSlot func(uin
 	}
 
 	groups := make(map[firstSeenGroupKey]*firstSeenGroup)
+	droppedUnassigned := 0
 	for _, row := range rows {
 		if uint64(row.RawSeenMS) > s.deadlineMS {
 			continue
@@ -234,11 +235,16 @@ func (s *FirstSeenAttestationSource) loadEpoch(epoch uint64, forkAtSlot func(uin
 
 		committee, ok := committees[slotCommitteeKey{slot: slot, index: committeeIndex}]
 		if !ok {
-			return nil, fmt.Errorf("first-seen row slot %d references missing committee %d", slot, committeeIndex)
+			// Rare post-Electra rows reference a (slot, committee) the validator was not
+			// actually assigned to (xatu attesting_validator_committee_index resolution
+			// artifact, ~0.003% of rows). Skip the row rather than fail the whole run.
+			droppedUnassigned++
+			continue
 		}
 		position, ok := committee.validators[uint64(row.ValidatorIndex)]
 		if !ok {
-			return nil, fmt.Errorf("first-seen row slot %d committee %d missing validator %d", slot, committeeIndex, row.ValidatorIndex)
+			droppedUnassigned++
+			continue
 		}
 
 		beaconBlockRoot, err := parseFirstSeenRoot(row.BlockRoot)
@@ -289,6 +295,10 @@ func (s *FirstSeenAttestationSource) loadEpoch(epoch uint64, forkAtSlot func(uin
 			groups[key] = group
 		}
 		group.bits.SetBitAt(position, true)
+	}
+
+	if droppedUnassigned > 0 {
+		fmt.Fprintf(os.Stderr, "first-seen epoch %d: skipped %d row(s) whose validator was not in the referenced committee (post-Electra resolution artifacts)\n", epoch, droppedUnassigned)
 	}
 
 	epochData := &firstSeenEpoch{slots: make(map[uint64][]attestationInfo)}
