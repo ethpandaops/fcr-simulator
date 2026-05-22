@@ -174,6 +174,7 @@ FROM debian:bookworm-slim AS lighthouse
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
+      curl \
       libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -187,6 +188,7 @@ FROM eclipse-temurin:21-jre-noble AS teku
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
+      curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=orchestrator-builder /out/fcr-orchestrator /usr/local/bin/fcr-orchestrator
@@ -204,6 +206,7 @@ FROM node:24-bookworm-slim AS lodestar
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
+      curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=orchestrator-builder /out/fcr-orchestrator /usr/local/bin/fcr-orchestrator
@@ -221,6 +224,7 @@ FROM debian:bookworm-slim AS nimbus
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
+      curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=orchestrator-builder /out/fcr-orchestrator /usr/local/bin/fcr-orchestrator
@@ -233,6 +237,7 @@ FROM debian:bookworm-slim AS grandine
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
+      curl \
       libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 
