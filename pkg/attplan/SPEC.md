@@ -14,6 +14,8 @@ type Mode int
 const (
     ModeNextNonMissed Mode = iota   // legacy-next-non-missed, parameterized by cap
     ModeStrictKMinus1               // strict-source-block-k-minus-1
+    ModeGreedyLookahead             // multi-source lookahead; representative SourceBlockSlot is next non-missed
+    ModeFirstSeenGossip             // direct first-seen parquet source; no source block
 )
 
 // Plan is the per-sim-slot attestation source mapping.
@@ -28,13 +30,13 @@ type Entry struct {
 //                Callers must populate for at least [simStart, simEnd+lookaheadCap].
 //   simStart, simEnd: range of sim_slots to plan for. Half-open [simStart, simEnd).
 //   mode: which heuristic to apply.
-//   lookaheadCap: only meaningful for ModeNextNonMissed. Must be >= 1.
-//                 (Ignored for ModeStrictKMinus1 but tests pass it anyway.)
+//   lookaheadCap: meaningful for ModeNextNonMissed and ModeGreedyLookahead. Must be >= 1.
+//                 Ignored for ModeStrictKMinus1 and ModeFirstSeenGossip.
 //
 // Output: one Entry per sim_slot in [simStart, simEnd), in ascending order.
 //
 // Errors:
-//   - mode == ModeNextNonMissed && lookaheadCap < 1: error
+//   - mode == ModeNextNonMissed or ModeGreedyLookahead && lookaheadCap < 1: error
 //   - simStart > simEnd: error
 //   - simStart == simEnd: empty result (not an error)
 func Plan(blockExists map[uint64]bool, simStart, simEnd uint64, mode Mode, lookaheadCap uint64) ([]Entry, error)
@@ -60,6 +62,12 @@ For each sim_slot `N`, source is `N+1` if `blockExists[N+1] == true`, else nil. 
 def source(N):
     return N+1 if blockExists[N+1] else None
 ```
+
+### ModeGreedyLookahead
+For planner compatibility, `Plan` returns the same representative source as `ModeNextNonMissed`. The HTTP slot-instruction backend expands this mode into every non-missed source block in the lookahead window.
+
+### ModeFirstSeenGossip
+For each sim_slot `N`, `SourceBlockSlot` is always nil. The HTTP slot-instruction backend serves inline attestations reconstructed from first-seen parquet rows, so no source block is selected by the planner.
 
 ## Test scenarios
 

@@ -17,6 +17,10 @@ const (
 	// lookahead window. The single-source planner entry remains a representative
 	// first source for the existing HTTP schema.
 	ModeGreedyLookahead
+	// ModeFirstSeenGossip serves pre-computed first-seen gossip attestations
+	// directly through the slot instruction endpoint instead of selecting source
+	// blocks.
+	ModeFirstSeenGossip
 )
 
 // Entry is the per-sim-slot attestation source mapping.
@@ -31,8 +35,8 @@ type Entry struct {
 // Plan returns one Entry per sim_slot in [simStart, simEnd), in ascending order.
 //
 // blockExists is treated as false for missing keys. ModeNextNonMissed and
-// ModeGreedyLookahead require lookaheadCap >= 1. ModeStrictKMinus1 ignores
-// lookaheadCap.
+// ModeGreedyLookahead require lookaheadCap >= 1. ModeStrictKMinus1 and
+// ModeFirstSeenGossip ignore lookaheadCap.
 func Plan(blockExists map[uint64]bool, simStart, simEnd uint64, mode Mode, lookaheadCap uint64) ([]Entry, error) {
 	if simStart > simEnd {
 		return nil, fmt.Errorf("simStart %d is after simEnd %d", simStart, simEnd)
@@ -40,7 +44,7 @@ func Plan(blockExists map[uint64]bool, simStart, simEnd uint64, mode Mode, looka
 	if (mode == ModeNextNonMissed || mode == ModeGreedyLookahead) && lookaheadCap < 1 {
 		return nil, fmt.Errorf("lookaheadCap must be >= 1 for mode %d", mode)
 	}
-	if mode != ModeNextNonMissed && mode != ModeStrictKMinus1 && mode != ModeGreedyLookahead {
+	if mode != ModeNextNonMissed && mode != ModeStrictKMinus1 && mode != ModeGreedyLookahead && mode != ModeFirstSeenGossip {
 		return nil, fmt.Errorf("unsupported attestation source mode %d", mode)
 	}
 
@@ -52,6 +56,8 @@ func Plan(blockExists map[uint64]bool, simStart, simEnd uint64, mode Mode, looka
 			source = nextNonMissedSource(blockExists, simSlot, lookaheadCap)
 		case ModeStrictKMinus1:
 			source = strictKMinus1Source(blockExists, simSlot)
+		case ModeFirstSeenGossip:
+			source = nil
 		}
 
 		entries = append(entries, Entry{

@@ -369,6 +369,12 @@ func TestGreedyLookahead_RepresentativeSource(t *testing.T) {
 	requirePlan(t, got, 100, []*uint64{source(103), source(103), source(103)})
 }
 
+func TestFirstSeenGossip_NoSourceBlocks(t *testing.T) {
+	got, err := Plan(blockMap(100, 101, 102, 103), 100, 104, ModeFirstSeenGossip, 0)
+	require.NoError(t, err)
+	requirePlan(t, got, 100, nilSources(4))
+}
+
 func TestErr_Cap0_ModeA(t *testing.T) {
 	got, err := Plan(blockMap(100, 101), 100, 104, ModeNextNonMissed, 0)
 	require.Error(t, err)

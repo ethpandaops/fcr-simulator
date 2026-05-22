@@ -44,6 +44,7 @@ const (
 	defaultOutputFormat          = "both"
 	defaultByzantineThreshold    = uint64(25)
 	defaultAttestationSourceMode = "next-non-missed"
+	defaultFirstSeenDeadlineMS   = uint64(12000)
 	defaultLookaheadCap          = uint64(4)
 	defaultHTTPListen            = "127.0.0.1:0"
 	defaultDecodedBlockCacheSize = beaconapi.DefaultDecodedBlockCacheSize
@@ -90,6 +91,8 @@ type config struct {
 	OutputFormat          string
 	ByzantineThreshold    uint64
 	AttestationSourceMode string
+	FirstSeenBasePath     string
+	FirstSeenDeadlineMS   uint64
 	LookaheadCap          uint64
 	HTTPListen            string
 	BlockArchiveURL       string
@@ -200,7 +203,9 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 	fs.StringVar(&cfg.Output, "output", defaultOutput, "output path")
 	fs.StringVar(&cfg.OutputFormat, "output-format", defaultOutputFormat, "csv, jsonl, or both")
 	fs.Uint64Var(&cfg.ByzantineThreshold, "byzantine-threshold", defaultByzantineThreshold, "FCR byzantine threshold percent")
-	fs.StringVar(&cfg.AttestationSourceMode, "attestation-source-mode", defaultAttestationSourceMode, "next-non-missed, strict-source-block-k-minus-1, or greedy-lookahead")
+	fs.StringVar(&cfg.AttestationSourceMode, "attestation-source-mode", defaultAttestationSourceMode, "next-non-missed, strict-source-block-k-minus-1, greedy-lookahead, or first-seen")
+	fs.StringVar(&cfg.FirstSeenBasePath, "attestation-first-seen-base", "", "base path for first-seen parquet files (local path or s3://bucket/prefix)")
+	fs.Uint64Var(&cfg.FirstSeenDeadlineMS, "attestation-first-seen-deadline-ms", defaultFirstSeenDeadlineMS, "first-seen raw_seen_ms deadline for first-seen mode")
 	fs.Uint64Var(&cfg.LookaheadCap, "lookahead-cap", defaultLookaheadCap, "attestation lookahead cap")
 	fs.StringVar(&cfg.HTTPListen, "http-listen", defaultHTTPListen, "local HTTP listen address")
 	fs.StringVar(&cfg.BlockArchiveURL, "block-archive-url", "", "optional block-archiver URL for resolving attestations to orphan/non-canonical blocks")
@@ -258,7 +263,15 @@ func parseConfig(args []string, output io.Writer) (config, bool, error) {
 	cfg.S3Bucket = strings.TrimSpace(cfg.S3Bucket)
 	cfg.OutputFormat = strings.ToLower(strings.TrimSpace(cfg.OutputFormat))
 	cfg.AttestationSourceMode = strings.TrimSpace(cfg.AttestationSourceMode)
-	if cfg.AttestationSourceMode == "strict-source-block-k-minus-1" {
+	cfg.FirstSeenBasePath = strings.TrimSpace(cfg.FirstSeenBasePath)
+	if cfg.FirstSeenBasePath != "" && !isS3URI(cfg.FirstSeenBasePath) {
+		expandedFirstSeenBase, err := expandPath(cfg.FirstSeenBasePath)
+		if err != nil {
+			return config{}, false, err
+		}
+		cfg.FirstSeenBasePath = expandedFirstSeenBase
+	}
+	if cfg.AttestationSourceMode == "strict-source-block-k-minus-1" || cfg.AttestationSourceMode == "first-seen" {
 		cfg.LookaheadCap = 0
 	}
 
@@ -324,8 +337,17 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 			return fmt.Errorf("--lookahead-cap must be greater than zero for %s mode", cfg.AttestationSourceMode)
 		}
 	case "strict-source-block-k-minus-1":
+	case "first-seen":
+		if strings.TrimSpace(cfg.FirstSeenBasePath) == "" {
+			return fmt.Errorf("--attestation-first-seen-base is required for first-seen mode")
+		}
+		if isS3URI(cfg.FirstSeenBasePath) {
+			if err := validateFirstSeenS3Settings(cfg.S3Endpoint); err != nil {
+				return err
+			}
+		}
 	default:
-		return fmt.Errorf("--attestation-source-mode must be next-non-missed, strict-source-block-k-minus-1, or greedy-lookahead")
+		return fmt.Errorf("--attestation-source-mode must be next-non-missed, strict-source-block-k-minus-1, greedy-lookahead, or first-seen")
 	}
 	if strings.TrimSpace(cfg.HTTPListen) == "" {
 		return fmt.Errorf("--http-listen is required")
@@ -333,7 +355,7 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 	if cfg.DecodedBlockCacheSize < 0 {
 		return fmt.Errorf("--decoded-block-cache-size must be >= 0")
 	}
-	if err := validateS3Settings(cfg.S3Endpoint, cfg.S3Bucket, false); err != nil {
+	if err := validateOptionalCacheS3Settings(cfg.S3Endpoint, cfg.S3Bucket, isS3URI(cfg.FirstSeenBasePath)); err != nil {
 		return err
 	}
 	return nil
@@ -517,6 +539,11 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 		return 1, err
 	}
 
+	firstSeenSource, err := newFirstSeenSource(cfg, fetcher)
+	if err != nil {
+		return 1, err
+	}
+
 	workerInfos, checkpointStates, checkpointBlocks, err := prepareWorkers(cfg, fetcher, chunks, stdout)
 	if err != nil {
 		return 1, err
@@ -527,7 +554,7 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 		return 1, fmt.Errorf("fetch genesis state: %w", err)
 	}
 
-	archiveWarm, err := warmBlockArchiveCache(cfg, eraReader, workerInfos, checkpointBlocks, stdout)
+	archiveWarm, err := warmBlockArchiveCache(cfg, eraReader, workerInfos, checkpointBlocks, firstSeenSource, stdout)
 	if err != nil {
 		return 1, fmt.Errorf("warm block archive cache: %w", err)
 	}
@@ -538,7 +565,7 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 		return 0, nil
 	}
 
-	server, serverURL, shutdown, err := startBeaconAPIServer(cfg, eraReader, fetcher, checkpointBlocks, archiveWarm.OrphanRootsBySlot)
+	server, serverURL, shutdown, err := startBeaconAPIServer(cfg, eraReader, fetcher, checkpointBlocks, archiveWarm.OrphanRootsBySlot, firstSeenSource)
 	if err != nil {
 		return 1, err
 	}
@@ -731,11 +758,30 @@ func newArchiveClient(cfg config) (*blockarchive.Client, error) {
 	)
 }
 
+func newFirstSeenSource(cfg config, fetcher *beaconfetch.Fetcher) (*beaconapi.FirstSeenAttestationSource, error) {
+	if cfg.AttestationSourceMode != "first-seen" {
+		return nil, nil
+	}
+
+	s3Store, err := newFirstSeenS3Store(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return beaconapi.NewFirstSeenAttestationSource(beaconapi.FirstSeenAttestationSourceConfig{
+		BasePath:   cfg.FirstSeenBasePath,
+		Network:    cfg.Network,
+		DeadlineMS: cfg.FirstSeenDeadlineMS,
+		CacheDir:   cfg.CacheDir,
+		S3Store:    s3Store,
+		Committees: fetcher,
+	})
+}
+
 // warmBlockArchiveCache front-loads every orphan block the engine workers will
 // request into the local disk cache, so the serving hot loop never contacts the
 // block archive over HTTP (where a slow or timing-out origin would stall or fail
 // a running simulation). No-op when no archive is configured.
-func warmBlockArchiveCache(cfg config, eraReader *era.Reader, workerInfos []workerInfo, checkpointBlocks map[[32]byte][]byte, stdout io.Writer) (beaconapi.ArchiveWarmResult, error) {
+func warmBlockArchiveCache(cfg config, eraReader *era.Reader, workerInfos []workerInfo, checkpointBlocks map[[32]byte][]byte, firstSeenSource *beaconapi.FirstSeenAttestationSource, stdout io.Writer) (beaconapi.ArchiveWarmResult, error) {
 	archiveClient, err := newArchiveClient(cfg)
 	if err != nil {
 		return beaconapi.ArchiveWarmResult{}, err
@@ -777,6 +823,7 @@ func warmBlockArchiveCache(cfg config, eraReader *era.Reader, workerInfos []work
 		CheckpointBlocksByRoot: checkpointBlocks,
 		BlockArchive:           archiveClient,
 		DecodedBlockCacheSize:  cfg.DecodedBlockCacheSize,
+		FirstSeenSource:        firstSeenSource,
 	}, ranges)
 	logArchiveWarmSummary(stdout, result.Stats)
 	return result, err
@@ -798,7 +845,7 @@ func logArchiveWarmSummary(stdout io.Writer, stats beaconapi.ArchiveWarmStats) {
 	)
 }
 
-func startBeaconAPIServer(cfg config, eraReader *era.Reader, fetcher *beaconfetch.Fetcher, checkpointBlocks map[[32]byte][]byte, archiveOrphanRootsBySlot map[uint64][][32]byte) (*http.Server, string, func(), error) {
+func startBeaconAPIServer(cfg config, eraReader *era.Reader, fetcher *beaconfetch.Fetcher, checkpointBlocks map[[32]byte][]byte, archiveOrphanRootsBySlot map[uint64][][32]byte, firstSeenSource *beaconapi.FirstSeenAttestationSource) (*http.Server, string, func(), error) {
 	mode, err := parseAttplanMode(cfg.AttestationSourceMode)
 	if err != nil {
 		return nil, "", nil, err
@@ -821,6 +868,7 @@ func startBeaconAPIServer(cfg config, eraReader *era.Reader, fetcher *beaconfetc
 		ArchiveCacheOnly:         true,
 		ArchiveOrphanRootsBySlot: archiveOrphanRootsBySlot,
 		DecodedBlockCacheSize:    cfg.DecodedBlockCacheSize,
+		FirstSeenSource:          firstSeenSource,
 	})
 
 	server := &http.Server{
@@ -998,6 +1046,13 @@ func writeRunManifest(cfg config, engineManifest manifest.EngineManifest, eraCac
 		}
 	}
 
+	firstSeenBasePath := ""
+	firstSeenDeadlineMS := uint64(0)
+	if cfg.AttestationSourceMode == "first-seen" {
+		firstSeenBasePath = cfg.FirstSeenBasePath
+		firstSeenDeadlineMS = cfg.FirstSeenDeadlineMS
+	}
+
 	m := manifest.RunManifest{
 		SchemaVersion:       schema.SchemaVersion,
 		FCRSimulatorVersion: simulatorVersion(),
@@ -1011,6 +1066,8 @@ func writeRunManifest(cfg config, engineManifest manifest.EngineManifest, eraCac
 			Parallel:              cfg.Parallel,
 			AttestationSourceMode: cfg.AttestationSourceMode,
 			LookaheadCap:          cfg.LookaheadCap,
+			FirstSeenBasePath:     firstSeenBasePath,
+			FirstSeenDeadlineMS:   firstSeenDeadlineMS,
 			ByzantineThreshold:    cfg.ByzantineThreshold,
 			BeaconNodeURL:         cfg.BeaconNodeURL,
 			EraURL:                cfg.EraURL,
@@ -1039,6 +1096,8 @@ func parseAttplanMode(mode string) (attplan.Mode, error) {
 		return attplan.ModeStrictKMinus1, nil
 	case "greedy-lookahead":
 		return attplan.ModeGreedyLookahead, nil
+	case "first-seen":
+		return attplan.ModeFirstSeenGossip, nil
 	default:
 		return 0, fmt.Errorf("unsupported attestation source mode %q", mode)
 	}
@@ -1120,6 +1179,9 @@ func newS3Store(endpoint, bucket string, pathStyle bool) (s3cache.Store, error) 
 	if strings.TrimSpace(endpoint) == "" && strings.TrimSpace(bucket) == "" {
 		return nil, nil
 	}
+	if strings.TrimSpace(bucket) == "" {
+		return nil, nil
+	}
 	return s3cache.New(s3cache.Config{
 		Endpoint:        endpoint,
 		Bucket:          bucket,
@@ -1127,6 +1189,67 @@ func newS3Store(endpoint, bucket string, pathStyle bool) (s3cache.Store, error) 
 		SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
 		PathStyle:       pathStyle,
 	})
+}
+
+func newFirstSeenS3Store(cfg config) (s3cache.Store, error) {
+	if !isS3URI(cfg.FirstSeenBasePath) {
+		return nil, nil
+	}
+	bucket, err := s3BucketFromURI(cfg.FirstSeenBasePath)
+	if err != nil {
+		return nil, err
+	}
+	return s3cache.New(s3cache.Config{
+		Endpoint:        cfg.S3Endpoint,
+		Bucket:          bucket,
+		AccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
+		SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+		PathStyle:       cfg.S3PathStyle,
+	})
+}
+
+func validateOptionalCacheS3Settings(endpoint, bucket string, endpointMayBeFirstSeenOnly bool) error {
+	endpoint = strings.TrimSpace(endpoint)
+	bucket = strings.TrimSpace(bucket)
+	if endpointMayBeFirstSeenOnly && endpoint != "" && bucket == "" {
+		return nil
+	}
+	return validateS3Settings(endpoint, bucket, false)
+}
+
+func validateFirstSeenS3Settings(endpoint string) error {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return fmt.Errorf("--s3-endpoint is required when --attestation-first-seen-base uses s3://")
+	}
+	if strings.TrimSpace(os.Getenv("AWS_ACCESS_KEY_ID")) == "" {
+		return fmt.Errorf("AWS_ACCESS_KEY_ID is required when --attestation-first-seen-base uses s3://")
+	}
+	if strings.TrimSpace(os.Getenv("AWS_SECRET_ACCESS_KEY")) == "" {
+		return fmt.Errorf("AWS_SECRET_ACCESS_KEY is required when --attestation-first-seen-base uses s3://")
+	}
+	return validateS3Endpoint(endpoint)
+}
+
+func isS3URI(value string) bool {
+	return strings.HasPrefix(strings.TrimSpace(value), "s3://")
+}
+
+func s3BucketFromURI(value string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return "", fmt.Errorf("--attestation-first-seen-base is not a valid S3 URI: %w", err)
+	}
+	if parsed.Scheme != "s3" {
+		return "", fmt.Errorf("--attestation-first-seen-base must use s3://")
+	}
+	if parsed.Host == "" {
+		return "", fmt.Errorf("--attestation-first-seen-base must include an S3 bucket")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("--attestation-first-seen-base must not include query or fragment")
+	}
+	return parsed.Host, nil
 }
 
 func validateS3Settings(endpoint, bucket string, required bool) error {

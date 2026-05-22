@@ -58,6 +58,10 @@ type RealBackendConfig struct {
 	// DecodedBlockCacheSize bounds decoded blockInfo caches. Zero disables
 	// decoded caching.
 	DecodedBlockCacheSize int
+
+	// FirstSeenSource serves first-seen gossip attestations for
+	// ModeFirstSeenGossip.
+	FirstSeenSource *FirstSeenAttestationSource
 }
 
 type realBackend struct {
@@ -174,8 +178,11 @@ func (b *realBackend) BuildPlan(from, to uint64) ([]PlanEntry, error) {
 	if (b.cfg.Mode == attplan.ModeNextNonMissed || b.cfg.Mode == attplan.ModeGreedyLookahead) && b.cfg.LookaheadCap < 1 {
 		return nil, fmt.Errorf("lookaheadCap must be >= 1 for mode %d", b.cfg.Mode)
 	}
-	if b.cfg.Mode != attplan.ModeNextNonMissed && b.cfg.Mode != attplan.ModeStrictKMinus1 && b.cfg.Mode != attplan.ModeGreedyLookahead {
+	if b.cfg.Mode != attplan.ModeNextNonMissed && b.cfg.Mode != attplan.ModeStrictKMinus1 && b.cfg.Mode != attplan.ModeGreedyLookahead && b.cfg.Mode != attplan.ModeFirstSeenGossip {
 		return nil, fmt.Errorf("unsupported attestation source mode %d", b.cfg.Mode)
+	}
+	if b.cfg.Mode == attplan.ModeFirstSeenGossip && b.cfg.FirstSeenSource == nil {
+		return nil, fmt.Errorf("first-seen attestation source is not configured")
 	}
 
 	loadStart := from
@@ -273,15 +280,21 @@ func (b *realBackend) BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstructio
 	if simSlot <= warmupStartSlot {
 		return SlotInstruction{}, fmt.Errorf("sim slot %d must be greater than warmup start slot %d", simSlot, warmupStartSlot)
 	}
-	if b.cfg.LookaheadCap < 1 {
+	if b.cfg.Mode != attplan.ModeFirstSeenGossip && b.cfg.LookaheadCap < 1 {
 		return SlotInstruction{}, fmt.Errorf("lookaheadCap must be >= 1 for slot instructions")
+	}
+	if b.cfg.Mode == attplan.ModeFirstSeenGossip && b.cfg.FirstSeenSource == nil {
+		return SlotInstruction{}, fmt.Errorf("first-seen attestation source is not configured")
 	}
 	minImportSlot, ok := checkedAdd(warmupStartSlot, 1)
 	if !ok {
 		return SlotInstruction{}, fmt.Errorf("warmup start slot %d cannot be incremented", warmupStartSlot)
 	}
 
-	loadEnd := saturatingAdd(simSlot, b.cfg.LookaheadCap)
+	loadEnd := simSlot
+	if b.cfg.Mode != attplan.ModeFirstSeenGossip {
+		loadEnd = saturatingAdd(simSlot, b.cfg.LookaheadCap)
+	}
 	if err := b.canonicalIndex.ensureRange(minImportSlot, loadEnd); err != nil {
 		return SlotInstruction{}, err
 	}
@@ -319,9 +332,17 @@ func (b *realBackend) BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstructio
 	}
 	instruction.ImportBlocks = append(instruction.ImportBlocks, slotOrphanImports...)
 
-	slotAttestations, err := state.attestationsMadeInWindow(simSlot, b.cfg.LookaheadCap)
-	if err != nil {
-		return SlotInstruction{}, err
+	var slotAttestations []attestationInfo
+	if b.cfg.Mode == attplan.ModeFirstSeenGossip {
+		slotAttestations, err = b.cfg.FirstSeenSource.AttestationsForSlot(simSlot, b.ConsensusVersionAtSlot)
+		if err != nil {
+			return SlotInstruction{}, err
+		}
+	} else {
+		slotAttestations, err = state.attestationsMadeInWindow(simSlot, b.cfg.LookaheadCap)
+		if err != nil {
+			return SlotInstruction{}, err
+		}
 	}
 	orphanImports, err := state.orphanImportsForSlotAttestations(slotAttestations, simSlot, minImportSlot)
 	if err != nil {
@@ -513,16 +534,29 @@ func (b *realBackend) warmArchiveCache(from, to uint64, acc *archiveWarmAccumula
 	}
 
 	roots := make(map[[32]byte]bool)
-	for _, info := range canonicalBySlot {
-		state.collectUnknownAttestationRoots(info, roots)
-	}
-	for slot := range state.orphanRootsBySlot {
-		infos, err := state.archiveOrphanInfosBySlot(slot)
-		if err != nil {
-			return err
+	if b.cfg.Mode == attplan.ModeFirstSeenGossip {
+		if b.cfg.FirstSeenSource == nil {
+			return fmt.Errorf("first-seen attestation source is not configured")
 		}
-		for _, info := range infos {
+		for simSlot := from; simSlot < to; simSlot++ {
+			attestations, err := b.cfg.FirstSeenSource.AttestationsForSlot(simSlot, b.ConsensusVersionAtSlot)
+			if err != nil {
+				return err
+			}
+			state.collectUnknownAttestationInfoRoots(attestations, roots)
+		}
+	} else {
+		for _, info := range canonicalBySlot {
 			state.collectUnknownAttestationRoots(info, roots)
+		}
+		for slot := range state.orphanRootsBySlot {
+			infos, err := state.archiveOrphanInfosBySlot(slot)
+			if err != nil {
+				return err
+			}
+			for _, info := range infos {
+				state.collectUnknownAttestationRoots(info, roots)
+			}
 		}
 	}
 
@@ -932,6 +966,8 @@ func planSourcesForSlot(blockExists map[uint64]bool, simSlot uint64, mode attpla
 			}
 		}
 		return sources
+	case attplan.ModeFirstSeenGossip:
+		return nil
 	default:
 		return nil
 	}
@@ -1240,7 +1276,11 @@ func (s *planBuildState) archiveOrphanImportsForSlot(slot, minImportSlot uint64)
 }
 
 func (s *planBuildState) collectUnknownAttestationRoots(info blockInfo, roots map[[32]byte]bool) {
-	for _, attestation := range info.Attestations {
+	s.collectUnknownAttestationInfoRoots(info.Attestations, roots)
+}
+
+func (s *planBuildState) collectUnknownAttestationInfoRoots(attestations []attestationInfo, roots map[[32]byte]bool) {
+	for _, attestation := range attestations {
 		for _, root := range [][32]byte{attestation.TargetRoot, attestation.BeaconBlockRoot} {
 			if isZeroRoot(root) || s.rootKnown(root) || s.scheduledRoots[root] || s.missingRoots[root] || s.ignoredRoots[root] {
 				continue

@@ -34,6 +34,8 @@ type Config struct {
 	Parallel              int    `json:"parallel"`
 	AttestationSourceMode string `json:"attestation_source_mode"`
 	LookaheadCap          uint64 `json:"lookahead_cap"`
+	FirstSeenBasePath     string `json:"attestation_first_seen_base,omitempty"`
+	FirstSeenDeadlineMS   uint64 `json:"attestation_first_seen_deadline_ms,omitempty"`
 	ByzantineThreshold    uint64 `json:"byzantine_threshold"`
 	BeaconNodeURL         string `json:"beacon_node_url"`
 	EraURL                string `json:"era_url"`

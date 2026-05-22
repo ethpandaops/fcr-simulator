@@ -24,6 +24,8 @@ Usage: $0 \
     [--output-dir DIR]            (default: ./results)
     [--attestation-source-mode M] (default: next-non-missed)
     [--lookahead-cap N]           (default: 4)
+    [--attestation-first-seen-base PATH_OR_S3]
+    [--attestation-first-seen-deadline-ms N] (default: 12000)
 USAGE
     exit 1
 }
@@ -38,6 +40,8 @@ ENGINE_BINARY="${FCR_ENGINE_BINARY:-}"
 ORCHESTRATOR="./results/fcr-orchestrator"
 ATT_MODE="next-non-missed"
 LOOKAHEAD_CAP=4
+FIRST_SEEN_BASE=""
+FIRST_SEEN_DEADLINE_MS=12000
 BLOCK_ARCHIVE_URL=""
 CSV_SCHEMA_HEADER="# fcr-simulator-csv-schema-version:4"
 
@@ -56,6 +60,8 @@ while [[ $# -gt 0 ]]; do
         --warmup-epochs) WARMUP_EPOCHS="$2"; shift 2 ;;
         --attestation-source-mode) ATT_MODE="$2"; shift 2 ;;
         --lookahead-cap) LOOKAHEAD_CAP="$2"; shift 2 ;;
+        --attestation-first-seen-base) FIRST_SEEN_BASE="$2"; shift 2 ;;
+        --attestation-first-seen-deadline-ms) FIRST_SEEN_DEADLINE_MS="$2"; shift 2 ;;
         --block-archive-url) BLOCK_ARCHIVE_URL="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; usage ;;
     esac
@@ -128,6 +134,9 @@ echo "Chunk size:       $CHUNK_SIZE epochs ($TOTAL_CHUNKS chunks)"
 echo "Workers/chunk:    $PARALLEL"
 echo "Warmup:           $WARMUP_EPOCHS epochs"
 echo "Source mode:      $ATT_MODE (cap=$LOOKAHEAD_CAP)"
+if [[ "$ATT_MODE" == "first-seen" ]]; then
+    echo "First-seen base:  $FIRST_SEEN_BASE (deadline=${FIRST_SEEN_DEADLINE_MS}ms)"
+fi
 echo "Cache:            $CACHE_DIR"
 echo "Output:           $OUTPUT_DIR"
 echo ""
@@ -155,6 +164,8 @@ run_orchestrator() {
         --output-format both \
         --attestation-source-mode "$ATT_MODE" \
         --lookahead-cap "$LOOKAHEAD_CAP" \
+        ${FIRST_SEEN_BASE:+--attestation-first-seen-base "$FIRST_SEEN_BASE"} \
+        --attestation-first-seen-deadline-ms "$FIRST_SEEN_DEADLINE_MS" \
         ${BLOCK_ARCHIVE_URL:+--block-archive-url "$BLOCK_ARCHIVE_URL"} \
         --cache-dir "$CACHE_DIR" \
         "$@"

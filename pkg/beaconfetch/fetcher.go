@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,6 +60,9 @@ func NewWithS3(beaconNodeURL, cacheDir, network string, s3Store s3cache.Store) (
 	}
 	if err := os.MkdirAll(filepath.Join(cacheDir, "blocks"), 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create blocks cache directory: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cacheDir, "committees"), 0o755); err != nil {
+		return nil, fmt.Errorf("failed to create committees cache directory: %w", err)
 	}
 
 	return &Fetcher{
@@ -170,6 +174,81 @@ func (f *Fetcher) CheckpointBlockRootAtSlot(slot uint64) ([32]byte, error) {
 	}
 
 	return root, nil
+}
+
+// BeaconCommittee is one beacon committee returned by the Beacon API.
+type BeaconCommittee struct {
+	Slot       uint64
+	Index      uint64
+	Validators []uint64
+}
+
+// FetchBeaconCommittees fetches /eth/v1/beacon/states/{epoch_start_slot}/committees?epoch={epoch}.
+// It returns every committee in the requested epoch and caches the raw JSON.
+func (f *Fetcher) FetchBeaconCommittees(epoch uint64) ([]BeaconCommittee, error) {
+	startSlot := epoch * slotsPerEpoch
+	cachePath := filepath.Join(f.cacheDir, "committees", fmt.Sprintf("committees-epoch-%d.json", epoch))
+	url := fmt.Sprintf("%s/eth/v1/beacon/states/%d/committees?epoch=%d", f.beaconNodeURL, startSlot, epoch)
+
+	var data []byte
+	var err error
+	if f.s3Store != nil {
+		data, err = f.cachedOrS3OrFetch(cachePath, beaconCommitteesObjectKey(f.network, epoch), url, acceptJSON)
+	} else {
+		data, err = f.cachedOrFetch(cachePath, url, acceptJSON)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	committees, err := parseBeaconCommittees(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode beacon committees for epoch %d: %w", epoch, err)
+	}
+	return committees, nil
+}
+
+func parseBeaconCommittees(data []byte) ([]BeaconCommittee, error) {
+	var response struct {
+		Data []struct {
+			Slot       string   `json:"slot"`
+			Index      string   `json:"index"`
+			Validators []string `json:"validators"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &response); err != nil {
+		return nil, err
+	}
+
+	committees := make([]BeaconCommittee, 0, len(response.Data))
+	for i, item := range response.Data {
+		slot, err := strconv.ParseUint(item.Slot, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("committee %d slot %q: %w", i, item.Slot, err)
+		}
+		index, err := strconv.ParseUint(item.Index, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("committee %d index %q: %w", i, item.Index, err)
+		}
+		if len(item.Validators) == 0 {
+			return nil, fmt.Errorf("committee %d at slot %d index %d has no validators", i, slot, index)
+		}
+
+		validators := make([]uint64, 0, len(item.Validators))
+		for j, value := range item.Validators {
+			validator, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("committee %d validator %d value %q: %w", i, j, value, err)
+			}
+			validators = append(validators, validator)
+		}
+		committees = append(committees, BeaconCommittee{
+			Slot:       slot,
+			Index:      index,
+			Validators: validators,
+		})
+	}
+	return committees, nil
 }
 
 const (
@@ -331,4 +410,8 @@ func checkpointStateObjectKey(network string, slot uint64) string {
 
 func checkpointGenesisStateObjectKey(network string) string {
 	return fmt.Sprintf("checkpoint-state/%s/genesis.ssz", network)
+}
+
+func beaconCommitteesObjectKey(network string, epoch uint64) string {
+	return fmt.Sprintf("beacon-committees/%s/epoch-%d.json", network, epoch)
 }

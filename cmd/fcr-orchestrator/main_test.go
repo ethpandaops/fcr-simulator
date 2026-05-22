@@ -55,6 +55,7 @@ func validConfig(engine string) *config {
 		Output:                "out.csv",
 		OutputFormat:          "csv",
 		AttestationSourceMode: "next-non-missed",
+		FirstSeenDeadlineMS:   defaultFirstSeenDeadlineMS,
 		LookaheadCap:          4,
 		HTTPListen:            "127.0.0.1:0",
 	}
@@ -332,6 +333,41 @@ func TestValidateConfig_RejectsS3WithoutCredentials(t *testing.T) {
 	err := validateConfig(cfg, true, true)
 	if err == nil || !strings.Contains(err.Error(), "AWS_ACCESS_KEY_ID") {
 		t.Fatalf("expected missing AWS_ACCESS_KEY_ID error, got %v", err)
+	}
+}
+
+func TestValidateConfig_AcceptsFirstSeenLocalBase(t *testing.T) {
+	cfg := validConfig("lighthouse")
+	cfg.AttestationSourceMode = "first-seen"
+	cfg.FirstSeenBasePath = "deploy/attestation-backfill/fixtures"
+
+	if err := validateConfig(cfg, true, true); err != nil {
+		t.Fatalf("validateConfig returned error: %v", err)
+	}
+}
+
+func TestValidateConfig_RejectsFirstSeenWithoutBase(t *testing.T) {
+	cfg := validConfig("lighthouse")
+	cfg.AttestationSourceMode = "first-seen"
+
+	err := validateConfig(cfg, true, true)
+	if err == nil || !strings.Contains(err.Error(), "--attestation-first-seen-base") {
+		t.Fatalf("expected missing first-seen base error, got %v", err)
+	}
+}
+
+func TestValidateConfig_AcceptsFirstSeenS3BaseWithoutCacheBucket(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "access")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+
+	cfg := validConfig("lighthouse")
+	cfg.AttestationSourceMode = "first-seen"
+	cfg.FirstSeenBasePath = "s3://fcr-simulator/attestation_first_seen"
+	cfg.S3Endpoint = "http://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:8080"
+	cfg.S3Bucket = ""
+
+	if err := validateConfig(cfg, true, true); err != nil {
+		t.Fatalf("validateConfig returned error: %v", err)
 	}
 }
 
