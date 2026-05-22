@@ -105,6 +105,20 @@ CSV starts with `# fcr-simulator-csv-schema-version:4` followed by the header ro
 
 A sidecar `<output>.manifest.json` captures engine manifest, run config, ERA file hashes, and output hashes for reproducibility.
 
+## Hosted results
+
+Full lighthouse FCR replay over mainnet (schema v4), hosted on `data.ethpandaops.io`. One contiguous run spanning **epochs 349000–449000** — ~14.6 months (2025-03-01 → 2026-05-20), 3.2M slots. Across the entire dataset `confirmed_non_canonical=0`: the rule never fast-confirmed a block that was later orphaned.
+
+| Epochs | Dates | Slots | Fast-confirmed | CSV |
+|---|---|---|---|---|
+| 349000–369000 | 2025-03-01 → 2025-05-29 | 640,000 | 91.4% | [csv](https://data.ethpandaops.io/fcr-simulator/lighthouse/mainnet/epochs-349000-369000.csv) |
+| 369000–389000 | 2025-05-29 → 2025-08-26 | 640,000 | 93.2% | [csv](https://data.ethpandaops.io/fcr-simulator/lighthouse/mainnet/epochs-369000-389000.csv) |
+| 389000–409000 | 2025-08-26 → 2025-11-23 | 640,000 | 92.8% | [csv](https://data.ethpandaops.io/fcr-simulator/lighthouse/mainnet/epochs-389000-409000.csv) |
+| 409000–429000 | 2025-11-23 → 2026-02-20 | 640,000 | 94.4% | [csv](https://data.ethpandaops.io/fcr-simulator/lighthouse/mainnet/epochs-409000-429000.csv) |
+| 429000–449000 | 2026-02-20 → 2026-05-20 | 640,000 | 96.2% | [csv](https://data.ethpandaops.io/fcr-simulator/lighthouse/mainnet/epochs-429000-449000.csv) |
+
+Each file is ~200 MB CSV with the `# fcr-simulator-csv-schema-version:4` header documented in [Output](#output). "Fast-confirmed" is the share of slots the rule confirmed within one slot (`fast_confirmed=true`); the rate rises toward recent epochs as post-Electra attestation consolidation shrinks per-slot aggregate counts.
+
 ## References
 
 - [Fast Confirmation Rule spec (consensus-specs#4747)](https://github.com/ethereum/consensus-specs/pull/4747)
