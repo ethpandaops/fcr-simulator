@@ -46,6 +46,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM eclipse-temurin:21-jdk-noble AS teku-builder
 
+ARG FCR_TEKU_COMMIT=c5825d53325cd67ab91b35cc544a7b660be317ff
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash \
       ca-certificates \
@@ -58,7 +60,15 @@ COPY . .
 RUN cd /tmp \
     && git config --file /root/.gitconfig url."https://github.com/".insteadOf "git@github.com:" \
     && git config --file /root/.gitconfig url."https://github.com/".insteadOf "ssh://git@github.com/"
-RUN if [ ! -f engines/teku/teku/settings.gradle ]; then \
+RUN if [ -f engines/teku/teku/settings.gradle ] \
+      && ! git -C engines/teku/teku rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+      rm -rf engines/teku/teku; \
+      mkdir -p engines/teku/teku; \
+      git -C engines/teku/teku init; \
+      git -C engines/teku/teku remote add origin https://github.com/Nashatyrev/teku.git; \
+      git -C engines/teku/teku fetch --depth 1 origin "${FCR_TEKU_COMMIT}"; \
+      git -C engines/teku/teku checkout --detach FETCH_HEAD; \
+    elif [ ! -f engines/teku/teku/settings.gradle ]; then \
       git submodule update --init --recursive engines/teku/teku; \
     fi
 RUN --mount=type=cache,target=/root/.gradle \

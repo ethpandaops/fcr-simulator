@@ -1,6 +1,6 @@
-From 37abfead8271630039c3d37d7dbe0c413d6e06a2 Mon Sep 17 00:00:00 2001
+From fe9de7b350bda8e1caf88e97004db3607ad5a44e Mon Sep 17 00:00:00 2001
 From: Codex <codex@example.invalid>
-Date: Thu, 21 May 2026 22:45:17 +1000
+Date: Fri, 22 May 2026 10:17:53 +1000
 Subject: [PATCH 1/2] fcr-simulator-engine: add Teku engine wrapper (FCR v2
  per-slot interface)
 
@@ -1140,7 +1140,7 @@ index 0000000000..289f1329fd
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java
 new file mode 100644
-index 0000000000..cb4852725e
+index 0000000000..6dc6280572
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java
 @@ -0,0 +1,75 @@
@@ -1192,7 +1192,7 @@ index 0000000000..cb4852725e
 +      Bytes aggregationBits, Optional<Bytes> committeeBits, AttestationData data) {
 +    public PlannedAttestation {
 +      Objects.requireNonNull(aggregationBits);
-+      committeeBits = Objects.requireNonNull(committeeBits);
++      Objects.requireNonNull(committeeBits);
 +      Objects.requireNonNull(data);
 +    }
 +  }
