@@ -21,8 +21,11 @@ import (
 const (
 	downloaderHTTPTimeout = 600 * time.Second
 	defaultMaxRetries     = 10
-	retryBackoffStepSec   = 5
-	retryBackoffMaxSec    = 30
+	// PreDownloadLookaheadSlots is the legacy right-side slot padding used by
+	// PreDownload and PreDownloadContext.
+	PreDownloadLookaheadSlots uint64 = 32
+	retryBackoffStepSec              = 5
+	retryBackoffMaxSec               = 30
 )
 
 var downloaderRetrySleep = time.Sleep
@@ -96,13 +99,24 @@ func (d *Downloader) PreDownloadContext(ctx context.Context, startSlot, endSlot 
 	if startSlot > endSlot {
 		return fmt.Errorf("start slot %d is after end slot %d", startSlot, endSlot)
 	}
+	return d.preDownloadSlotRangeContext(ctx, startSlot, saturatingAddSlot(endSlot, PreDownloadLookaheadSlots))
+}
+
+// PreDownloadSlotRangeContext fetches every era covering [startSlot, endSlot].
+func (d *Downloader) PreDownloadSlotRangeContext(ctx context.Context, startSlot, endSlot uint64) error {
+	return d.preDownloadSlotRangeContext(ctx, startSlot, endSlot)
+}
+
+func (d *Downloader) preDownloadSlotRangeContext(ctx context.Context, startSlot, endSlot uint64) error {
+	if d == nil {
+		return fmt.Errorf("nil ERA downloader")
+	}
+	if startSlot > endSlot {
+		return fmt.Errorf("start slot %d is after end slot %d", startSlot, endSlot)
+	}
 
 	startEra := EraNumberForSlot(startSlot)
-	endWithLookahead := endSlot + 32
-	if endSlot > math.MaxUint64-32 {
-		endWithLookahead = math.MaxUint64
-	}
-	endEra := EraNumberForSlot(endWithLookahead)
+	endEra := EraNumberForSlot(endSlot)
 
 	var needed []uint64
 	for eraNumber := startEra; ; eraNumber++ {
@@ -125,6 +139,13 @@ func (d *Downloader) PreDownloadContext(ctx context.Context, startSlot, endSlot 
 	}
 
 	return nil
+}
+
+func saturatingAddSlot(value, delta uint64) uint64 {
+	if delta > math.MaxUint64-value {
+		return math.MaxUint64
+	}
+	return value + delta
 }
 
 // CacheDir returns the actual directory ERA files are written to.

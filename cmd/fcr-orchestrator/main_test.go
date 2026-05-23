@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ethpandaops/fcr-simulator/pkg/era"
 	"github.com/ethpandaops/fcr-simulator/pkg/manifest"
 )
 
@@ -288,6 +289,42 @@ func clearOptionalS3Env(t *testing.T) {
 	t.Setenv("S3_BUCKET", "")
 	t.Setenv("AWS_ACCESS_KEY_ID", "")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+}
+
+func TestWarmArchiveEraDownloadEnvelopeIncludesActualWarmupBoundaryEra(t *testing.T) {
+	const (
+		plannedWarmupSlot = uint64(12574752)
+		actualWarmupSlot  = uint64(12574688)
+		lookaheadCap      = uint64(64)
+	)
+
+	naiveStartEra, naiveEndEra := eraRangeForExactSlotRange(plannedWarmupSlot, plannedWarmupSlot)
+	if naiveStartEra != 1536 || naiveEndEra != 1536 {
+		t.Fatalf("naive planned warmup era range=(%d,%d), want (1536,1536)", naiveStartEra, naiveEndEra)
+	}
+	if got := era.EraNumberForSlot(actualWarmupSlot); got != 1535 {
+		t.Fatalf("actual warmup slot era=%d, want 1535", got)
+	}
+
+	envelope, ok := warmArchiveEraDownloadEnvelope(
+		[]workerInfo{{ActualWarmupStartSlot: actualWarmupSlot}},
+		plannedWarmupSlot,
+		lookaheadCap,
+	)
+	if !ok {
+		t.Fatal("warmArchiveEraDownloadEnvelope ok=false, want true")
+	}
+	if wantEnd := plannedWarmupSlot + lookaheadCap; envelope.EndSlot != wantEnd {
+		t.Fatalf("corrected envelope end slot=%d, want %d", envelope.EndSlot, wantEnd)
+	}
+
+	correctedStartEra, correctedEndEra := eraRangeForExactSlotRange(envelope.StartSlot, envelope.EndSlot)
+	if correctedStartEra > 1535 || correctedEndEra < 1535 {
+		t.Fatalf("corrected era range=(%d,%d), want it to include era 1535", correctedStartEra, correctedEndEra)
+	}
+	if correctedEndEra < 1536 {
+		t.Fatalf("corrected era range=(%d,%d), want it to retain planned era 1536", correctedStartEra, correctedEndEra)
+	}
 }
 
 func TestValidateConfig_AcceptsAllSupportedEngines(t *testing.T) {

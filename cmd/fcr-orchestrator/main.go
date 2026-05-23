@@ -523,12 +523,14 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 		return 1, fmt.Errorf("no non-empty chunks generated")
 	}
 
-	fmt.Fprintf(stdout, "pre-downloading ERA files for slots %d through %d\n", minWarmupSlot(activeChunks), maxEndSlot(activeChunks))
+	initialEraStartSlot := minWarmupSlot(activeChunks)
+	initialEraEndSlot := maxEndSlot(activeChunks)
+	fmt.Fprintf(stdout, "pre-downloading ERA files for slots %d through %d\n", initialEraStartSlot, initialEraEndSlot)
 	downloader, err := era.NewDownloaderWithS3(cfg.EraURL, cfg.CacheDir, cfg.Network, s3Store)
 	if err != nil {
 		return 1, err
 	}
-	if err := downloader.PreDownloadContext(ctx, minWarmupSlot(activeChunks), maxEndSlot(activeChunks)); err != nil {
+	if err := downloader.PreDownloadContext(ctx, initialEraStartSlot, initialEraEndSlot); err != nil {
 		return 1, fmt.Errorf("pre-download ERA files: %w", err)
 	}
 
@@ -550,6 +552,13 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 	workerInfos, checkpointStates, checkpointBlocks, err := prepareWorkers(cfg, fetcher, chunks, stdout)
 	if err != nil {
 		return 1, err
+	}
+	initialEraEnvelope := eraSlotEnvelope{
+		StartSlot: initialEraStartSlot,
+		EndSlot:   saturatingSlotAdd(initialEraEndSlot, era.PreDownloadLookaheadSlots),
+	}
+	if err := preDownloadWarmArchiveCatchUpEras(ctx, cfg, downloader, workerInfos, initialEraEnvelope, initialEraEndSlot, stdout); err != nil {
+		return 1, fmt.Errorf("catch-up pre-download ERA files: %w", err)
 	}
 
 	fmt.Fprintln(stdout, "fetching genesis state")
@@ -725,6 +734,9 @@ func prepareWorkers(cfg config, fetcher *beaconfetch.Fetcher, chunks []chunk.Chu
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("worker %d checkpoint state: %w", c.Index, err)
 		}
+		if actualSlot != c.WarmupStartSlot {
+			fmt.Fprintf(stdout, "worker %d warmup slot adjusted: planned=%d actual=%d\n", c.Index, c.WarmupStartSlot, actualSlot)
+		}
 
 		root, err := fetcher.CheckpointBlockRootAtSlot(actualSlot)
 		if err != nil {
@@ -748,6 +760,59 @@ func prepareWorkers(cfg config, fetcher *beaconfetch.Fetcher, chunks []chunk.Chu
 	}
 
 	return infos, checkpointStates, checkpointBlocks, nil
+}
+
+type eraSlotEnvelope struct {
+	StartSlot uint64
+	EndSlot   uint64
+}
+
+func preDownloadWarmArchiveCatchUpEras(ctx context.Context, cfg config, downloader *era.Downloader, workerInfos []workerInfo, initialCovered eraSlotEnvelope, maxPlannedEndSlot uint64, stdout io.Writer) error {
+	envelope, ok := warmArchiveEraDownloadEnvelope(workerInfos, maxPlannedEndSlot, cfg.LookaheadCap)
+	if !ok || !slotEnvelopeExtendsBeyond(envelope, initialCovered) {
+		return nil
+	}
+
+	startEra, endEra := eraRangeForExactSlotRange(envelope.StartSlot, envelope.EndSlot)
+	fmt.Fprintf(stdout, "catching up ERA files for warm archive slots %d through %d (eras %d through %d)\n", envelope.StartSlot, envelope.EndSlot, startEra, endEra)
+	return downloader.PreDownloadSlotRangeContext(ctx, envelope.StartSlot, envelope.EndSlot)
+}
+
+func warmArchiveEraDownloadEnvelope(workerInfos []workerInfo, maxPlannedEndSlot, lookaheadCap uint64) (eraSlotEnvelope, bool) {
+	minActualWarmupSlot, ok := minActualWorkerWarmupSlot(workerInfos)
+	if !ok {
+		return eraSlotEnvelope{}, false
+	}
+	return eraSlotEnvelope{
+		StartSlot: oneEraGuardedStartSlot(minActualWarmupSlot),
+		EndSlot:   saturatingSlotAdd(maxPlannedEndSlot, lookaheadCap),
+	}, true
+}
+
+func minActualWorkerWarmupSlot(workerInfos []workerInfo) (uint64, bool) {
+	var min uint64
+	found := false
+	for _, info := range workerInfos {
+		if info.Skipped {
+			continue
+		}
+		if !found || info.ActualWarmupStartSlot < min {
+			min = info.ActualWarmupStartSlot
+			found = true
+		}
+	}
+	return min, found
+}
+
+func oneEraGuardedStartSlot(slot uint64) uint64 {
+	if slot <= era.SlotsPerEra {
+		return 0
+	}
+	return slot - era.SlotsPerEra
+}
+
+func slotEnvelopeExtendsBeyond(candidate, covered eraSlotEnvelope) bool {
+	return candidate.StartSlot < covered.StartSlot || candidate.EndSlot > covered.EndSlot
 }
 
 func newArchiveClient(cfg config) (*blockarchive.Client, error) {
@@ -1304,11 +1369,12 @@ func validateS3Endpoint(value string) error {
 }
 
 func eraRangeForSlots(startSlot, endSlot uint64) (uint64, uint64) {
-	endWithLookahead := endSlot + 32
-	if endSlot > math.MaxUint64-32 {
-		endWithLookahead = math.MaxUint64
-	}
+	endWithLookahead := saturatingSlotAdd(endSlot, era.PreDownloadLookaheadSlots)
 	return era.EraNumberForSlot(startSlot), era.EraNumberForSlot(endWithLookahead)
+}
+
+func eraRangeForExactSlotRange(startSlot, endSlot uint64) (uint64, uint64) {
+	return era.EraNumberForSlot(startSlot), era.EraNumberForSlot(endSlot)
 }
 
 func flagWasSet(fs *flag.FlagSet, name string) bool {
