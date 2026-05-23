@@ -393,14 +393,13 @@ func TestValidateConfig_RejectsFirstSeenWithoutBase(t *testing.T) {
 	}
 }
 
-func TestValidateConfig_RejectsFirstSeenNonLighthouse(t *testing.T) {
+func TestValidateConfig_AcceptsFirstSeenNonLighthouse(t *testing.T) {
 	cfg := validConfig("nimbus")
 	cfg.AttestationSourceMode = "xatu-first-seen-singles"
 	cfg.FirstSeenBasePath = "deploy/attestation-backfill/fixtures"
 
-	err := validateConfig(cfg, true, true)
-	if err == nil || !strings.Contains(err.Error(), "--engine lighthouse") {
-		t.Fatalf("expected first-seen lighthouse-only error, got %v", err)
+	if err := validateConfig(cfg, true, true); err != nil {
+		t.Fatalf("validateConfig returned error: %v", err)
 	}
 }
 

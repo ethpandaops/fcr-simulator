@@ -338,9 +338,6 @@ func validateConfig(cfg *config, startSet, endSet bool) error {
 		}
 	case "strict-source-block-k-minus-1":
 	case "xatu-first-seen-singles":
-		if cfg.Engine != "lighthouse" {
-			return fmt.Errorf("--attestation-source-mode xatu-first-seen-singles is currently supported only with --engine lighthouse")
-		}
 		if strings.TrimSpace(cfg.FirstSeenBasePath) == "" {
 			return fmt.Errorf("--attestation-first-seen-base is required for xatu-first-seen-singles mode")
 		}
@@ -544,7 +541,7 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 		return 1, err
 	}
 
-	firstSeenSource, err := newFirstSeenSource(cfg)
+	firstSeenSource, err := newFirstSeenSource(cfg, fetcher)
 	if err != nil {
 		return 1, err
 	}
@@ -826,7 +823,7 @@ func newArchiveClient(cfg config) (*blockarchive.Client, error) {
 	)
 }
 
-func newFirstSeenSource(cfg config) (*beaconapi.FirstSeenAttestationSource, error) {
+func newFirstSeenSource(cfg config, committeeProvider beaconapi.BeaconCommitteeProvider) (*beaconapi.FirstSeenAttestationSource, error) {
 	if cfg.AttestationSourceMode != "xatu-first-seen-singles" {
 		return nil, nil
 	}
@@ -836,11 +833,12 @@ func newFirstSeenSource(cfg config) (*beaconapi.FirstSeenAttestationSource, erro
 		return nil, err
 	}
 	return beaconapi.NewFirstSeenAttestationSource(beaconapi.FirstSeenAttestationSourceConfig{
-		BasePath:   cfg.FirstSeenBasePath,
-		Network:    cfg.Network,
-		DeadlineMS: cfg.FirstSeenDeadlineMS,
-		CacheDir:   cfg.CacheDir,
-		S3Store:    s3Store,
+		BasePath:          cfg.FirstSeenBasePath,
+		Network:           cfg.Network,
+		DeadlineMS:        cfg.FirstSeenDeadlineMS,
+		CacheDir:          cfg.CacheDir,
+		S3Store:           s3Store,
+		CommitteeProvider: committeeProvider,
 	})
 }
 

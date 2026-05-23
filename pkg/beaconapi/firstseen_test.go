@@ -5,11 +5,12 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/ethpandaops/fcr-simulator/pkg/beaconfetch"
 	"github.com/parquet-go/parquet-go"
 	"github.com/stretchr/testify/require"
 )
 
-func TestFirstSeenAttestationSourceGroupsRowsByVoteTuple(t *testing.T) {
+func TestFirstSeenAttestationSourceEncodesPreElectraStandardSingleAttestations(t *testing.T) {
 	base := writeFirstSeenFixture(t, "mainnet", 2, []firstSeenParquetRow{
 		firstSeenRow(64, 2, 10, "3", rootWithByte(0x11), 1000),
 		firstSeenRow(64, 2, 12, "not-a-committee", rootWithByte(0x11), 12000),
@@ -21,35 +22,77 @@ func TestFirstSeenAttestationSourceGroupsRowsByVoteTuple(t *testing.T) {
 		Network:    "mainnet",
 		DeadlineMS: 12000,
 		CacheDir:   t.TempDir(),
+		CommitteeProvider: stubCommitteeProvider{
+			committees: map[uint64][]beaconfetch.BeaconCommittee{
+				2: {
+					{Slot: 64, Index: 3, Validators: []uint64{9, 10, 12}},
+				},
+			},
+		},
 	})
 	require.NoError(t, err)
 
 	attestations, err := source.AttestationsForSlot(64, func(uint64) string { return "deneb" })
 	require.NoError(t, err)
-	require.Len(t, attestations, 2)
+	require.Len(t, attestations, 3)
 
-	require.Empty(t, attestations[0].AggregationBits)
+	require.Equal(t, "0x0a", attestations[0].AggregationBits)
 	require.Nil(t, attestations[0].CommitteeBits)
-	require.Equal(t, []uint64{10, 12}, attestations[0].AttestingIndices)
+	require.Empty(t, attestations[0].AttestingIndices)
 	require.Equal(t, uint64(64), attestations[0].Slot)
-	require.Equal(t, uint64(0), attestations[0].Index)
+	require.Equal(t, uint64(3), attestations[0].Index)
 	require.Equal(t, rootWithByte(0x11), attestations[0].BeaconBlockRoot)
 	require.Equal(t, uint64(1), attestations[0].SourceEpoch)
 	require.Equal(t, rootWithByte(0x01), attestations[0].SourceRoot)
 	require.Equal(t, uint64(2), attestations[0].TargetEpoch)
 	require.Equal(t, rootWithByte(0x02), attestations[0].TargetRoot)
 
-	require.Empty(t, attestations[1].AggregationBits)
+	require.Equal(t, "0x0a", attestations[1].AggregationBits)
 	require.Nil(t, attestations[1].CommitteeBits)
-	require.Equal(t, []uint64{10}, attestations[1].AttestingIndices)
-	require.Equal(t, uint64(0), attestations[1].Index)
+	require.Empty(t, attestations[1].AttestingIndices)
+	require.Equal(t, uint64(3), attestations[1].Index)
 	require.Equal(t, rootWithByte(0x22), attestations[1].BeaconBlockRoot)
+
+	require.Equal(t, "0x0c", attestations[2].AggregationBits)
+	require.Nil(t, attestations[2].CommitteeBits)
+	require.Empty(t, attestations[2].AttestingIndices)
+	require.Equal(t, uint64(3), attestations[2].Index)
+	require.Equal(t, rootWithByte(0x11), attestations[2].BeaconBlockRoot)
 
 	_, err = source.AttestationsForSlot(65, func(uint64) string { return "deneb" })
 	require.NoError(t, err)
 }
 
-func TestFirstSeenAttestationSourceDeduplicatesValidatorIndices(t *testing.T) {
+func TestFirstSeenAttestationSourceEncodesElectraStandardSingleAttestation(t *testing.T) {
+	base := writeFirstSeenFixture(t, "mainnet", 2, []firstSeenParquetRow{
+		firstSeenRow(64, 2, 101, "5", rootWithByte(0x11), 1000),
+	})
+	source, err := NewFirstSeenAttestationSource(FirstSeenAttestationSourceConfig{
+		BasePath:   base,
+		Network:    "mainnet",
+		DeadlineMS: 12000,
+		CacheDir:   t.TempDir(),
+		CommitteeProvider: stubCommitteeProvider{
+			committees: map[uint64][]beaconfetch.BeaconCommittee{
+				2: {
+					{Slot: 64, Index: 5, Validators: []uint64{100, 101, 102}},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	attestations, err := source.AttestationsForSlot(64, func(uint64) string { return "electra" })
+	require.NoError(t, err)
+	require.Len(t, attestations, 1)
+	require.Equal(t, uint64(0), attestations[0].Index)
+	require.Equal(t, "0x0a", attestations[0].AggregationBits)
+	require.NotNil(t, attestations[0].CommitteeBits)
+	require.Equal(t, "0x2000000000000000", *attestations[0].CommitteeBits)
+	require.Empty(t, attestations[0].AttestingIndices)
+}
+
+func TestFirstSeenAttestationSourceDeduplicatesExactValidatorVotesDeterministically(t *testing.T) {
 	base := writeFirstSeenFixture(t, "mainnet", 2, []firstSeenParquetRow{
 		firstSeenRow(64, 2, 10, "3", rootWithByte(0x11), 1000),
 		firstSeenRow(64, 2, 10, "3", rootWithByte(0x11), 1001),
@@ -60,13 +103,31 @@ func TestFirstSeenAttestationSourceDeduplicatesValidatorIndices(t *testing.T) {
 		Network:    "mainnet",
 		DeadlineMS: 12000,
 		CacheDir:   t.TempDir(),
+		CommitteeProvider: stubCommitteeProvider{
+			committees: map[uint64][]beaconfetch.BeaconCommittee{
+				2: {
+					{Slot: 64, Index: 3, Validators: []uint64{9, 10}},
+				},
+			},
+		},
 	})
 	require.NoError(t, err)
 
-	attestations, err := source.AttestationsForSlot(64, func(uint64) string { return "electra" })
+	attestations, err := source.AttestationsForSlot(64, func(uint64) string { return "deneb" })
 	require.NoError(t, err)
-	require.Len(t, attestations, 1)
-	require.Equal(t, []uint64{9, 10}, attestations[0].AttestingIndices)
+	require.Len(t, attestations, 2)
+	require.Equal(t, "0x05", attestations[0].AggregationBits)
+	require.Equal(t, rootWithByte(0x11), attestations[0].BeaconBlockRoot)
+	require.Equal(t, "0x06", attestations[1].AggregationBits)
+	require.Equal(t, rootWithByte(0x11), attestations[1].BeaconBlockRoot)
+}
+
+type stubCommitteeProvider struct {
+	committees map[uint64][]beaconfetch.BeaconCommittee
+}
+
+func (p stubCommitteeProvider) FetchBeaconCommittees(epoch uint64) ([]beaconfetch.BeaconCommittee, error) {
+	return p.committees[epoch], nil
 }
 
 func writeFirstSeenFixture(t *testing.T, network string, epoch uint64, rows []firstSeenParquetRow) string {
