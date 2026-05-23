@@ -541,7 +541,7 @@ func execute(ctx context.Context, cfg config, stdout io.Writer) (int, error) {
 		return 1, err
 	}
 
-	firstSeenSource, err := newFirstSeenSource(cfg, fetcher, stdout)
+	firstSeenSource, err := newFirstSeenSource(cfg)
 	if err != nil {
 		return 1, err
 	}
@@ -823,7 +823,7 @@ func newArchiveClient(cfg config) (*blockarchive.Client, error) {
 	)
 }
 
-func newFirstSeenSource(cfg config, committeeProvider beaconapi.BeaconCommitteeProvider, stdout io.Writer) (*beaconapi.FirstSeenAttestationSource, error) {
+func newFirstSeenSource(cfg config) (*beaconapi.FirstSeenAttestationSource, error) {
 	if cfg.AttestationSourceMode != "xatu-first-seen-singles" {
 		return nil, nil
 	}
@@ -833,13 +833,11 @@ func newFirstSeenSource(cfg config, committeeProvider beaconapi.BeaconCommitteeP
 		return nil, err
 	}
 	return beaconapi.NewFirstSeenAttestationSource(beaconapi.FirstSeenAttestationSourceConfig{
-		BasePath:          cfg.FirstSeenBasePath,
-		Network:           cfg.Network,
-		DeadlineMS:        cfg.FirstSeenDeadlineMS,
-		CacheDir:          cfg.CacheDir,
-		S3Store:           s3Store,
-		CommitteeProvider: committeeProvider,
-		LogWriter:         stdout,
+		BasePath:   cfg.FirstSeenBasePath,
+		Network:    cfg.Network,
+		DeadlineMS: cfg.FirstSeenDeadlineMS,
+		CacheDir:   cfg.CacheDir,
+		S3Store:    s3Store,
 	})
 }
 
