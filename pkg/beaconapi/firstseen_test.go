@@ -1,6 +1,7 @@
 package beaconapi
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -122,6 +123,68 @@ func TestFirstSeenAttestationSourceDeduplicatesExactValidatorVotesDeterministica
 	require.Equal(t, rootWithByte(0x11), attestations[1].BeaconBlockRoot)
 }
 
+func TestFirstSeenAttestationSourceDropsAndLogsLowRatePhantomRows(t *testing.T) {
+	rows := make([]firstSeenParquetRow, 0, 101)
+	validators := make([]uint64, 0, 100)
+	for i := 0; i < 100; i++ {
+		validator := uint32(1000 + i)
+		rows = append(rows, firstSeenRow(64, 2, validator, "3", rootWithByte(0x11), 1000))
+		validators = append(validators, uint64(validator))
+	}
+	rows = append(rows, firstSeenRow(64, 2, 9999, "3", rootWithByte(0x11), 1000))
+
+	base := writeFirstSeenFixture(t, "mainnet", 2, rows)
+	var logs bytes.Buffer
+	source, err := NewFirstSeenAttestationSource(FirstSeenAttestationSourceConfig{
+		BasePath:   base,
+		Network:    "mainnet",
+		DeadlineMS: 12000,
+		CacheDir:   t.TempDir(),
+		CommitteeProvider: stubCommitteeProvider{
+			committees: map[uint64][]beaconfetch.BeaconCommittee{
+				2: {
+					{Slot: 64, Index: 3, Validators: validators},
+				},
+			},
+		},
+		LogWriter: &logs,
+	})
+	require.NoError(t, err)
+
+	attestations, err := source.AttestationsForSlot(64, func(uint64) string { return "deneb" })
+	require.NoError(t, err)
+	require.Len(t, attestations, 100)
+	require.Equal(t, mustAggregationBits(t, 100, 0), attestations[0].AggregationBits)
+	require.Equal(t, mustAggregationBits(t, 100, 99), attestations[99].AggregationBits)
+	require.Contains(t, logs.String(), "first-seen: dropped 1/101 phantom rows (0.9901%) with no committee assignment for epoch 2")
+}
+
+func TestFirstSeenAttestationSourceRejectsHighRatePhantomRows(t *testing.T) {
+	base := writeFirstSeenFixture(t, "mainnet", 2, []firstSeenParquetRow{
+		firstSeenRow(64, 2, 10, "3", rootWithByte(0x11), 1000),
+		firstSeenRow(64, 2, 12, "3", rootWithByte(0x11), 1000),
+	})
+	source, err := NewFirstSeenAttestationSource(FirstSeenAttestationSourceConfig{
+		BasePath:   base,
+		Network:    "mainnet",
+		DeadlineMS: 12000,
+		CacheDir:   t.TempDir(),
+		CommitteeProvider: stubCommitteeProvider{
+			committees: map[uint64][]beaconfetch.BeaconCommittee{
+				2: {
+					{Slot: 64, Index: 3, Validators: []uint64{10}},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = source.AttestationsForSlot(64, func(uint64) string { return "deneb" })
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "phantom row fraction 50.0000% exceeds 1.0000% guardrail")
+	require.Contains(t, err.Error(), "1/2 rows have no committee assignment")
+}
+
 type stubCommitteeProvider struct {
 	committees map[uint64][]beaconfetch.BeaconCommittee
 }
@@ -163,4 +226,12 @@ func rootWithByte(value byte) [32]byte {
 	var root [32]byte
 	root[31] = value
 	return root
+}
+
+func mustAggregationBits(t *testing.T, committeeSize, position uint64) string {
+	t.Helper()
+
+	bits, err := singleValidatorAggregationBits(committeeSize, position)
+	require.NoError(t, err)
+	return bits
 }

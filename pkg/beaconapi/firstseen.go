@@ -25,6 +25,7 @@ import (
 const (
 	defaultFirstSeenEpochCacheSize = 64
 	mainnetSlotsPerEpoch           = uint64(32)
+	firstSeenPhantomRowsMaxRatio   = 0.01
 )
 
 type BeaconCommitteeProvider interface {
@@ -39,6 +40,7 @@ type FirstSeenAttestationSourceConfig struct {
 	S3Store           s3cache.Store
 	CommitteeProvider BeaconCommitteeProvider
 	EpochCacheSize    int
+	LogWriter         io.Writer
 }
 
 type FirstSeenAttestationSource struct {
@@ -48,6 +50,7 @@ type FirstSeenAttestationSource struct {
 	cacheDir          string
 	s3Store           s3cache.Store
 	committeeProvider BeaconCommitteeProvider
+	logWriter         io.Writer
 	cache             *lru.Cache[uint64, *firstSeenEpoch]
 
 	mu       sync.Mutex
@@ -145,6 +148,7 @@ func NewFirstSeenAttestationSource(cfg FirstSeenAttestationSourceConfig) (*First
 		cacheDir:          cfg.CacheDir,
 		s3Store:           cfg.S3Store,
 		committeeProvider: cfg.CommitteeProvider,
+		logWriter:         cfg.LogWriter,
 		cache:             cache,
 		inflight:          make(map[uint64]*firstSeenInflight),
 	}, nil
@@ -228,6 +232,8 @@ func (s *FirstSeenAttestationSource) loadEpoch(epoch uint64, forkAtSlot func(uin
 	}
 
 	votesByKey := make(map[firstSeenVoteKey]firstSeenVote)
+	var eligibleRows uint64
+	var phantomRows uint64
 	for _, row := range rows {
 		if uint64(row.RawSeenMS) > s.deadlineMS {
 			continue
@@ -236,10 +242,12 @@ func (s *FirstSeenAttestationSource) loadEpoch(epoch uint64, forkAtSlot func(uin
 			return nil, fmt.Errorf("first-seen row slot %d has epoch %d, expected %d", row.Slot, row.Epoch, epoch)
 		}
 
+		eligibleRows++
 		slot := uint64(row.Slot)
 		assignment, ok := firstSeenCommitteeAssignmentForValidator(assignments, slot, uint64(row.ValidatorIndex))
 		if !ok {
-			return nil, fmt.Errorf("first-seen row slot %d validator %d has no beacon committee assignment", row.Slot, row.ValidatorIndex)
+			phantomRows++
+			continue
 		}
 
 		beaconBlockRoot, err := parseFirstSeenRoot(row.BlockRoot)
@@ -273,6 +281,9 @@ func (s *FirstSeenAttestationSource) loadEpoch(epoch uint64, forkAtSlot func(uin
 			root:       syntheticFirstSeenAttestationRoot(voteKey, assignment),
 		}
 	}
+	if err := s.reportFirstSeenPhantomRows(epoch, phantomRows, eligibleRows); err != nil {
+		return nil, err
+	}
 
 	epochData := &firstSeenEpoch{slots: make(map[uint64][]attestationInfo)}
 	sortedVotes := make([]firstSeenVote, 0, len(votesByKey))
@@ -290,6 +301,37 @@ func (s *FirstSeenAttestationSource) loadEpoch(epoch uint64, forkAtSlot func(uin
 		epochData.slots[vote.key.vote.slot] = append(epochData.slots[vote.key.vote.slot], attestation)
 	}
 	return epochData, nil
+}
+
+func (s *FirstSeenAttestationSource) reportFirstSeenPhantomRows(epoch, dropped, total uint64) error {
+	if dropped == 0 || total == 0 {
+		return nil
+	}
+
+	ratio := float64(dropped) / float64(total)
+	percent := ratio * 100
+	if ratio > firstSeenPhantomRowsMaxRatio {
+		return fmt.Errorf(
+			"first-seen: phantom row fraction %.4f%% exceeds %.4f%% guardrail for epoch %d: %d/%d rows have no committee assignment",
+			percent,
+			firstSeenPhantomRowsMaxRatio*100,
+			epoch,
+			dropped,
+			total,
+		)
+	}
+
+	if s.logWriter != nil {
+		fmt.Fprintf(
+			s.logWriter,
+			"first-seen: dropped %d/%d phantom rows (%.4f%%) with no committee assignment for epoch %d\n",
+			dropped,
+			total,
+			percent,
+			epoch,
+		)
+	}
+	return nil
 }
 
 func firstSeenCommitteeAssignments(committees []beaconfetch.BeaconCommittee) (map[uint64]map[uint64]firstSeenCommitteeAssignment, error) {
