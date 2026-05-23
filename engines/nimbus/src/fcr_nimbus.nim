@@ -87,6 +87,7 @@ type
 
   DirectIndexedAttestation = object
     attestingIndices: seq[ValidatorIndex]
+    droppedPhantomIndices: uint64
     case kind: DirectIndexedAttestationKind
     of diakPhase0:
       phase0Attestation: phase0.IndexedAttestation
@@ -685,7 +686,7 @@ func planAttestationDataToNative(planned: PlanAttestationData): AttestationData 
     target: planCheckpointToNative(planned.target))
 
 proc buildDirectIndexedAttestation(planned: PlanAttestation,
-    data: AttestationData, fork: ConsensusFork):
+    data: AttestationData, fork: ConsensusFork, validatorRegistryLen: uint64):
     Result[DirectIndexedAttestation, string] =
   if planned.attestingIndices.isNone:
     return err("indexed attestation is missing attesting_indices")
@@ -696,8 +697,12 @@ proc buildDirectIndexedAttestation(planned: PlanAttestation,
   var
     deduped: seq[uint64]
     validatorIndices: seq[ValidatorIndex]
+    droppedPhantomIndices: uint64
   for rawIndex in rawIndices:
     if deduped.len > 0 and deduped[^1] == rawIndex:
+      continue
+    if rawIndex >= validatorRegistryLen:
+      inc droppedPhantomIndices
       continue
     let validatorIndex = ValidatorIndex.init(rawIndex)
     if validatorIndex.isErr:
@@ -719,6 +724,7 @@ proc buildDirectIndexedAttestation(planned: PlanAttestation,
     ok(DirectIndexedAttestation(
       kind: diakElectra,
       attestingIndices: validatorIndices,
+      droppedPhantomIndices: droppedPhantomIndices,
       electraAttestation: electra.IndexedAttestation(
         attesting_indices:
           List[uint64, Limit MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT].init(deduped),
@@ -727,6 +733,7 @@ proc buildDirectIndexedAttestation(planned: PlanAttestation,
     ok(DirectIndexedAttestation(
       kind: diakPhase0,
       attestingIndices: validatorIndices,
+      droppedPhantomIndices: droppedPhantomIndices,
       phase0Attestation: phase0.IndexedAttestation(
         attesting_indices:
           List[uint64, Limit MAX_VALIDATORS_PER_COMMITTEE].init(deduped),
@@ -771,6 +778,14 @@ proc logFailedAttestationInjection(self: Engine, simSlot: Slot,
     " finalized_epoch " & $finalized.epoch.uint64 &
     " finalized_root 0x" & finalized.root.data.toHex()
 
+proc logDroppedPhantomAttestingIndices(simSlot: Slot, data: AttestationData,
+    droppedPhantomIndices, validatorRegistryLen: uint64) =
+  stderr.writeLine "[fcr-nimbus] dropped phantom attesting_indices " &
+    "sim_slot " & $simSlot.uint64 &
+    " attestation_slot " & $data.slot.uint64 &
+    " count " & $droppedPhantomIndices &
+    " validator_registry_len " & $validatorRegistryLen
+
 proc injectForkChoiceAttestation(self: Engine, simSlot: Slot,
     data: AttestationData, attestingIndices: seq[ValidatorIndex]):
     bool =
@@ -812,9 +827,16 @@ proc injectAttestations(self: Engine, simSlot: Slot,
     var cache = StateCache()
     let fork = self.spec.consensusForkAtEpoch(planned.data.slot.epoch)
     if planned.attestingIndices.isSome:
-      let indexed = buildDirectIndexedAttestation(planned, data, fork)
+      let validatorRegistryLen = withState(self.dag.headState):
+        forkyState.data.validators.len.uint64
+      let indexed = buildDirectIndexedAttestation(
+        planned, data, fork, validatorRegistryLen)
       if indexed.isErr:
         return err(indexed.error)
+      if indexed.value.droppedPhantomIndices > 0:
+        logDroppedPhantomAttestingIndices(
+          simSlot, data, indexed.value.droppedPhantomIndices,
+          validatorRegistryLen)
       if indexed.value.attestingIndices.len == 0:
         continue
       if self.injectForkChoiceAttestation(
