@@ -1,35 +1,3 @@
-From fe9de7b350bda8e1caf88e97004db3607ad5a44e Mon Sep 17 00:00:00 2001
-From: Codex <codex@example.invalid>
-Date: Fri, 22 May 2026 10:17:53 +1000
-Subject: [PATCH 1/2] fcr-simulator-engine: add Teku engine wrapper (FCR v2
- per-slot interface)
-
----
- fcr-simulator-engine/build.gradle             |  69 +++
- .../forkchoice/FcrForkChoiceAccess.java       |  59 ++
- .../forkchoice/fcr/Config.java                |  85 +++
- .../forkchoice/fcr/Engine.java                | 575 ++++++++++++++++++
- .../forkchoice/fcr/HttpClient.java            | 102 ++++
- .../statetransition/forkchoice/fcr/Main.java  | 111 ++++
- .../forkchoice/fcr/OutputWriter.java          |  65 ++
- .../forkchoice/fcr/SlotInstruction.java       |  75 +++
- .../fcr/SlotInstructionFetcher.java           | 171 ++++++
- .../forkchoice/fcr/SlotResult.java            |  55 ++
- .../src/main/resources/log4j2-fcr.xml         |  13 +
- settings.gradle                               |   1 +
- 12 files changed, 1381 insertions(+)
- create mode 100644 fcr-simulator-engine/build.gradle
- create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
- create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Config.java
- create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
- create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java
- create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java
- create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java
- create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java
- create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstructionFetcher.java
- create mode 100644 fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotResult.java
- create mode 100644 fcr-simulator-engine/src/main/resources/log4j2-fcr.xml
-
 diff --git a/fcr-simulator-engine/build.gradle b/fcr-simulator-engine/build.gradle
 new file mode 100644
 index 0000000000..a7c3af304e
@@ -263,10 +231,10 @@ index 0000000000..1fa59249d3
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
 new file mode 100644
-index 0000000000..62bbdc7255
+index 0000000000..bdf597f7e7
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
-@@ -0,0 +1,575 @@
+@@ -0,0 +1,630 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -309,6 +277,7 @@ index 0000000000..62bbdc7255
 +import tech.pegasys.teku.spec.datastructures.operations.AttestationData;
 +import tech.pegasys.teku.spec.datastructures.operations.AttestationSchema;
 +import tech.pegasys.teku.spec.datastructures.operations.IndexedAttestation;
++import tech.pegasys.teku.spec.datastructures.operations.IndexedAttestationSchema;
 +import tech.pegasys.teku.spec.datastructures.state.AnchorPoint;
 +import tech.pegasys.teku.spec.datastructures.state.Checkpoint;
 +import tech.pegasys.teku.spec.datastructures.state.beaconstate.BeaconState;
@@ -683,16 +652,24 @@ index 0000000000..62bbdc7255
 +      return 0;
 +    }
 +
-+    final Bytes32 headRoot = recentChainData.getChainHead().orElseThrow().getRoot();
-+    final BeaconState headState = recentChainData.retrieveBlockState(headRoot).join().orElseThrow();
++    final boolean hasWireAttestations =
++        attestations.stream()
++            .anyMatch(plannedAttestation -> plannedAttestation.attestingIndices().isEmpty());
++    final Optional<BeaconState> headState =
++        hasWireAttestations ? Optional.of(getHeadState()) : Optional.empty();
 +    final List<ValidatableAttestation> validatableAttestations = new ArrayList<>();
 +    for (final SlotInstruction.PlannedAttestation plannedAttestation : attestations) {
-+      final Attestation attestation = buildAttestation(plannedAttestation);
 +      try {
++        final Attestation attestation =
++            plannedAttestation.attestingIndices().isPresent()
++                ? buildEmptyAttestation(plannedAttestation)
++                : buildAttestation(plannedAttestation);
 +        final IndexedAttestation indexedAttestation =
-+            spec.atSlot(plannedAttestation.data().slot())
-+                .getAttestationUtil()
-+                .getIndexedAttestation(headState, attestation);
++            plannedAttestation.attestingIndices().isPresent()
++                ? buildIndexedAttestation(plannedAttestation)
++                : spec.atSlot(plannedAttestation.data().slot())
++                    .getAttestationUtil()
++                    .getIndexedAttestation(headState.orElseThrow(), attestation);
 +        final ValidatableAttestation validatableAttestation =
 +            ValidatableAttestation.from(spec, attestation);
 +        validatableAttestation.setIndexedAttestation(indexedAttestation);
@@ -710,20 +687,25 @@ index 0000000000..62bbdc7255
 +            System.err.println("failed to apply indexed attestation: " + error.getMessage()));
 +  }
 +
++  private BeaconState getHeadState() {
++    final Bytes32 headRoot = recentChainData.getChainHead().orElseThrow().getRoot();
++    return recentChainData.retrieveBlockState(headRoot).join().orElseThrow();
++  }
++
 +  private Attestation buildAttestation(
 +      final SlotInstruction.PlannedAttestation plannedAttestation) {
 +    final SlotInstruction.AttestationData plannedData = plannedAttestation.data();
 +    final AttestationSchema<Attestation> schema =
 +        spec.atSlot(plannedData.slot()).getSchemaDefinitions().getAttestationSchema();
-+    final AttestationData data =
-+        new AttestationData(
-+            plannedData.slot(),
-+            plannedData.index(),
-+            plannedData.beaconBlockRoot(),
-+            checkpoint(plannedData.source()),
-+            checkpoint(plannedData.target()));
++    final AttestationData data = buildAttestationData(plannedAttestation);
 +    final SszBitlist aggregationBits =
-+        schema.getAggregationBitsSchema().fromBytes(plannedAttestation.aggregationBits());
++        schema
++            .getAggregationBitsSchema()
++            .fromBytes(
++                plannedAttestation
++                    .aggregationBits()
++                    .orElseThrow(
++                        () -> new IllegalStateException("attestation is missing aggregation_bits")));
 +    if (schema.requiresCommitteeBits()) {
 +      final SszBitvector committeeBits =
 +          schema
@@ -739,6 +721,47 @@ index 0000000000..62bbdc7255
 +      return schema.create(aggregationBits, data, BLSSignature.infinity(), () -> committeeBits);
 +    }
 +    return schema.create(aggregationBits, data, BLSSignature.infinity());
++  }
++
++  private IndexedAttestation buildIndexedAttestation(
++      final SlotInstruction.PlannedAttestation plannedAttestation) {
++    final AttestationData data = buildAttestationData(plannedAttestation);
++    final List<UInt64> attestingIndices =
++        plannedAttestation.attestingIndices().orElseThrow().stream()
++            .distinct()
++            .sorted()
++            .toList();
++    final IndexedAttestationSchema indexedAttestationSchema =
++        spec.atSlot(data.getSlot()).getSchemaDefinitions().getIndexedAttestationSchema();
++    return indexedAttestationSchema.create(
++        indexedAttestationSchema.getAttestingIndicesSchema().of(attestingIndices),
++        data,
++        BLSSignature.infinity());
++  }
++
++  private Attestation buildEmptyAttestation(
++      final SlotInstruction.PlannedAttestation plannedAttestation) {
++    final SlotInstruction.AttestationData plannedData = plannedAttestation.data();
++    final AttestationSchema<Attestation> schema =
++        spec.atSlot(plannedData.slot()).getSchemaDefinitions().getAttestationSchema();
++    final AttestationData data = buildAttestationData(plannedAttestation);
++    final SszBitlist aggregationBits = schema.getAggregationBitsSchema().empty();
++    if (schema.requiresCommitteeBits()) {
++      final SszBitvector committeeBits = schema.getCommitteeBitsSchema().orElseThrow().ofBits();
++      return schema.create(aggregationBits, data, BLSSignature.infinity(), () -> committeeBits);
++    }
++    return schema.create(aggregationBits, data, BLSSignature.infinity());
++  }
++
++  private AttestationData buildAttestationData(
++      final SlotInstruction.PlannedAttestation plannedAttestation) {
++    final SlotInstruction.AttestationData plannedData = plannedAttestation.data();
++    return new AttestationData(
++        plannedData.slot(),
++        plannedData.index(),
++        plannedData.beaconBlockRoot(),
++        checkpoint(plannedData.source()),
++        checkpoint(plannedData.target()));
 +  }
 +
 +  private static Checkpoint checkpoint(final SlotInstruction.Checkpoint checkpoint) {
@@ -1140,10 +1163,10 @@ index 0000000000..289f1329fd
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java
 new file mode 100644
-index 0000000000..6dc6280572
+index 0000000000..d2d9ef624d
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,80 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -1189,11 +1212,16 @@ index 0000000000..6dc6280572
 +  }
 +
 +  public record PlannedAttestation(
-+      Bytes aggregationBits, Optional<Bytes> committeeBits, AttestationData data) {
++      Optional<Bytes> aggregationBits,
++      Optional<Bytes> committeeBits,
++      AttestationData data,
++      Optional<List<UInt64>> attestingIndices) {
 +    public PlannedAttestation {
 +      Objects.requireNonNull(aggregationBits);
 +      Objects.requireNonNull(committeeBits);
 +      Objects.requireNonNull(data);
++      Objects.requireNonNull(attestingIndices);
++      attestingIndices = attestingIndices.map(List::copyOf);
 +    }
 +  }
 +
@@ -1221,10 +1249,10 @@ index 0000000000..6dc6280572
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstructionFetcher.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstructionFetcher.java
 new file mode 100644
-index 0000000000..1f856dcdab
+index 0000000000..23c652ab3d
 --- /dev/null
 +++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstructionFetcher.java
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,195 @@
 +/*
 + * Copyright Consensys Software Inc., 2025
 + *
@@ -1318,13 +1346,22 @@ index 0000000000..1f856dcdab
 +    }
 +    final List<SlotInstruction.PlannedAttestation> result = new ArrayList<>();
 +    for (final JsonNode attestation : attestations) {
++      final Optional<Bytes> aggregationBits =
++          parseOptionalBytes(
++              attestation.get("aggregation_bits"), "attestations[].aggregation_bits");
++      final Optional<List<UInt64>> attestingIndices =
++          parseOptionalUInt64List(
++              attestation.get("attesting_indices"), "attestations[].attesting_indices");
++      if (aggregationBits.isEmpty() && attestingIndices.isEmpty()) {
++        throw new IOException("attestation is missing aggregation_bits or attesting_indices");
++      }
 +      result.add(
 +          new SlotInstruction.PlannedAttestation(
-+              parseBytes(
-+                  required(attestation, "aggregation_bits"), "attestations[].aggregation_bits"),
++              aggregationBits,
 +              parseOptionalBytes(
 +                  attestation.get("committee_bits"), "attestations[].committee_bits"),
-+              parseAttestationData(required(attestation, "data"))));
++              parseAttestationData(required(attestation, "data")),
++              attestingIndices));
 +    }
 +    return result;
 +  }
@@ -1394,6 +1431,21 @@ index 0000000000..1f856dcdab
 +      return Optional.empty();
 +    }
 +    return Optional.of(parseBytes(node, name));
++  }
++
++  private static Optional<List<UInt64>> parseOptionalUInt64List(
++      final JsonNode node, final String name) throws IOException {
++    if (node == null || node.isNull()) {
++      return Optional.empty();
++    }
++    if (!node.isArray()) {
++      throw new IOException(name + " must be an array");
++    }
++    final List<UInt64> result = new ArrayList<>();
++    for (final JsonNode value : node) {
++      result.add(parseUInt64(value, name + "[]"));
++    }
++    return Optional.of(result);
 +  }
 +}
 diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotResult.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotResult.java
@@ -1485,6 +1537,3 @@ index 46f1a32cb5..47ac4d2ec9 100644
  include 'ethereum:performance-trackers'
  include 'services:zkchain'
 +include 'fcr-simulator-engine'
--- 
-2.50.1 (Apple Git-155)
-

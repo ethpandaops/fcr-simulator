@@ -197,8 +197,9 @@ interface PlanBlockImport {
 }
 
 interface PlanAttestation {
-  aggregationBits: Uint8Array;
+  aggregationBits: Uint8Array | null;
   committeeBits: Uint8Array | null;
+  attestingIndices: number[] | null;
   data: PlanAttestationData;
 }
 
@@ -234,8 +235,9 @@ interface PlanBlockImportWire {
 }
 
 interface PlanAttestationWire {
-  aggregation_bits: string;
+  aggregation_bits?: string | null;
   committee_bits?: string | null;
+  attesting_indices?: unknown;
   data: PlanAttestationDataWire;
 }
 
@@ -282,9 +284,19 @@ async function fetchSlotInstruction(baseUrl: string, simSlot: number, warmupStar
 }
 
 function parsePlanAttestation(attestation: PlanAttestationWire): PlanAttestation {
+  const attestingIndices = parseOptionalAttestingIndices(attestation.attesting_indices);
+  const aggregationBits = attestingIndices === null ? attestation.aggregation_bits : null;
+  if (aggregationBits == null && attestingIndices === null) {
+    throw new Error("attestation is missing aggregation_bits or attesting_indices");
+  }
+
   return {
-    aggregationBits: parseHexBytes(attestation.aggregation_bits),
-    committeeBits: attestation.committee_bits == null ? null : parseHexBytes(attestation.committee_bits),
+    aggregationBits: aggregationBits == null ? null : parseHexBytes(aggregationBits),
+    committeeBits:
+      attestingIndices === null && attestation.committee_bits != null
+        ? parseHexBytes(attestation.committee_bits)
+        : null,
+    attestingIndices,
     data: {
       slot: attestation.data.slot,
       index: attestation.data.index,
@@ -293,6 +305,21 @@ function parsePlanAttestation(attestation: PlanAttestationWire): PlanAttestation
       target: parsePlanCheckpoint(attestation.data.target),
     },
   };
+}
+
+function parseOptionalAttestingIndices(value: unknown): number[] | null {
+  if (value == null) return null;
+  if (!Array.isArray(value)) {
+    throw new Error("attesting_indices must be an array");
+  }
+  return value.map((validatorIndex, i) => parseValidatorIndex(validatorIndex, `attesting_indices[${i}]`));
+}
+
+function parseValidatorIndex(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`invalid validator index for ${name}: ${String(value)}`);
+  }
+  return value;
 }
 
 function parsePlanCheckpoint(checkpoint: PlanCheckpointWire): PlanCheckpoint {
@@ -1223,18 +1250,22 @@ function injectPlannedAttestations(
   for (const planned of attestations) {
     const fork = headState.config.getForkName(planned.data.slot);
     const forkSeq = headState.config.getForkSeq(planned.data.slot);
-    const attestation = buildPlannedAttestation(planned, forkSeq);
 
     let indexed: IndexedAttestation;
-    try {
-      indexed = headState.epochCtx.getIndexedAttestation(forkSeq, attestation);
-    } catch {
-      // Planned attestation's epoch shuffling not available in head state's epoch context
-      // (e.g. attestation references a far-future or far-past epoch). Skip and warn.
-      continue;
+    if (planned.attestingIndices !== null) {
+      indexed = buildDirectIndexedAttestation(planned);
+    } else {
+      const attestation = buildPlannedAttestation(planned, forkSeq);
+      try {
+        indexed = headState.epochCtx.getIndexedAttestation(forkSeq, attestation);
+      } catch {
+        // Planned attestation's epoch shuffling not available in head state's epoch context
+        // (e.g. attestation references a far-future or far-past epoch). Skip and warn.
+        continue;
+      }
     }
     if (indexed.attestingIndices.length === 0) continue;
-    const attDataRoot = toRootHex(sszTypesFor(fork).AttestationData.hashTreeRoot(attestation.data));
+    const attDataRoot = toRootHex(sszTypesFor(fork).AttestationData.hashTreeRoot(indexed.data));
     try {
       injectAttestationAtSlot(forkChoice, indexed, attDataRoot, injectSlot);
       injected++;
@@ -1245,8 +1276,47 @@ function injectPlannedAttestations(
   return injected;
 }
 
+function buildDirectIndexedAttestation(planned: PlanAttestation): IndexedAttestation {
+  if (planned.attestingIndices === null) {
+    throw new Error("indexed attestation is missing attesting_indices");
+  }
+
+  return {
+    attestingIndices: uniqueSorted(planned.attestingIndices),
+    data: buildPlannedAttestationData(planned),
+    signature: G2_POINT_AT_INFINITY,
+  };
+}
+
 function buildPlannedAttestation(planned: PlanAttestation, forkSeq: ForkSeq): Attestation {
-  const data = {
+  const aggregationBits = planned.aggregationBits;
+  if (aggregationBits === null) {
+    throw new Error("attestation is missing aggregation_bits");
+  }
+
+  const data = buildPlannedAttestationData(planned);
+
+  if (forkSeq >= ForkSeq.electra) {
+    if (planned.committeeBits === null) {
+      throw new Error("electra attestation is missing committee_bits");
+    }
+    return {
+      aggregationBits: ssz.electra.AggregationBits.deserialize(aggregationBits),
+      data,
+      signature: G2_POINT_AT_INFINITY,
+      committeeBits: ssz.electra.CommitteeBits.deserialize(planned.committeeBits),
+    } as Attestation;
+  }
+
+  return {
+    aggregationBits: ssz.phase0.CommitteeBits.deserialize(aggregationBits),
+    data,
+    signature: G2_POINT_AT_INFINITY,
+  } as Attestation;
+}
+
+function buildPlannedAttestationData(planned: PlanAttestation): IndexedAttestation["data"] {
+  return {
     slot: planned.data.slot,
     index: planned.data.index,
     beaconBlockRoot: planned.data.beaconBlockRoot,
@@ -1259,27 +1329,13 @@ function buildPlannedAttestation(planned: PlanAttestation, forkSeq: ForkSeq): At
       root: planned.data.target.root,
     },
   };
-
-  if (forkSeq >= ForkSeq.electra) {
-    if (planned.committeeBits === null) {
-      throw new Error("electra attestation is missing committee_bits");
-    }
-    return {
-      aggregationBits: ssz.electra.AggregationBits.deserialize(planned.aggregationBits),
-      data,
-      signature: G2_POINT_AT_INFINITY,
-      committeeBits: ssz.electra.CommitteeBits.deserialize(planned.committeeBits),
-    } as Attestation;
-  }
-
-  return {
-    aggregationBits: ssz.phase0.CommitteeBits.deserialize(planned.aggregationBits),
-    data,
-    signature: G2_POINT_AT_INFINITY,
-  } as Attestation;
 }
 
-type ForkChoiceWithInternals = ForkChoice & {
+function uniqueSorted(values: number[]): number[] {
+  return Array.from(new Set(values)).sort((a, b) => a - b);
+}
+
+type ForkChoiceWithInternals = {
   fcStore: {
     currentSlot: number;
     equivocatingIndices: Set<number>;
@@ -1315,7 +1371,7 @@ function injectAttestationAtSlot(
   const blockRootHex = toRootHex(indexed.data.beaconBlockRoot);
   if (isZeroRoot(blockRootHex)) return;
 
-  const internal = forkChoice as ForkChoiceWithInternals;
+  const internal = forkChoice as unknown as ForkChoiceWithInternals;
   withForkChoiceCurrentSlot(forkChoice, injectSlot, () => {
     internal.validateOnAttestation(
       indexed,
@@ -1336,7 +1392,7 @@ function injectAttestationAtSlot(
 }
 
 function withForkChoiceCurrentSlot<T>(forkChoice: ForkChoice, slot: number, fn: () => T): T {
-  const internal = forkChoice as ForkChoiceWithInternals;
+  const internal = forkChoice as unknown as ForkChoiceWithInternals;
   const previousSlot = internal.fcStore.currentSlot;
   internal.fcStore.currentSlot = slot;
   try {

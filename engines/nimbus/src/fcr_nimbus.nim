@@ -6,7 +6,8 @@
 # into the final per-run CSV.
 
 import
-  std/[json, monotimes, options, os, parseopt, strformat, strutils, tables, times],
+  std/[algorithm, json, monotimes, options, os, parseopt, strformat, strutils,
+    tables, times],
   chronos,
   chronos/apps/http/httpclient,
   results,
@@ -75,9 +76,22 @@ type
     target: PlanCheckpoint
 
   PlanAttestation = object
-    aggregationBits: seq[byte]
+    aggregationBits: Option[seq[byte]]
     committeeBits: Option[seq[byte]]
+    attestingIndices: Option[seq[uint64]]
     data: PlanAttestationData
+
+  DirectIndexedAttestationKind = enum
+    diakPhase0
+    diakElectra
+
+  DirectIndexedAttestation = object
+    attestingIndices: seq[ValidatorIndex]
+    case kind: DirectIndexedAttestationKind
+    of diakPhase0:
+      phase0Attestation: phase0.IndexedAttestation
+    of diakElectra:
+      electraAttestation: electra.IndexedAttestation
 
   PlanBlockImport = object
     slot: Slot
@@ -227,6 +241,42 @@ proc parsePlanHexBytes(value, ctx: string): seq[byte] =
   except ValueError as e:
     raise newException(EngineError, ctx & ": invalid hex: " & e.msg)
 
+proc parseOptionalPlanHexBytes(node: JsonNode, field, ctx: string):
+    Option[seq[byte]] =
+  if not node.hasKey(field):
+    return none(seq[byte])
+  let child = node[field]
+  if child.kind == JNull:
+    return none(seq[byte])
+  if child.kind != JString:
+    raise newException(EngineError,
+      ctx & "." & field & " must be a string or null")
+  some(parsePlanHexBytes(child.getStr(), ctx & "." & field))
+
+proc parseOptionalAttestingIndices(node: JsonNode, ctx: string):
+    Option[seq[uint64]] =
+  if not node.hasKey("attesting_indices"):
+    return none(seq[uint64])
+  let child = node["attesting_indices"]
+  if child.kind == JNull:
+    return none(seq[uint64])
+  if child.kind != JArray:
+    raise newException(EngineError, ctx & ".attesting_indices must be an array")
+
+  var indices: seq[uint64]
+  var i = 0
+  for indexNode in child:
+    if indexNode.kind != JInt:
+      raise newException(EngineError,
+        &"{ctx}.attesting_indices[{i}] must be a non-negative integer")
+    let value = indexNode.getBiggestInt()
+    if value < 0:
+      raise newException(EngineError,
+        &"{ctx}.attesting_indices[{i}] must be non-negative")
+    indices.add(value.uint64)
+    inc i
+  some(indices)
+
 proc requireObject(node: JsonNode, ctx: string) =
   if node.isNil or node.kind != JObject:
     raise newException(EngineError, ctx & " must be an object")
@@ -283,20 +333,27 @@ proc parseAttestationData(node: JsonNode, ctx: string): PlanAttestationData =
 
 proc parsePlanAttestation(node: JsonNode, ctx: string): PlanAttestation =
   requireObject(node, ctx)
-  var committeeBits = none(seq[byte])
-  if node.hasKey("committee_bits"):
-    let committeeNode = node["committee_bits"]
-    if committeeNode.kind != JNull:
-      if committeeNode.kind != JString:
-        raise newException(EngineError,
-          ctx & ".committee_bits must be a string or null")
-      committeeBits = some(parsePlanHexBytes(
-        committeeNode.getStr(), ctx & ".committee_bits"))
+  let
+    attestingIndices = parseOptionalAttestingIndices(node, ctx)
+    aggregationBits =
+      if attestingIndices.isSome:
+        none(seq[byte])
+      else:
+        parseOptionalPlanHexBytes(node, "aggregation_bits", ctx)
+    committeeBits =
+      if attestingIndices.isSome:
+        none(seq[byte])
+      else:
+        parseOptionalPlanHexBytes(node, "committee_bits", ctx)
+
+  if aggregationBits.isNone and attestingIndices.isNone:
+    raise newException(EngineError,
+      ctx & " is missing aggregation_bits or attesting_indices")
+
   PlanAttestation(
-    aggregationBits: parsePlanHexBytes(
-      requireStringField(node, "aggregation_bits", ctx),
-      ctx & ".aggregation_bits"),
+    aggregationBits: aggregationBits,
     committeeBits: committeeBits,
+    attestingIndices: attestingIndices,
     data: parseAttestationData(requireField(node, "data", ctx), ctx & ".data"))
 
 proc parsePlanBlockImport(node: JsonNode, ctx: string): PlanBlockImport =
@@ -627,6 +684,54 @@ func planAttestationDataToNative(planned: PlanAttestationData): AttestationData 
     source: planCheckpointToNative(planned.source),
     target: planCheckpointToNative(planned.target))
 
+proc buildDirectIndexedAttestation(planned: PlanAttestation,
+    data: AttestationData, fork: ConsensusFork):
+    Result[DirectIndexedAttestation, string] =
+  if planned.attestingIndices.isNone:
+    return err("indexed attestation is missing attesting_indices")
+
+  var rawIndices = planned.attestingIndices.get
+  rawIndices.sort()
+
+  var
+    deduped: seq[uint64]
+    validatorIndices: seq[ValidatorIndex]
+  for rawIndex in rawIndices:
+    if deduped.len > 0 and deduped[^1] == rawIndex:
+      continue
+    let validatorIndex = ValidatorIndex.init(rawIndex)
+    if validatorIndex.isErr:
+      return err(
+        &"invalid attesting_indices: validator index {rawIndex} out of range")
+    deduped.add(rawIndex)
+    validatorIndices.add(validatorIndex.value)
+
+  let maxIndices =
+    if fork >= ConsensusFork.Electra:
+      MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT
+    else:
+      MAX_VALIDATORS_PER_COMMITTEE
+  if deduped.len.uint64 > maxIndices:
+    return err(
+      &"invalid attesting_indices: got {deduped.len} indices, max is {maxIndices}")
+
+  if fork >= ConsensusFork.Electra:
+    ok(DirectIndexedAttestation(
+      kind: diakElectra,
+      attestingIndices: validatorIndices,
+      electraAttestation: electra.IndexedAttestation(
+        attesting_indices:
+          List[uint64, Limit MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT].init(deduped),
+        data: data)))
+  else:
+    ok(DirectIndexedAttestation(
+      kind: diakPhase0,
+      attestingIndices: validatorIndices,
+      phase0Attestation: phase0.IndexedAttestation(
+        attesting_indices:
+          List[uint64, Limit MAX_VALIDATORS_PER_COMMITTEE].init(deduped),
+        data: data)))
+
 proc decodeBaseAggregationBits(bytes: seq[byte]):
     Result[CommitteeValidatorsBits, string] =
   try:
@@ -706,11 +811,23 @@ proc injectAttestations(self: Engine, simSlot: Slot,
     let data = planAttestationDataToNative(planned.data)
     var cache = StateCache()
     let fork = self.spec.consensusForkAtEpoch(planned.data.slot.epoch)
+    if planned.attestingIndices.isSome:
+      let indexed = buildDirectIndexedAttestation(planned, data, fork)
+      if indexed.isErr:
+        return err(indexed.error)
+      if indexed.value.attestingIndices.len == 0:
+        continue
+      if self.injectForkChoiceAttestation(
+          simSlot, data, indexed.value.attestingIndices):
+        inc injected
+      continue
+
     if fork >= ConsensusFork.Electra:
       if planned.committeeBits.isNone:
         return err("electra attestation is missing committee_bits")
 
-      let aggregationBits = decodeElectraAggregationBits(planned.aggregationBits)
+      let aggregationBits = decodeElectraAggregationBits(
+        planned.aggregationBits.get)
       if aggregationBits.isErr:
         return err(aggregationBits.error)
       let committeeBits = decodeElectraCommitteeBits(planned.committeeBits.get)
@@ -728,7 +845,7 @@ proc injectAttestations(self: Engine, simSlot: Slot,
       if self.injectForkChoiceAttestation(simSlot, data, attestingIndices):
         inc injected
     else:
-      let aggregationBits = decodeBaseAggregationBits(planned.aggregationBits)
+      let aggregationBits = decodeBaseAggregationBits(planned.aggregationBits.get)
       if aggregationBits.isErr:
         return err(aggregationBits.error)
 
