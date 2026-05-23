@@ -472,21 +472,21 @@ proc fetchSlotInstruction(session: HttpSessionRef, base: string,
 
 proc fetchCheckpointState(session: HttpSessionRef, base: string, slot: Slot,
     cfg: RuntimeConfig):
-    Future[ForkedHashedBeaconState] {.async: (raises: [CatchableError]).} =
+    Future[ref ForkedHashedBeaconState] {.async: (raises: [CatchableError]).} =
   let url = base & "/eth/v2/debug/beacon/states/" & $slot.uint64
   let (status, body) = await httpGet(session, url, acceptSsz = true)
   if status != 200:
     raise newException(EngineError, &"HTTP {status} from {url}")
-  readSszForkedHashedBeaconState(cfg, body)
+  newClone(readSszForkedHashedBeaconState(cfg, body))
 
 proc fetchGenesisState(session: HttpSessionRef, base: string,
     cfg: RuntimeConfig):
-    Future[ForkedHashedBeaconState] {.async: (raises: [CatchableError]).} =
+    Future[ref ForkedHashedBeaconState] {.async: (raises: [CatchableError]).} =
   let url = base & "/eth/v2/debug/beacon/states/genesis"
   let (status, body) = await httpGet(session, url, acceptSsz = true)
   if status != 200:
     raise newException(EngineError, &"HTTP {status} from {url}")
-  readSszForkedHashedBeaconState(cfg, body)
+  newClone(readSszForkedHashedBeaconState(cfg, body))
 
 # --------------------------------------------------------------------------------
 # Engine core
@@ -529,7 +529,7 @@ proc init(T: type Engine, cfg: EngineConfig): Future[T]
     await fetchGenesisState(eng.session, eng.base, eng.spec)
 
   let memDb = BeaconChainDB.new("", eng.spec, inMemory = true)
-  ChainDAGRef.preInit(memDb, checkpointState)
+  ChainDAGRef.preInit(memDb, checkpointState[])
 
   let validatorMonitor = newClone(ValidatorMonitor.init(eng.spec))
   eng.validatorMonitor = validatorMonitor
