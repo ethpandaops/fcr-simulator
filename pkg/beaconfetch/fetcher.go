@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,11 +22,25 @@ const (
 	httpTimeout              = 600 * time.Second
 	slotsPerEpoch            = uint64(32)
 	checkpointFallbackEpochs = uint64(4)
+	beaconFetchMaxAttempts   = uint32(8)
+	beaconFetchJitterMax     = 1 * time.Second
+	beaconFetchBackoffStep   = 5 * time.Second
+	beaconFetchBackoffMax    = 30 * time.Second
 )
 
 // ErrNotFound is returned when the beacon node returns 404 (slot missed,
 // state pruned, etc.).
 var ErrNotFound = errors.New("not found")
+
+var (
+	beaconFetchRetrySleep  = time.Sleep
+	beaconFetchRetryJitter = func(max time.Duration) time.Duration {
+		if max <= 0 {
+			return 0
+		}
+		return time.Duration(rand.Int63n(int64(max)))
+	}
+)
 
 // Fetcher pulls SSZ blobs from a real beacon node and caches them on disk.
 type Fetcher struct {
@@ -316,31 +331,90 @@ func (f *Fetcher) cachedOrS3OrFetch(cachePath, objectKey, url, accept string) ([
 }
 
 func (f *Fetcher) fetch(url, accept string) ([]byte, error) {
+	var lastErr error
+	for attempt := uint32(1); attempt <= beaconFetchMaxAttempts; attempt++ {
+		body, retry, err := f.tryFetch(url, accept)
+		if err == nil {
+			return body, nil
+		}
+		if !retry {
+			return nil, err
+		}
+
+		lastErr = err
+		if attempt < beaconFetchMaxAttempts {
+			beaconFetchRetrySleep(beaconFetchRetryDelay(attempt))
+		}
+	}
+
+	return nil, fmt.Errorf("failed to fetch %s after %d attempts: %w", url, beaconFetchMaxAttempts, lastErr)
+}
+
+func (f *Fetcher) tryFetch(url, accept string) ([]byte, bool, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build request for %s: %w", url, err)
+		return nil, false, fmt.Errorf("failed to build request for %s: %w", url, err)
 	}
 	req.Header.Set("Accept", accept)
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch %s: %w", url, err)
+		return nil, true, fmt.Errorf("failed to fetch %s: %w", url, err)
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, ErrNotFound
+		_ = resp.Body.Close()
+		return nil, false, ErrNotFound
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %s from %s", resp.Status, url)
+		_ = resp.Body.Close()
+		return nil, isRetryableBeaconFetchStatus(resp.StatusCode), beaconFetchHTTPError{
+			status:     resp.Status,
+			statusCode: resp.StatusCode,
+			url:        url,
+		}
 	}
 
 	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body from %s: %w", url, err)
+		return nil, true, fmt.Errorf("failed to read response body from %s: %w", url, err)
 	}
 
-	return body, nil
+	return body, false, nil
+}
+
+type beaconFetchHTTPError struct {
+	status     string
+	statusCode int
+	url        string
+}
+
+func (e beaconFetchHTTPError) Error() string {
+	return fmt.Sprintf("HTTP %s from %s", e.status, e.url)
+}
+
+func isRetryableBeaconFetchStatus(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests || (statusCode >= 500 && statusCode <= 599)
+}
+
+func beaconFetchRetryDelay(attempt uint32) time.Duration {
+	backoff := beaconFetchBackoffStep
+	for i := uint32(1); i < attempt; i++ {
+		backoff *= 2
+		if backoff >= beaconFetchBackoffMax {
+			backoff = beaconFetchBackoffMax
+			break
+		}
+	}
+	if backoff > beaconFetchBackoffMax {
+		backoff = beaconFetchBackoffMax
+	}
+	delay := backoff + beaconFetchRetryJitter(beaconFetchJitterMax)
+	if delay > beaconFetchBackoffMax {
+		return beaconFetchBackoffMax
+	}
+	return delay
 }
 
 func writeFileAtomic(path string, data []byte) error {

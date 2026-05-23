@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ethpandaops/fcr-simulator/pkg/s3cache"
 	"github.com/stretchr/testify/require"
@@ -335,6 +336,8 @@ func TestNewValidationAndCacheDirErrors(t *testing.T) {
 }
 
 func TestFetchHTTP500DoesNotWriteCache(t *testing.T) {
+	withBeaconFetchRetryHooks(t, func(time.Duration) {}, func(time.Duration) time.Duration { return 0 })
+
 	fetcher := newTestFetcher(t, t.TempDir(), func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/eth/v2/debug/beacon/states/12", r.URL.Path)
 		http.Error(w, "boom", http.StatusInternalServerError)
@@ -349,6 +352,8 @@ func TestFetchHTTP500DoesNotWriteCache(t *testing.T) {
 }
 
 func TestCheckpointBlockRootAtSlot_InvalidResponses(t *testing.T) {
+	withBeaconFetchRetryHooks(t, func(time.Duration) {}, func(time.Duration) time.Duration { return 0 })
+
 	tests := []struct {
 		name    string
 		handler http.HandlerFunc
@@ -387,6 +392,63 @@ func TestCheckpointBlockRootAtSlot_InvalidResponses(t *testing.T) {
 	}
 }
 
+func TestFetchBeaconCommittees_RetriesHTTP524ThenSucceeds(t *testing.T) {
+	var sleeps []time.Duration
+	withBeaconFetchRetryHooks(t, func(delay time.Duration) {
+		sleeps = append(sleeps, delay)
+	}, func(time.Duration) time.Duration { return 0 })
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		require.Equal(t, "/eth/v1/beacon/states/224/committees", r.URL.Path)
+		require.Equal(t, "7", r.URL.Query().Get("epoch"))
+		require.Equal(t, acceptJSON, r.Header.Get("Accept"))
+		if call <= 3 {
+			http.Error(w, "timeout", 524)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"slot":"224","index":"3","validators":["1","2"]}]}`))
+	}))
+	defer server.Close()
+
+	fetcher, err := New(server.URL, t.TempDir())
+	require.NoError(t, err)
+
+	committees, err := fetcher.FetchBeaconCommittees(7)
+	require.NoError(t, err)
+	require.Equal(t, []BeaconCommittee{{
+		Slot:       224,
+		Index:      3,
+		Validators: []uint64{1, 2},
+	}}, committees)
+	require.EqualValues(t, 4, calls.Load())
+	require.Equal(t, []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second}, sleeps)
+	require.Equal(t, []byte(`{"data":[{"slot":"224","index":"3","validators":["1","2"]}]}`), readCacheFile(t, fetcher.cacheDir, "committees", "committees-epoch-7.json"))
+}
+
+func TestFetchBeaconCommittees_404DoesNotRetry(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		require.Equal(t, "/eth/v1/beacon/states/224/committees", r.URL.Path)
+		require.Equal(t, "7", r.URL.Query().Get("epoch"))
+		require.Equal(t, acceptJSON, r.Header.Get("Accept"))
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	fetcher, err := New(server.URL, t.TempDir())
+	require.NoError(t, err)
+
+	committees, err := fetcher.FetchBeaconCommittees(7)
+	require.Nil(t, committees)
+	require.ErrorIs(t, err, ErrNotFound)
+	require.EqualValues(t, 1, calls.Load())
+}
+
 func TestWriteFileAtomicParentError(t *testing.T) {
 	parentFile := filepath.Join(t.TempDir(), "parent-file")
 	require.NoError(t, os.WriteFile(parentFile, []byte("file"), 0o644))
@@ -401,6 +463,19 @@ func newTestFetcher(t *testing.T, cacheDir string, handler http.HandlerFunc) *Fe
 	fetcher := mustNewFetcher(t, "http://beacon.example", cacheDir)
 	attachTestTransport(fetcher, handler)
 	return fetcher
+}
+
+func withBeaconFetchRetryHooks(t *testing.T, sleep func(time.Duration), jitter func(time.Duration) time.Duration) {
+	t.Helper()
+
+	oldSleep := beaconFetchRetrySleep
+	oldJitter := beaconFetchRetryJitter
+	beaconFetchRetrySleep = sleep
+	beaconFetchRetryJitter = jitter
+	t.Cleanup(func() {
+		beaconFetchRetrySleep = oldSleep
+		beaconFetchRetryJitter = oldJitter
+	})
 }
 
 func newTestFetcherWithS3(t *testing.T, cacheDir, network string, store s3cache.Store, handler http.HandlerFunc) *Fetcher {
