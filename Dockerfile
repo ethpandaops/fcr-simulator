@@ -107,7 +107,7 @@ RUN --mount=type=cache,target=/pnpm/store \
 
 FROM debian:bookworm AS nimbus-builder
 
-ARG FCR_NIMBUS_COMMIT=da4d690277aef13adb96015e5adfda94e2ba8251
+ARG FCR_NIMBUS_COMMIT=74bbe31d43884a47d4eb2952afb73250cfd70336
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash \
