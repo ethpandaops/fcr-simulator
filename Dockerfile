@@ -107,7 +107,7 @@ RUN --mount=type=cache,target=/pnpm/store \
 
 FROM debian:bookworm AS nimbus-builder
 
-ARG FCR_NIMBUS_COMMIT=6fb05f36804d53c2e8e014cfeeea8ad7996a5efe
+ARG FCR_NIMBUS_COMMIT=da4d690277aef13adb96015e5adfda94e2ba8251
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash \
@@ -131,7 +131,7 @@ RUN if [ -f engines/nimbus/nimbus-eth2/Makefile ] \
       rm -rf engines/nimbus/nimbus-eth2; \
       mkdir -p engines/nimbus/nimbus-eth2; \
       git -C engines/nimbus/nimbus-eth2 init; \
-      git -C engines/nimbus/nimbus-eth2 remote add origin https://github.com/status-im/nimbus-eth2.git; \
+      git -C engines/nimbus/nimbus-eth2 remote add origin https://github.com/samcm/nimbus-eth2.git; \
       git -C engines/nimbus/nimbus-eth2 fetch --depth 1 origin "${FCR_NIMBUS_COMMIT}"; \
       git -C engines/nimbus/nimbus-eth2 checkout --detach FETCH_HEAD; \
     elif [ ! -f engines/nimbus/nimbus-eth2/Makefile ]; then \
