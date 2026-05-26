@@ -10,9 +10,9 @@ All engines live under `engines/<name>/`. Each has a `build.sh` that produces `r
 |---|---|
 | lighthouse | submodule `engines/lighthouse/lighthouse` (samcm/lighthouse `fcr-simulator`) |
 | teku       | submodule `engines/teku/teku` (Nashatyrev/teku `confirmation-2`) |
-| nimbus     | submodule `engines/nimbus/nimbus-eth2` (status-im/nimbus-eth2 `unstable`) |
-| lodestar   | submodule `engines/lodestar/lodestar` (ChainSafe/lodestar PR #8837) |
-| grandine   | upstream `bomanaps/grandine` PR #656 via `engines/grandine/grandine-engine.patch` |
+| nimbus     | submodule `engines/nimbus/nimbus-eth2` (samcm/nimbus-eth2 `fcr-frozen-anchor-fix`) |
+| lodestar   | submodule `engines/lodestar/lodestar` (nazarhussain/lodestar) |
+| grandine   | upstream `grandinetech/grandine` PR #656 via `engines/grandine/grandine-engine.patch` |
 
 Prysm is deferred: PR #15164 implements an older spec (`adiasg/eth2.0-specs:3e3ef28`), not [consensus-specs#4747](https://github.com/ethereum/consensus-specs/pull/4747). Shipping a binary against the older algorithm would contaminate cross-engine comparison. Revisit once the upstream PR rebases.
 
@@ -43,7 +43,7 @@ The orchestrator owns which block sources attestations for each sim slot:
 - **`next-non-missed`** (default): for sim slot N, the first non-missed block in `N+1..N+lookahead-cap`. `--lookahead-cap=4` reproduces today's Lighthouse behavior; `--lookahead-cap=32` covers the spec's full inclusion range.
 - **`strict-source-block-k-minus-1`**: source is exactly `N+1` if it exists, else nothing.
 - **`greedy-lookahead`**: consumes every non-missed block in `N+1..N+lookahead-cap`, bounded to attestations for the FCR evaluation slot.
-- **`first-seen`**: serves pre-computed per-validator first-seen gossip votes from parquet instead of sourcing attestations from blocks. The orchestrator groups rows by vote tuple, filters by `raw_seen_ms <= --attestation-first-seen-deadline-ms` (default `12000`), and sends attestation data plus `attesting_indices` directly to the Lighthouse engine. Use `--attestation-first-seen-base` as either a local base path or `s3://bucket/prefix`; files are expected below `network=<network>/source=raw/epoch=<epoch>/data.parquet`.
+- **`xatu-first-seen-singles`**: serves per-validator first-seen gossip votes from parquet instead of sourcing attestations from blocks. The orchestrator filters by `raw_seen_ms <= --attestation-first-seen-deadline-ms` (default `12000`) and sends committee-free `attesting_indices` to the engine for direct fork-choice injection. All 5 engines implement this injection path. Use `--attestation-first-seen-base` as either a local base path or `s3://bucket/prefix`; files are expected below `network=<network>/source=raw/epoch=<epoch>/data.parquet`. `--lookahead-cap` is inert in this mode.
 
 ## Build
 
@@ -78,7 +78,7 @@ The orchestrator auto-runs `engines/<engine>/build.sh` if the corresponding bina
   --cache-dir ~/.cache/fcr-simulator
 ```
 
-First-seen fixture run:
+xatu-first-seen-singles fixture run:
 
 ```bash
 ./results/fcr-orchestrator \
@@ -87,7 +87,7 @@ First-seen fixture run:
   --beacon-node-url "$BEACON_NODE_URL" \
   --start-epoch 349000 --end-epoch 349015 \
   --warmup-epochs 0 --parallel 1 \
-  --attestation-source-mode first-seen \
+  --attestation-source-mode xatu-first-seen-singles \
   --attestation-first-seen-base deploy/attestation-backfill/fixtures \
   --attestation-first-seen-deadline-ms 12000 \
   --output deploy/firstseen-test/results.csv --output-format both \
@@ -123,19 +123,11 @@ CSV starts with `# fcr-simulator-csv-schema-version:4` followed by the header ro
 
 A sidecar `<output>.manifest.json` captures engine manifest, run config, ERA file hashes, and output hashes for reproducibility.
 
-## Hosted results
+## Datasets
 
-Full lighthouse FCR replay over mainnet (schema v4), hosted on `data.ethpandaops.io`. One contiguous run spanning **epochs 349000–449000** — ~14.6 months (2025-03-01 → 2026-05-20), 3.2M slots. Across the entire dataset `confirmed_non_canonical=0`: the rule never fast-confirmed a block that was later orphaned.
+Cross-client FCR replays are published as GitHub releases. Latest: **[v0.2.0](https://github.com/ethpandaops/fcr-simulator/releases/tag/v0.2.0)** (12 months lighthouse + 4-5 months each of lodestar, grandine, nimbus, teku; schema v4). The release page has the by-month scoreboard and `METADATA.json` has per-CSV image SHAs and the full 24-column schema.
 
-| Epochs | Dates | Slots | Fast-confirmed | CSV |
-|---|---|---|---|---|
-| 349000–369000 | 2025-03-01 → 2025-05-29 | 640,000 | 91.4% | [csv](https://data.ethpandaops.io/fcr-simulator/lighthouse/mainnet/epochs-349000-369000.csv) |
-| 369000–389000 | 2025-05-29 → 2025-08-26 | 640,000 | 93.2% | [csv](https://data.ethpandaops.io/fcr-simulator/lighthouse/mainnet/epochs-369000-389000.csv) |
-| 389000–409000 | 2025-08-26 → 2025-11-23 | 640,000 | 92.8% | [csv](https://data.ethpandaops.io/fcr-simulator/lighthouse/mainnet/epochs-389000-409000.csv) |
-| 409000–429000 | 2025-11-23 → 2026-02-20 | 640,000 | 94.4% | [csv](https://data.ethpandaops.io/fcr-simulator/lighthouse/mainnet/epochs-409000-429000.csv) |
-| 429000–449000 | 2026-02-20 → 2026-05-20 | 640,000 | 96.2% | [csv](https://data.ethpandaops.io/fcr-simulator/lighthouse/mainnet/epochs-429000-449000.csv) |
-
-Each file is ~200 MB CSV with the `# fcr-simulator-csv-schema-version:4` header documented in [Output](#output). "Fast-confirmed" is the share of slots the rule confirmed within one slot (`fast_confirmed=true`); the rate rises toward recent epochs as post-Electra attestation consolidation shrinks per-slot aggregate counts.
+An older lighthouse-only run is mirrored at `data.ethpandaops.io/fcr-simulator/lighthouse/mainnet/epochs-<start>-<end>.csv` as five 640k-slot chunks covering epochs 349000 to 449000. Note this uses `greedy-lookahead` (block-sourced attestations with `lookahead_cap=8`), not `xatu-first-seen-singles`, so it's not directly comparable to v0.2.0.
 
 ## References
 
