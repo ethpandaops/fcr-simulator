@@ -3,8 +3,8 @@
 	url = https://github.com/nazarhussain/lodestar.git
 [submodule "engines/nimbus/nimbus-eth2"]
 	path = engines/nimbus/nimbus-eth2
-	url = https://github.com/status-im/nimbus-eth2.git
-	branch = stable
+	url = https://github.com/samcm/nimbus-eth2.git
+	branch = fcr-frozen-anchor-fix
 [submodule "engines/teku/teku"]
 	path = engines/teku/teku
 	url = https://github.com/Nashatyrev/teku.git
