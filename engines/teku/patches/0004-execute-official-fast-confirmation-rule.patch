@@ -1,0 +1,175 @@
+diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fastconfirmation/FastConfirmationSimulator.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fastconfirmation/FastConfirmationSimulator.java
+new file mode 100644
+--- /dev/null
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fastconfirmation/FastConfirmationSimulator.java
+@@ -0,0 +1,54 @@
++/*
++ * Copyright Consensys Software Inc., 2026
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
++ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations under the License.
++ */
++
++package tech.pegasys.teku.statetransition.forkchoice.fastconfirmation;
++
++import java.util.Optional;
++import org.apache.tuweni.bytes.Bytes32;
++import tech.pegasys.teku.infrastructure.unsigned.UInt64;
++import tech.pegasys.teku.spec.Spec;
++import tech.pegasys.teku.spec.datastructures.forkchoice.FastConfirmationStore;
++import tech.pegasys.teku.spec.datastructures.state.beaconstate.BeaconState;
++
++/** Public adapter allowing the simulator to execute the package-private fast confirmation rule. */
++public final class FastConfirmationSimulator {
++  private FastConfirmationSimulator() {}
++
++  public static FastConfirmationStore updateVariables(
++      final Spec spec,
++      final FastConfirmationStore store,
++      final UInt64 currentSlot,
++      final Bytes32 currentSlotHead) {
++    return FastConfirmationRuleUtil.updateFastConfirmationVariables(
++        store,
++        currentSlotHead,
++        FastConfirmationRuleUtil.getGreatestUnrealizedJustifiedCheckpoint(store.store()),
++        FastConfirmationRuleUtil.isStartSlotAtEpoch(spec, currentSlot),
++        FastConfirmationRuleUtil.isStartSlotAtEpoch(spec, currentSlot.plus(1)));
++  }
++
++  public static FastConfirmationStore evaluate(
++      final Spec spec,
++      final FastConfirmationStore updatedStore,
++      final UInt64 currentSlot,
++      final Optional<BeaconState> previousBalanceSource,
++      final BeaconState currentBalanceSource,
++      final BeaconState headBlockState) {
++    final FastConfirmationStates states =
++        new FastConfirmationStates(previousBalanceSource, currentBalanceSource, headBlockState);
++    final Bytes32 confirmedRoot =
++        new FastConfirmationCalculator(spec, updatedStore, states, currentSlot)
++            .getLatestConfirmed();
++    return updatedStore.withConfirmedRoot(confirmedRoot);
++  }
++}
+diff --git a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
+--- a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
+@@ -45,6 +45,7 @@
+ import tech.pegasys.teku.spec.datastructures.blocks.SignedBeaconBlock;
+ import tech.pegasys.teku.spec.datastructures.blocks.SignedBlockAndState;
+ import tech.pegasys.teku.spec.datastructures.execution.ExecutionPayloadContext;
++import tech.pegasys.teku.spec.datastructures.forkchoice.FastConfirmationStore;
+ import tech.pegasys.teku.spec.datastructures.forkchoice.ForkChoiceNode;
+ import tech.pegasys.teku.spec.datastructures.operations.Attestation;
+ import tech.pegasys.teku.spec.datastructures.operations.AttestationData;
+@@ -68,6 +69,8 @@
+ import tech.pegasys.teku.statetransition.forkchoice.MergeTransitionBlockValidator;
+ import tech.pegasys.teku.statetransition.forkchoice.PayloadValidationResult;
+ import tech.pegasys.teku.statetransition.forkchoice.TickProcessor;
++import tech.pegasys.teku.statetransition.forkchoice.fastconfirmation.FastConfirmationRuleUtil;
++import tech.pegasys.teku.statetransition.forkchoice.fastconfirmation.FastConfirmationSimulator;
+ import tech.pegasys.teku.statetransition.util.DebugDataDumper;
+ import tech.pegasys.teku.statetransition.validation.BlockBroadcastValidator;
+ import tech.pegasys.teku.storage.api.LateBlockReorgPreparationHandler;
+@@ -88,6 +91,7 @@
+   private final ExecutionLayerChannelStub executionLayer;
+   private final Map<UInt64, Optional<SignedBeaconBlock>> canonicalBlockCache;
+   private final OutputWriter outputWriter;
++  private FastConfirmationStore fastConfirmationStore;
+ 
+   private Engine(
+       final Config cfg,
+@@ -98,6 +102,7 @@
+       final StorageSystem storageSystem,
+       final ForkChoice forkChoice,
+       final ExecutionLayerChannelStub executionLayer,
++      final FastConfirmationStore fastConfirmationStore,
+       final OutputWriter outputWriter) {
+     this.cfg = cfg;
+     this.spec = spec;
+@@ -108,6 +113,7 @@
+     this.recentChainData = storageSystem.recentChainData();
+     this.forkChoice = forkChoice;
+     this.executionLayer = executionLayer;
++    this.fastConfirmationStore = fastConfirmationStore;
+     this.canonicalBlockCache = new HashMap<>();
+     this.outputWriter = outputWriter;
+   }
+@@ -181,6 +187,7 @@
+         storageSystem,
+         forkChoice,
+         executionLayer,
++        FastConfirmationStore.create(recentChainData.getStore()),
+         new OutputWriter(cfg.output()));
+   }
+ 
+@@ -242,6 +249,7 @@
+     advanceToSlot(evalSlot);
+     final long t0 = System.nanoTime();
+     FcrForkChoiceAccess.processHead(forkChoice, evalSlot).join();
++    evaluateFastConfirmation(evalSlot);
+     final long durationUs = (System.nanoTime() - t0) / 1_000;
+ 
+     if (simSlot % 32 == 0) {
+@@ -379,7 +387,7 @@
+   private void printSlotDiagnostic(
+       final UInt64 slot, final boolean isRecording, final boolean hasBlock) {
+     final Bytes32 headRoot = recentChainData.getChainHead().orElseThrow().getRoot();
+-    final Bytes32 confirmedRoot = recentChainData.getStore().getFinalizedCheckpoint().getRoot();
++    final Bytes32 confirmedRoot = fastConfirmationStore.confirmedRoot();
+     final long confirmedSlot =
+         recentChainData.getSlotForBlockRoot(confirmedRoot).orElse(UInt64.ZERO).longValue();
+     System.err.println(
+@@ -442,6 +450,37 @@
+     return recentChainData.retrieveBlockState(headRoot).join().orElseThrow();
+   }
+ 
++  private void evaluateFastConfirmation(final UInt64 evalSlot) {
++    final Bytes32 headRoot = recentChainData.getChainHead().orElseThrow().getRoot();
++    fastConfirmationStore =
++        FastConfirmationSimulator.updateVariables(spec, fastConfirmationStore, evalSlot, headRoot);
++    final boolean isEpochStart = FastConfirmationRuleUtil.isStartSlotAtEpoch(spec, evalSlot);
++    final Checkpoint currentBalanceCheckpoint =
++        fastConfirmationStore.currentEpochObservedJustifiedCheckpoint();
++    final Checkpoint previousBalanceCheckpoint =
++        fastConfirmationStore.previousEpochObservedJustifiedCheckpoint();
++    final BeaconState currentBalanceSource =
++        recentChainData.retrieveCheckpointState(currentBalanceCheckpoint).join().orElseThrow();
++    final Optional<BeaconState> previousBalanceSource =
++        isEpochStart
++            ? Optional.of(
++                recentChainData
++                    .retrieveCheckpointState(previousBalanceCheckpoint)
++                    .join()
++                    .orElseThrow())
++            : Optional.empty();
++    final BeaconState headBlockState =
++        recentChainData.retrieveBlockState(headRoot).join().orElseThrow();
++    fastConfirmationStore =
++        FastConfirmationSimulator.evaluate(
++            spec,
++            fastConfirmationStore,
++            evalSlot,
++            previousBalanceSource,
++            currentBalanceSource,
++            headBlockState);
++  }
++
+   private Attestation buildAttestation(
+       final SlotInstruction.PlannedAttestation plannedAttestation) {
+     final SlotInstruction.AttestationData plannedData = plannedAttestation.data();
+@@ -519,7 +558,7 @@
+       final int numInjected,
+       final long durationUs) {
+     final Bytes32 headRoot = recentChainData.getChainHead().orElseThrow().getRoot();
+-    final Bytes32 confirmedRoot = recentChainData.getStore().getFinalizedCheckpoint().getRoot();
++    final Bytes32 confirmedRoot = fastConfirmationStore.confirmedRoot();
+     final long confirmedSlot =
+         recentChainData.getSlotForBlockRoot(confirmedRoot).orElse(UInt64.ZERO).longValue();
+     final long evalSlot = slot.longValue() + 1;

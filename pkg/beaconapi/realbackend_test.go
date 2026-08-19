@@ -393,6 +393,33 @@ func TestRealBackendBuildSlotDropsPreWarmupOrphanParents(t *testing.T) {
 	}, instruction.ImportBlocks)
 }
 
+func TestRealBackendBuildSlotStrictModeUsesNextBlockWithZeroConfiguredLookahead(t *testing.T) {
+	cacheDir := t.TempDir()
+
+	canonical101 := encodeTestSignedBeaconBlock(101)
+	canonical101Root := testBlockRoot(t, canonical101)
+	canonical102 := encodeTestSignedBeaconBlockWithAttestations(102, canonical101Root, []*phase0.Attestation{
+		testAttestation(100, canonical101Root, canonical101Root),
+		testAttestation(101, canonical101Root, canonical101Root),
+	})
+	writeTestEraFileWithBlocks(t, cacheDir, 1, canonical101, canonical102)
+
+	reader, err := era.New(cacheDir)
+	require.NoError(t, err)
+	backend := NewRealBackend(RealBackendConfig{
+		EraReader: reader,
+		Mode:      attplan.ModeStrictKMinus1,
+	})
+
+	instruction, err := backend.BuildSlot(101, 100)
+	require.NoError(t, err)
+	require.Len(t, instruction.Attestations, 2)
+	require.Equal(t, []uint64{100, 101}, []uint64{
+		instruction.Attestations[0].Data.Slot,
+		instruction.Attestations[1].Data.Slot,
+	})
+}
+
 func TestRealBackendBuildSlotWarmupScopeUnaffectedByIndexWarmth(t *testing.T) {
 	cacheDir := t.TempDir()
 

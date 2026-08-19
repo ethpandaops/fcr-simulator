@@ -1,0 +1,408 @@
+diff -ruN --exclude=build --exclude=.gradle a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java
+--- a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java	2026-08-19 15:00:40
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/FcrForkChoiceAccess.java	2026-08-19 14:52:25
+@@ -14,20 +14,22 @@
+ package tech.pegasys.teku.statetransition.forkchoice;
+ 
+ import java.util.List;
++import java.util.Optional;
+ import java.util.function.BiConsumer;
+ import tech.pegasys.teku.infrastructure.async.SafeFuture;
+ import tech.pegasys.teku.infrastructure.unsigned.UInt64;
+ import tech.pegasys.teku.spec.datastructures.attestation.ValidatableAttestation;
+ import tech.pegasys.teku.spec.datastructures.forkchoice.VoteUpdater;
+-import tech.pegasys.teku.spec.datastructures.operations.IndexedAttestation;
++import tech.pegasys.teku.spec.datastructures.operations.IndexedAttestationLight;
+ import tech.pegasys.teku.storage.client.RecentChainData;
+ import tech.pegasys.teku.storage.protoarray.ForkChoiceStrategy;
+ 
+ public final class FcrForkChoiceAccess {
+   private FcrForkChoiceAccess() {}
+ 
+-  public static SafeFuture<Boolean> processHead(final ForkChoice forkChoice, final UInt64 nodeSlot) {
+-    return forkChoice.processHead(nodeSlot);
++  public static SafeFuture<Boolean> processHead(
++      final ForkChoice forkChoice, final UInt64 nodeSlot) {
++    return forkChoice.processHead(nodeSlot).thenApply(Optional::isPresent);
+   }
+ 
+   public static int applyIndexedAttestations(
+@@ -40,10 +42,10 @@
+     int applied = 0;
+     for (ValidatableAttestation attestation : attestations) {
+       try {
+-        final IndexedAttestation indexedAttestation =
++        final IndexedAttestationLight indexedAttestation =
+             attestation.getIndexedAttestation().orElseThrow();
+-        if (!forkChoiceStrategy.contains(indexedAttestation.getData().getTarget().getRoot())
+-            || !forkChoiceStrategy.contains(indexedAttestation.getData().getBeaconBlockRoot())) {
++        if (!forkChoiceStrategy.contains(indexedAttestation.data().getTarget().getRoot())
++            || !forkChoiceStrategy.contains(indexedAttestation.data().getBeaconBlockRoot())) {
+           continue;
+         }
+         final VoteUpdater transaction = recentChainData.startVoteUpdate();
+diff -ruN --exclude=build --exclude=.gradle a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java
+--- a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java	2026-08-19 15:00:40
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Engine.java	2026-08-19 14:57:59
+@@ -18,7 +18,16 @@
+ 
+ import com.google.common.io.MoreFiles;
+ import com.google.common.io.RecursiveDeleteOption;
+-
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Optional;
++import java.util.concurrent.CopyOnWriteArrayList;
++import org.apache.tuweni.bytes.Bytes32;
+ import tech.pegasys.teku.bls.BLSConstants;
+ import tech.pegasys.teku.bls.BLSSignature;
+ import tech.pegasys.teku.bls.BLSSignatureVerifier;
+@@ -36,11 +45,11 @@
+ import tech.pegasys.teku.spec.datastructures.blocks.SignedBeaconBlock;
+ import tech.pegasys.teku.spec.datastructures.blocks.SignedBlockAndState;
+ import tech.pegasys.teku.spec.datastructures.execution.ExecutionPayloadContext;
++import tech.pegasys.teku.spec.datastructures.forkchoice.ForkChoiceNode;
+ import tech.pegasys.teku.spec.datastructures.operations.Attestation;
+ import tech.pegasys.teku.spec.datastructures.operations.AttestationData;
+ import tech.pegasys.teku.spec.datastructures.operations.AttestationSchema;
+-import tech.pegasys.teku.spec.datastructures.operations.IndexedAttestation;
+-import tech.pegasys.teku.spec.datastructures.operations.IndexedAttestationSchema;
++import tech.pegasys.teku.spec.datastructures.operations.IndexedAttestationLight;
+ import tech.pegasys.teku.spec.datastructures.state.AnchorPoint;
+ import tech.pegasys.teku.spec.datastructures.state.Checkpoint;
+ import tech.pegasys.teku.spec.datastructures.state.beaconstate.BeaconState;
+@@ -61,23 +70,12 @@
+ import tech.pegasys.teku.statetransition.forkchoice.TickProcessor;
+ import tech.pegasys.teku.statetransition.util.DebugDataDumper;
+ import tech.pegasys.teku.statetransition.validation.BlockBroadcastValidator;
++import tech.pegasys.teku.storage.api.LateBlockReorgPreparationHandler;
+ import tech.pegasys.teku.storage.client.RecentChainData;
+ import tech.pegasys.teku.storage.server.StateStorageMode;
+ import tech.pegasys.teku.storage.storageSystem.FileBackedStorageSystemBuilder;
+ import tech.pegasys.teku.storage.storageSystem.StorageSystem;
+ 
+-import java.io.IOException;
+-import java.nio.file.Files;
+-import java.nio.file.Path;
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Optional;
+-import java.util.concurrent.CopyOnWriteArrayList;
+-
+-import org.apache.tuweni.bytes.Bytes32;
+-
+ public class Engine implements AutoCloseable {
+   private final Config cfg;
+   private final Spec spec;
+@@ -116,15 +114,7 @@
+ 
+   public static Engine bootstrap(final Config cfg) throws IOException, InterruptedException {
+     BLSConstants.disableBLSVerification();
+-    final Spec spec =
+-        SpecFactory.create(
+-            cfg.network(),
+-            false,
+-            builder ->
+-                builder
+-                    .confirmationByzantineThreshold((int) cfg.byzantineThreshold())
+-                    .committeeWeightEstimationAdjustmentFactor(5)
+-                    .confirmationSlashingThreshold(25));
++    final Spec spec = SpecFactory.create(cfg.network(), false, builder -> {});
+     spec.reinitializeForTesting(
+         AvailabilityCheckerFactory.NOOP_BLOB_SIDECAR,
+         AvailabilityCheckerFactory.NOOP_DATACOLUMN_SIDECAR,
+@@ -163,9 +153,10 @@
+             new TickProcessor(spec, recentChainData),
+             new AlwaysValidTransitionBlockValidator(spec, recentChainData),
+             DEFAULT_FORK_CHOICE_LATE_BLOCK_REORG_ENABLED,
++            LateBlockReorgPreparationHandler.NOOP,
+             DebugDataDumper.NOOP,
+             new StubMetricsSystem(),
+-            AsyncBLSSignatureVerifier.wrap(BLSSignatureVerifier.NO_OP));
++            AsyncBLSSignatureVerifier.wrap(BLSSignatureVerifier.NOOP));
+ 
+     final AnchorPoint anchorPoint =
+         AnchorPoint.fromInitialBlockAndState(
+@@ -245,7 +236,7 @@
+ 
+     final ImportedBlockInfo importedBlockInfo =
+         importPlannedBlocks(slot, instruction.importBlocks());
+-    final int numInjected = injectAttestations(slot, instruction.attestations());
++    final int numInjected = injectAttestations(instruction.attestations());
+ 
+     final UInt64 evalSlot = instruction.evalSlot();
+     advanceToSlot(evalSlot);
+@@ -308,10 +299,7 @@
+       }
+       if (importBlock.canonical()) {
+         throw new IllegalStateException(
+-            "failed to process canonical block at "
+-                + simSlot
+-                + ": "
+-                + result.getFailureReason());
++            "failed to process canonical block at " + simSlot + ": " + result.getFailureReason());
+       }
+       System.err.println(
+           "planned non-canonical block import failed: slot="
+@@ -391,7 +379,7 @@
+   private void printSlotDiagnostic(
+       final UInt64 slot, final boolean isRecording, final boolean hasBlock) {
+     final Bytes32 headRoot = recentChainData.getChainHead().orElseThrow().getRoot();
+-    final Bytes32 confirmedRoot = recentChainData.getStore().getConfirmedRoot();
++    final Bytes32 confirmedRoot = recentChainData.getStore().getFinalizedCheckpoint().getRoot();
+     final long confirmedSlot =
+         recentChainData.getSlotForBlockRoot(confirmedRoot).orElse(UInt64.ZERO).longValue();
+     System.err.println(
+@@ -409,8 +397,7 @@
+             + confirmedSlot);
+   }
+ 
+-  private int injectAttestations(
+-      final UInt64 simSlot, final List<SlotInstruction.PlannedAttestation> attestations) {
++  private int injectAttestations(final List<SlotInstruction.PlannedAttestation> attestations) {
+     if (attestations.isEmpty()) {
+       return 0;
+     }
+@@ -427,7 +414,7 @@
+             plannedAttestation.attestingIndices().isPresent()
+                 ? buildEmptyAttestation(plannedAttestation)
+                 : buildAttestation(plannedAttestation);
+-        final IndexedAttestation indexedAttestation =
++        final IndexedAttestationLight indexedAttestation =
+             plannedAttestation.attestingIndices().isPresent()
+                 ? buildIndexedAttestation(plannedAttestation)
+                 : spec.atSlot(plannedAttestation.data().slot())
+@@ -468,7 +455,8 @@
+                 plannedAttestation
+                     .aggregationBits()
+                     .orElseThrow(
+-                        () -> new IllegalStateException("attestation is missing aggregation_bits")));
++                        () ->
++                            new IllegalStateException("attestation is missing aggregation_bits")));
+     if (schema.requiresCommitteeBits()) {
+       final SszBitvector committeeBits =
+           schema
+@@ -486,20 +474,12 @@
+     return schema.create(aggregationBits, data, BLSSignature.infinity());
+   }
+ 
+-  private IndexedAttestation buildIndexedAttestation(
++  private IndexedAttestationLight buildIndexedAttestation(
+       final SlotInstruction.PlannedAttestation plannedAttestation) {
+     final AttestationData data = buildAttestationData(plannedAttestation);
+     final List<UInt64> attestingIndices =
+-        plannedAttestation.attestingIndices().orElseThrow().stream()
+-            .distinct()
+-            .sorted()
+-            .toList();
+-    final IndexedAttestationSchema indexedAttestationSchema =
+-        spec.atSlot(data.getSlot()).getSchemaDefinitions().getIndexedAttestationSchema();
+-    return indexedAttestationSchema.create(
+-        indexedAttestationSchema.getAttestingIndicesSchema().of(attestingIndices),
+-        data,
+-        BLSSignature.infinity());
++        plannedAttestation.attestingIndices().orElseThrow().stream().distinct().sorted().toList();
++    return new IndexedAttestationLight(attestingIndices, data, BLSSignature.infinity());
+   }
+ 
+   private Attestation buildEmptyAttestation(
+@@ -539,7 +519,7 @@
+       final int numInjected,
+       final long durationUs) {
+     final Bytes32 headRoot = recentChainData.getChainHead().orElseThrow().getRoot();
+-    final Bytes32 confirmedRoot = recentChainData.getStore().getConfirmedRoot();
++    final Bytes32 confirmedRoot = recentChainData.getStore().getFinalizedCheckpoint().getRoot();
+     final long confirmedSlot =
+         recentChainData.getSlotForBlockRoot(confirmedRoot).orElse(UInt64.ZERO).longValue();
+     final long evalSlot = slot.longValue() + 1;
+@@ -588,7 +568,8 @@
+   }
+ 
+   private static class ValidForkChoiceNotifier implements ForkChoiceNotifier {
+-    private final List<ForkChoiceUpdatedResultSubscriber> subscribers = new CopyOnWriteArrayList<>();
++    private final List<ForkChoiceUpdatedResultSubscriber> subscribers =
++        new CopyOnWriteArrayList<>();
+ 
+     @Override
+     public void onForkChoiceUpdated(
+@@ -614,7 +595,7 @@
+ 
+     @Override
+     public SafeFuture<Optional<ExecutionPayloadContext>> getPayloadId(
+-        final Bytes32 parentBeaconBlockRoot, final UInt64 blockSlot) {
++        final ForkChoiceNode parentBeaconBlock, final UInt64 blockSlot) {
+       return SafeFuture.completedFuture(Optional.empty());
+     }
+ 
+diff -ruN --exclude=build --exclude=.gradle a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java
+--- a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java	2026-08-19 15:00:40
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/HttpClient.java	2026-08-19 14:49:40
+@@ -13,10 +13,6 @@
+ 
+ package tech.pegasys.teku.statetransition.forkchoice.fcr;
+ 
+-import tech.pegasys.teku.infrastructure.unsigned.UInt64;
+-
+-import org.apache.tuweni.bytes.Bytes32;
+-
+ import java.io.IOException;
+ import java.net.URI;
+ import java.net.URLEncoder;
+@@ -25,8 +21,9 @@
+ import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
+ import java.util.Optional;
+-
+ import org.apache.tuweni.bytes.Bytes;
++import org.apache.tuweni.bytes.Bytes32;
++import tech.pegasys.teku.infrastructure.unsigned.UInt64;
+ 
+ public class HttpClient {
+   private final String baseUrl;
+diff -ruN --exclude=build --exclude=.gradle a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java
+--- a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java	2026-08-19 15:00:40
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/Main.java	2026-08-19 14:58:28
+@@ -13,6 +13,7 @@
+ 
+ package tech.pegasys.teku.statetransition.forkchoice.fcr;
+ 
++import com.fasterxml.jackson.databind.ObjectMapper;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.util.LinkedHashMap;
+@@ -20,8 +21,6 @@
+ import java.util.Map;
+ import java.util.Properties;
+ 
+-import com.fasterxml.jackson.databind.ObjectMapper;
+-
+ public class Main {
+   private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+ 
+@@ -30,6 +29,7 @@
+     System.exit(new Main().run(args));
+   }
+ 
++  @SuppressWarnings("Finally")
+   int run(final String[] args) {
+     if (hasManifestFlag(args)) {
+       return printManifest();
+@@ -98,8 +98,7 @@
+ 
+   private static Properties loadBuildProperties() {
+     final Properties properties = new Properties();
+-    try (InputStream in =
+-        Main.class.getResourceAsStream("/META-INF/fcr-build.properties")) {
++    try (InputStream in = Main.class.getResourceAsStream("/META-INF/fcr-build.properties")) {
+       if (in != null) {
+         properties.load(in);
+       }
+diff -ruN --exclude=build --exclude=.gradle a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java
+--- a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java	2026-08-19 15:00:40
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/OutputWriter.java	2026-08-19 14:49:40
+@@ -13,13 +13,12 @@
+ 
+ package tech.pegasys.teku.statetransition.forkchoice.fcr;
+ 
++import com.fasterxml.jackson.databind.ObjectMapper;
+ import java.io.BufferedWriter;
+ import java.io.IOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.StandardOpenOption;
+-
+-import com.fasterxml.jackson.databind.ObjectMapper;
+ 
+ public class OutputWriter implements AutoCloseable {
+   private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+diff -ruN --exclude=build --exclude=.gradle a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java
+--- a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java	2026-08-19 15:00:40
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstruction.java	2026-08-19 14:54:24
+@@ -13,15 +13,14 @@
+ 
+ package tech.pegasys.teku.statetransition.forkchoice.fcr;
+ 
+-import tech.pegasys.teku.infrastructure.unsigned.UInt64;
+-
+ import java.util.List;
+ import java.util.Objects;
+ import java.util.Optional;
+-
+ import org.apache.tuweni.bytes.Bytes;
+ import org.apache.tuweni.bytes.Bytes32;
++import tech.pegasys.teku.infrastructure.unsigned.UInt64;
+ 
++@SuppressWarnings("MethodInputParametersMustBeFinal")
+ public record SlotInstruction(
+     UInt64 simSlot,
+     UInt64 evalSlot,
+@@ -35,6 +34,7 @@
+     attestations = List.copyOf(attestations);
+   }
+ 
++  @SuppressWarnings("MethodInputParametersMustBeFinal")
+   public record BlockImport(UInt64 slot, Bytes32 root, boolean canonical) {
+     public BlockImport {
+       Objects.requireNonNull(slot);
+@@ -42,6 +42,7 @@
+     }
+   }
+ 
++  @SuppressWarnings("MethodInputParametersMustBeFinal")
+   public record PlannedAttestation(
+       Optional<Bytes> aggregationBits,
+       Optional<Bytes> committeeBits,
+@@ -56,12 +57,9 @@
+     }
+   }
+ 
++  @SuppressWarnings("MethodInputParametersMustBeFinal")
+   public record AttestationData(
+-      UInt64 slot,
+-      UInt64 index,
+-      Bytes32 beaconBlockRoot,
+-      Checkpoint source,
+-      Checkpoint target) {
++      UInt64 slot, UInt64 index, Bytes32 beaconBlockRoot, Checkpoint source, Checkpoint target) {
+     public AttestationData {
+       Objects.requireNonNull(slot);
+       Objects.requireNonNull(index);
+@@ -71,6 +69,7 @@
+     }
+   }
+ 
++  @SuppressWarnings("MethodInputParametersMustBeFinal")
+   public record Checkpoint(UInt64 epoch, Bytes32 root) {
+     public Checkpoint {
+       Objects.requireNonNull(epoch);
+diff -ruN --exclude=build --exclude=.gradle a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstructionFetcher.java b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstructionFetcher.java
+--- a/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstructionFetcher.java	2026-08-19 15:00:40
++++ b/fcr-simulator-engine/src/main/java/tech/pegasys/teku/statetransition/forkchoice/fcr/SlotInstructionFetcher.java	2026-08-19 14:49:40
+@@ -13,17 +13,15 @@
+ 
+ package tech.pegasys.teku.statetransition.forkchoice.fcr;
+ 
+-import tech.pegasys.teku.infrastructure.unsigned.UInt64;
+-
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Optional;
+-
+-import com.fasterxml.jackson.databind.JsonNode;
+-import com.fasterxml.jackson.databind.ObjectMapper;
+ import org.apache.tuweni.bytes.Bytes;
+ import org.apache.tuweni.bytes.Bytes32;
++import tech.pegasys.teku.infrastructure.unsigned.UInt64;
+ 
+ public class SlotInstructionFetcher {
+   private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();

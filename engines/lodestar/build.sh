@@ -31,10 +31,11 @@ if [[ "${NODE_MAJOR}" -lt 24 ]]; then
   exit 1
 fi
 
-if ! command -v pnpm >/dev/null 2>&1; then
-  echo "pnpm not found on PATH" >&2
+if ! command -v corepack >/dev/null 2>&1; then
+  echo "corepack not found on PATH" >&2
   exit 1
 fi
+PNPM=(corepack pnpm)
 
 if LODESTAR_COMMIT="$(git -C "${LODESTAR_DIR}" rev-parse HEAD 2>/dev/null)"; then
   LODESTAR_DESCRIBE="$(git -C "${LODESTAR_DIR}" describe --always --tags 2>/dev/null || echo "${LODESTAR_COMMIT:0:8}")"
@@ -49,13 +50,13 @@ fi
 echo "[fcr-lodestar] installing engine + lodestar workspaces (pinned ${LODESTAR_COMMIT})" >&2
 (
   cd "${ENGINE_DIR}"
-  pnpm install --frozen-lockfile=false
+  "${PNPM[@]}" install --frozen-lockfile=false
 )
 
 echo "[fcr-lodestar] building lodestar packages we depend on" >&2
 (
   cd "${ENGINE_DIR}/lodestar"
-  PATH="${ENGINE_DIR}/lodestar/node_modules/.bin:${PATH}" pnpm \
+  PATH="${ENGINE_DIR}/lodestar/node_modules/.bin:${PATH}" "${PNPM[@]}" \
     --filter '@lodestar/params' \
     --filter '@lodestar/utils' \
     --filter '@lodestar/types' \

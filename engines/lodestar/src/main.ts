@@ -9,7 +9,7 @@ import {
   ProtoArray,
   ExecutionStatus,
   PayloadStatus,
-  type CheckpointWithPayloadStatus,
+  type CheckpointWithHex,
   type ForkChoiceStateGetter,
   type JustifiedBalancesGetter,
   type ProtoBlock,
@@ -709,8 +709,8 @@ class StateCache {
     this.evictedCheckpoints.delete(key);
   }
 
-  getCheckpoint(checkpoint: CheckpointWithPayloadStatus): CachedBeaconStateAllForks | null {
-    const key = checkpointKey(checkpoint.epoch, checkpoint.rootHex, checkpoint.payloadStatus);
+  getCheckpoint(checkpoint: CheckpointWithHex): CachedBeaconStateAllForks | null {
+    const key = checkpointKey(checkpoint.epoch, checkpoint.rootHex, PayloadStatus.FULL);
     const entry = this.stateByCheckpointKey.get(key);
     if (entry) return entry.state;
     const evicted = this.evictedCheckpoints.get(key);
@@ -719,7 +719,7 @@ class StateCache {
       key,
       checkpointEpoch: checkpoint.epoch,
       checkpointRoot: checkpoint.rootHex,
-      payloadStatus: checkpoint.payloadStatus,
+      payloadStatus: PayloadStatus.FULL,
       evictedEpoch: evicted?.epoch,
       evictedAtSlot: evicted?.evictedAtSlot,
       stateRoots: this.stateByStateRoot.size,
@@ -877,7 +877,7 @@ async function bootstrapEngine(cfg: CliConfig): Promise<BootstrapResult> {
   // For replay this is acceptable — every state we'd consult is in the linear
   // canonical chain we've already processed.
   const justifiedBalancesGetter: JustifiedBalancesGetter = (
-    _checkpoint: CheckpointWithPayloadStatus,
+    _checkpoint: CheckpointWithHex,
     blockState: IBeaconStateView,
   ): EffectiveBalanceIncrements => {
     return blockState.getEffectiveBalanceIncrementsZeroInactive();
@@ -957,8 +957,6 @@ function initializeForkChoiceFromAnchor(args: {
     finalizedCheckpoint,
     justifiedBalances,
     justifiedBalancesGetter,
-    PayloadStatus.FULL,
-    PayloadStatus.FULL,
     stateGetter,
     {
       onJustified: () => {},

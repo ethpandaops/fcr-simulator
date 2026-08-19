@@ -41,13 +41,8 @@ import beacon_chain/networking/network_metadata
 
 const
   EngineName = "nimbus"
-  EngineVersion = block:
-    const VersionMod = "../nimbus-eth2/beacon_chain/version"
-    when fileExists(VersionMod & ".nim"):
-      "v26.5.0"
-    else:
-      "v26.5.0"
-  EngineCommit = "6fb05f36804d53c2e8e014cfeeea8ad7996a5efe"
+  EngineVersion = "v26.7.0"
+  EngineCommit = "4110bc7828a45518d22d60e2f60438ae81ff17e9"
   FcrSpecCommit = ""
   FlushInterval = 100
 
@@ -798,7 +793,8 @@ proc injectForkChoiceAttestation(self: Engine, simSlot: Slot,
 
   let
     res = self.attPool[].forkChoice.on_attestation(
-      self.dag, data.slot, data.beacon_block_root, attestingIndices, wallTime)
+      self.dag, data.slot, data.beacon_block_root, attestingIndices,
+      CommitteeIndex(data.index), wallTime)
   if res.isErr:
     self.logFailedAttestationInjection(simSlot, data, $res.error)
     return false
@@ -873,7 +869,7 @@ proc recomputeHead(self: Engine, evalSlot: Slot): Result[Eth2Digest, string] =
   if headRes.isErr:
     return err("get_head failed")
   let head = headRes.value
-  let headRefOpt = self.dag.getBlockRef(head)
+  let headRefOpt = self.dag.getBlockRef(head.root)
   if headRefOpt.isNone:
     return err("getBlockRef(head) failed")
   let headRef = headRefOpt.get
@@ -881,7 +877,7 @@ proc recomputeHead(self: Engine, evalSlot: Slot): Result[Eth2Digest, string] =
   let wsRes = self.attPool[].forkChoice.will_select_head(self.dag, headRef, wallTime)
   if wsRes.isErr:
     return err("will_select_head failed")
-  ok(head)
+  ok(head.root)
 
 proc emitRecord(self: Engine, simSlot: Slot, hasBlock: bool,
     blockRoot: Option[Eth2Digest], headRoot: Eth2Digest,

@@ -280,11 +280,15 @@ func (b *realBackend) BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstructio
 	if simSlot <= warmupStartSlot {
 		return SlotInstruction{}, fmt.Errorf("sim slot %d must be greater than warmup start slot %d", simSlot, warmupStartSlot)
 	}
-	if b.cfg.Mode != attplan.ModeFirstSeenGossip && b.cfg.LookaheadCap < 1 {
-		return SlotInstruction{}, fmt.Errorf("lookaheadCap must be >= 1 for slot instructions")
+	if (b.cfg.Mode == attplan.ModeNextNonMissed || b.cfg.Mode == attplan.ModeGreedyLookahead) && b.cfg.LookaheadCap < 1 {
+		return SlotInstruction{}, fmt.Errorf("lookaheadCap must be >= 1 for mode %d", b.cfg.Mode)
 	}
 	if b.cfg.Mode == attplan.ModeFirstSeenGossip && b.cfg.FirstSeenSource == nil {
 		return SlotInstruction{}, fmt.Errorf("first-seen attestation source is not configured")
+	}
+	lookaheadCap := b.cfg.LookaheadCap
+	if b.cfg.Mode == attplan.ModeStrictKMinus1 {
+		lookaheadCap = 1
 	}
 	minImportSlot, ok := checkedAdd(warmupStartSlot, 1)
 	if !ok {
@@ -293,12 +297,21 @@ func (b *realBackend) BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstructio
 
 	loadEnd := simSlot
 	if b.cfg.Mode != attplan.ModeFirstSeenGossip {
-		loadEnd = saturatingAdd(simSlot, b.cfg.LookaheadCap)
+		loadEnd = saturatingAdd(simSlot, lookaheadCap)
 	}
 	if err := b.canonicalIndex.ensureRange(minImportSlot, loadEnd); err != nil {
 		return SlotInstruction{}, err
 	}
 	canonical := b.canonicalIndex.view(minImportSlot, loadEnd)
+	blockExists := make(map[uint64]bool, lookaheadCap)
+	for slot := saturatingAdd(simSlot, 1); slot <= loadEnd; slot++ {
+		if _, ok := canonical.infoBySlot(slot); ok {
+			blockExists[slot] = true
+		}
+		if slot == math.MaxUint64 {
+			break
+		}
+	}
 
 	state := &planBuildState{
 		backend:           b,
@@ -339,7 +352,8 @@ func (b *realBackend) BuildSlot(simSlot, warmupStartSlot uint64) (SlotInstructio
 			return SlotInstruction{}, err
 		}
 	} else {
-		slotAttestations, err = state.attestationsMadeInWindow(simSlot, b.cfg.LookaheadCap)
+		sources := planSourcesForSlot(blockExists, simSlot, b.cfg.Mode, lookaheadCap, instruction.EvalSlot)
+		slotAttestations, err = state.attestationsFromSources(sources)
 		if err != nil {
 			return SlotInstruction{}, err
 		}
@@ -1156,27 +1170,17 @@ func (s *planBuildState) orphanImportsForSources(
 	return imports, nil
 }
 
-func (s *planBuildState) attestationsMadeInWindow(madeSlot, lookaheadCap uint64) ([]attestationInfo, error) {
-	if lookaheadCap == 0 || madeSlot == math.MaxUint64 {
-		return nil, nil
-	}
-
-	end, ok := checkedAdd(madeSlot, lookaheadCap)
-	if !ok {
-		return nil, nil
-	}
-
-	start := madeSlot + 1
+func (s *planBuildState) attestationsFromSources(sources []PlanAttestationSource) ([]attestationInfo, error) {
 	out := make([]attestationInfo, 0)
 	seen := make(map[[32]byte]bool)
-	for sourceSlot := start; ; sourceSlot++ {
-		sourceInfos, err := s.sourceBlockInfosBySlot(sourceSlot)
+	for _, source := range sources {
+		sourceInfos, err := s.sourceBlockInfosBySlot(source.Slot)
 		if err != nil {
 			return nil, err
 		}
 		for _, info := range sourceInfos {
 			for _, attestation := range info.Attestations {
-				if attestation.Slot != madeSlot {
+				if source.MaxAttestationSlot != nil && attestation.Slot > *source.MaxAttestationSlot {
 					continue
 				}
 				// De-duplicate only exact aggregate repeats. Different
@@ -1189,9 +1193,6 @@ func (s *planBuildState) attestationsMadeInWindow(madeSlot, lookaheadCap uint64)
 				seen[attestation.Root] = true
 				out = append(out, attestation)
 			}
-		}
-		if sourceSlot == end {
-			break
 		}
 	}
 	return out, nil

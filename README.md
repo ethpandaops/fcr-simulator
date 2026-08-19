@@ -6,13 +6,13 @@ Replays historical Ethereum mainnet blocks through each CL client's [Fast Confir
 
 All engines live under `engines/<name>/`. Each has a `build.sh` that produces `results/fcr-<name>`.
 
-| Engine | Upstream pin |
-|---|---|
-| lighthouse | submodule `engines/lighthouse/lighthouse` (samcm/lighthouse `fcr-simulator`) |
-| teku       | submodule `engines/teku/teku` (Nashatyrev/teku `confirmation-2`) |
-| nimbus     | submodule `engines/nimbus/nimbus-eth2` (samcm/nimbus-eth2 `fcr-frozen-anchor-fix`) |
-| lodestar   | submodule `engines/lodestar/lodestar` (nazarhussain/lodestar) |
-| grandine   | upstream `grandinetech/grandine` PR #656 via `engines/grandine/grandine-engine.patch` |
+| Engine | Upstream pin | FCR source |
+|---|---|---|
+| lighthouse | v8.2.2 | Lighthouse PR #8951 rebased onto the release |
+| teku       | 26.8.0 | Release implementation, with simulator adapter patches |
+| nimbus     | v26.7.0 | Release implementation |
+| lodestar   | v1.46.0 | Release implementation |
+| grandine   | PR #656 (`9905f46f`) | Unreleased; Grandine 2.0.6 does not contain FCR |
 
 Prysm is deferred: PR #15164 implements an older spec (`adiasg/eth2.0-specs:3e3ef28`), not [consensus-specs#4747](https://github.com/ethereum/consensus-specs/pull/4747). Shipping a binary against the older algorithm would contaminate cross-engine comparison. Revisit once the upstream PR rebases.
 
@@ -56,9 +56,9 @@ go build -o ./results/fcr-orchestrator ./cmd/fcr-orchestrator
 
 # Engines (each writes results/fcr-<name>)
 bash engines/lighthouse/build.sh   # Rust,  ~10-20 min cold
-bash engines/teku/build.sh         # Java,  ~5 min cold (needs JDK 21)
+bash engines/teku/build.sh         # Java,  ~5 min cold (needs JDK 25)
 bash engines/nimbus/build.sh       # Nim,   ~5-10 min cold
-bash engines/lodestar/build.sh     # Node,  ~3-5 min cold (needs Node 24+, pnpm)
+bash engines/lodestar/build.sh     # Node,  ~3-5 min cold (needs Node 24+, Corepack)
 bash engines/grandine/build.sh     # Rust,  ~10-15 min cold
 ```
 
