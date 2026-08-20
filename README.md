@@ -8,7 +8,7 @@ All engines live under `engines/<name>/`. Each has a `build.sh` that produces `r
 
 | Engine | Upstream pin | FCR source |
 |---|---|---|
-| lighthouse | v8.2.2 | Lighthouse PR #8951 rebased onto the release |
+| lighthouse | `unstable` (`6b0e7bbf4`) | Merged Lighthouse implementation targeting v8.3.0 |
 | teku       | 26.8.0 | Release implementation, with simulator adapter patches |
 | nimbus     | v26.7.0 | Release implementation |
 | lodestar   | v1.46.0 | Release implementation |
