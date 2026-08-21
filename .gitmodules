@@ -13,3 +13,7 @@
 	path = engines/lighthouse/lighthouse
 	url = https://github.com/samcm/lighthouse.git
 	branch = fcr-simulator
+[submodule "engines/prysm/prysm"]
+	path = engines/prysm/prysm
+	url = https://github.com/OffchainLabs/prysm.git
+	branch = fcr

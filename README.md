@@ -13,8 +13,9 @@ All engines live under `engines/<name>/`. Each has a `build.sh` that produces `r
 | nimbus     | v26.7.0 | Release implementation |
 | lodestar   | v1.46.0 | Release implementation |
 | grandine   | PR #656 (`9905f46f`) | Unreleased; Grandine 2.0.6 does not contain FCR |
+| prysm      | PR #17122 (`5fc7c60d`) | Unreleased; enabled through Prysm's FCR test harness |
 
-Prysm is deferred: PR #15164 implements an older spec (`adiasg/eth2.0-specs:3e3ef28`), not [consensus-specs#4747](https://github.com/ethereum/consensus-specs/pull/4747). Shipping a binary against the older algorithm would contaminate cross-engine comparison. Revisit once the upstream PR rebases.
+Prysm support is pinned to the open [PR #17122](https://github.com/OffchainLabs/prysm/pull/17122), not a released client version. The adapter compiles as a test binary so it can reuse Prysm's upstream FCR spectest harness without patching production client code.
 
 ## Architecture
 
@@ -25,9 +26,9 @@ A Go orchestrator owns everything engine-agnostic — ERA file download, checkpo
 │  fcr-orchestrator (Go)                                  │
 └────────────────────────────────┬────────────────────────┘
                                  │ HTTP (SSZ blocks/states + /fcr-sim/v1/plan)
-       ┌──────────┬──────────┬───┴───────┬──────────┐
-   fcr-lighthouse fcr-teku  fcr-nimbus  fcr-lodestar fcr-grandine
-       (Rust)    (Java)     (Nim)       (TypeScript) (Rust)
+       ┌──────────┬──────────┬───┴───────┬──────────┬──────────┐
+   fcr-lighthouse fcr-teku  fcr-nimbus  fcr-lodestar fcr-grandine fcr-prysm
+       (Rust)    (Java)     (Nim)       (TypeScript) (Rust)      (Go)
 ```
 
 Per sim slot N the engine: fetches block N, imports it, looks up `plan[N].source_block_slot`, extracts that block's attestations, injects them using its native equivalent of Lighthouse's `AttestationFromBlock::True`, runs `recompute_head_at_slot(N+1)`, emits one JSONL record. The orchestrator validates each record, enriches with engine metadata, writes the final CSV / JSONL / manifest.
@@ -43,7 +44,7 @@ The orchestrator owns which block sources attestations for each sim slot:
 - **`next-non-missed`** (default): for sim slot N, the first non-missed block in `N+1..N+lookahead-cap`. `--lookahead-cap=4` reproduces today's Lighthouse behavior; `--lookahead-cap=32` covers the spec's full inclusion range.
 - **`strict-source-block-k-minus-1`**: source is exactly `N+1` if it exists, else nothing.
 - **`greedy-lookahead`**: consumes every non-missed block in `N+1..N+lookahead-cap`, bounded to attestations for the FCR evaluation slot.
-- **`xatu-first-seen-singles`**: serves per-validator first-seen gossip votes from parquet instead of sourcing attestations from blocks. The orchestrator filters by `raw_seen_ms <= --attestation-first-seen-deadline-ms` (default `12000`) and sends committee-free `attesting_indices` to the engine for direct fork-choice injection. All 5 engines implement this injection path. Use `--attestation-first-seen-base` as either a local base path or `s3://bucket/prefix`; files are expected below `network=<network>/source=raw/epoch=<epoch>/data.parquet`. `--lookahead-cap` is inert in this mode.
+- **`xatu-first-seen-singles`**: serves per-validator first-seen gossip votes from parquet instead of sourcing attestations from blocks. The orchestrator filters by `raw_seen_ms <= --attestation-first-seen-deadline-ms` (default `12000`) and sends committee-free `attesting_indices` to the engine for direct fork-choice injection. All 6 engines implement this injection path. Use `--attestation-first-seen-base` as either a local base path or `s3://bucket/prefix`; files are expected below `network=<network>/source=raw/epoch=<epoch>/data.parquet`. `--lookahead-cap` is inert in this mode.
 
 ## Build
 
@@ -60,6 +61,7 @@ bash engines/teku/build.sh         # Java,  ~5 min cold (needs JDK 25)
 bash engines/nimbus/build.sh       # Nim,   ~5-10 min cold
 bash engines/lodestar/build.sh     # Node,  ~3-5 min cold (needs Node 24+, Corepack)
 bash engines/grandine/build.sh     # Rust,  ~10-15 min cold
+bash engines/prysm/build.sh        # Go,    unreleased PR (downloads its pinned Go toolchain)
 ```
 
 The orchestrator auto-runs `engines/<engine>/build.sh` if the corresponding binary is missing.
@@ -133,4 +135,4 @@ An older lighthouse-only run is mirrored at `data.ethpandaops.io/fcr-simulator/l
 
 - [Fast Confirmation Rule spec (consensus-specs#4747)](https://github.com/ethereum/consensus-specs/pull/4747)
 - [Research paper (arXiv:2405.00549)](https://arxiv.org/abs/2405.00549)
-- Per-client FCR PRs: [Lighthouse #8951](https://github.com/sigp/lighthouse/pull/8951), [Teku confirmation-2](https://github.com/Nashatyrev/teku/tree/confirmation-2), [Nimbus (merged to unstable)](https://github.com/status-im/nimbus-eth2), [Lodestar #8837](https://github.com/ChainSafe/lodestar/pull/8837), [Grandine #656](https://github.com/grandinetech/grandine/pull/656), [Prysm #15164 (deferred)](https://github.com/OffchainLabs/prysm/pull/15164)
+- Per-client FCR PRs: [Lighthouse #8951](https://github.com/sigp/lighthouse/pull/8951), [Teku confirmation-2](https://github.com/Nashatyrev/teku/tree/confirmation-2), [Nimbus (merged to unstable)](https://github.com/status-im/nimbus-eth2), [Lodestar #8837](https://github.com/ChainSafe/lodestar/pull/8837), [Grandine #656](https://github.com/grandinetech/grandine/pull/656), [Prysm #17122](https://github.com/OffchainLabs/prysm/pull/17122)
