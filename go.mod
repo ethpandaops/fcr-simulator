@@ -1,6 +1,6 @@
 module github.com/ethpandaops/fcr-simulator
 
-go 1.24.9
+go 1.26.10
 
 require (
 	github.com/attestantio/go-eth2-client v0.27.1
