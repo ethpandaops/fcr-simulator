@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM golang:1.24-bookworm AS orchestrator-builder
+FROM golang:1.26-bookworm AS orchestrator-builder
 
 ENV CGO_ENABLED=0
 WORKDIR /src
