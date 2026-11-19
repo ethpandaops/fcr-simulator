@@ -44,7 +44,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     bash engines/lighthouse/build.sh
 
 
-FROM eclipse-temurin:21-jdk-noble AS teku-builder
+# engines/teku/build.sh builds Teku 26.8.0, which needs JDK 25.
+FROM eclipse-temurin:25.0.5_8-jdk-noble@sha256:80f67fb3d6f76e2d817d98a4cc2a9cf05f054d4e6adc5e2144bde671d722e63f AS teku-builder
 
 ARG FCR_TEKU_COMMIT=c5825d53325cd67ab91b35cc544a7b660be317ff
 
@@ -184,7 +185,21 @@ ENV FCR_ENGINE_BINARY=/usr/local/bin/fcr-lighthouse
 ENTRYPOINT ["fcr-orchestrator"]
 
 
-FROM eclipse-temurin:21-jre-noble AS teku
+FROM eclipse-temurin:25.0.5_8-jre-noble@sha256:e3b6f7887a50f20d8f07abf279d8a81a5953fb398a9555bd9edd56b9bd15968c AS teku
+
+# Eclipse Temurin 25.0.5.1+2 fixes CVE-2026-114938 (Java4Shell) in the x86-64 Base64 intrinsic.
+# Until an eclipse-temurin image ships it, amd64 builds swap in Adoptium's release tarball, checked
+# against the SHA-256 Adoptium publishes. arm64 is not affected and has no 25.0.5.1 build yet.
+ADD https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5.1%2B2/OpenJDK25U-jre_x64_linux_hotspot_25.0.5.1_2.tar.gz /tmp/openjdk.tar.gz
+RUN set -eux; \
+    if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+      echo "2edef9e4f81ec5ee426d023336d4cfbd7b4644e99884e7a73a6a867b70b17acf  /tmp/openjdk.tar.gz" | sha256sum -c -; \
+      rm -rf "$JAVA_HOME"; \
+      mkdir -p "$JAVA_HOME"; \
+      tar -xzf /tmp/openjdk.tar.gz -C "$JAVA_HOME" --strip-components=1 --no-same-owner; \
+    fi; \
+    rm /tmp/openjdk.tar.gz; \
+    java -version
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
